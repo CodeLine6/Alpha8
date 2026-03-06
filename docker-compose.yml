@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: quant8-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: quant8
+      POSTGRES_PASSWORD: quant8_dev
+      POSTGRES_DB: quant8
+    ports:
+      - '5432:5432'
+    volumes:
+      - quant8_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: [ 'CMD-SHELL', 'pg_isready -U quant8' ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: quant8-redis
+    restart: unless-stopped
+    ports:
+      - '6379:6379'
+    volumes:
+      - quant8_redis:/data
+    healthcheck:
+      test: [ 'CMD', 'redis-cli', 'ping' ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  quant8_pgdata:
+  quant8_redis:

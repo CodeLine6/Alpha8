@@ -1,0 +1,12 @@
+# Dev overrides — relaxed settings for local development
+
+services:
+  postgres:
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+    # Enable query logging for debugging
+    command: [ 'postgres', '-c', 'log_statement=all' ]
+
+  redis:
+    # No persistence in dev — faster restart
+    command: [ 'redis-server', '--save', '', '--appendonly', 'no' ]

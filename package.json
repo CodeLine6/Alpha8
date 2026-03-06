@@ -1,0 +1,55 @@
+{
+  "name": "quant8",
+  "version": "1.0.0",
+  "description": "Automated stock trading application for Indian markets (NSE/BSE)",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "nodemon src/index.js",
+    "start": "node src/index.js",
+    "test": "npx --node-options=--experimental-vm-modules jest --forceExit",
+    "migrate": "node scripts/migrate.js",
+    "backtest": "node scripts/backtest.js",
+    "dashboard": "next dev src/dashboard -p 4000",
+    "lint": "eslint src/",
+    "docker:up": "docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d",
+    "docker:down": "docker compose -f docker-compose.yml -f docker-compose.dev.yml down",
+    "db:init": "node scripts/init-db.js",
+    "login": "node scripts/auto-login.js"
+  },
+  "keywords": [
+    "trading",
+    "stocks",
+    "nse",
+    "bse",
+    "algorithmic-trading",
+    "india"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.7",
+    "ioredis": "^5.4.2",
+    "kiteconnect": "^5.0.0",
+    "node-cron": "^3.0.3",
+    "node-telegram-bot-api": "^0.66.0",
+    "otpauth": "^9.5.0",
+    "otplib": "^13.3.0",
+    "pg": "^8.13.1",
+    "pino": "^9.6.0",
+    "pino-pretty": "^13.0.0",
+    "puppeteer": "^24.38.0",
+    "technicalindicators": "^3.1.0",
+    "ws": "^8.18.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@jest/globals": "^29.7.0",
+    "jest": "^29.7.0",
+    "nodemon": "^3.1.9"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

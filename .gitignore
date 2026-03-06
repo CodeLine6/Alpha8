@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+dashboard/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Build
+dist/
+build/
+.next/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Coverage
+coverage/
+
+# Test
+__snapshots__/
+
+# Database
+*.sql.bak
+
+# Temporary
+tmp/
