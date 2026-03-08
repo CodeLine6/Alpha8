@@ -101,6 +101,19 @@ const MIGRATIONS = [
 
   `CREATE INDEX IF NOT EXISTS idx_daily_summary_date
      ON daily_summary(date);`,
+
+  `CREATE TABLE IF NOT EXISTS signal_outcomes (
+    id          SERIAL PRIMARY KEY,
+    strategy    VARCHAR(50)  NOT NULL,
+    signal      VARCHAR(10)  NOT NULL,
+    symbol      VARCHAR(20)  NOT NULL,
+    outcome     VARCHAR(10)  NOT NULL,
+    pnl         DECIMAL(12,2),
+    recorded_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+  );`,
+
+  `CREATE INDEX IF NOT EXISTS idx_signal_outcomes_strategy
+  ON signal_outcomes(strategy, recorded_at);`
 ];
 
 async function migrate() {

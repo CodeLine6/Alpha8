@@ -13,7 +13,7 @@ import { KiteClient } from './api/kite-client.js';
 import { BrokerManager } from './api/broker-manager.js';
 import { TelegramBot } from './notifications/index.js';
 import { MarketScheduler } from './scheduler/index.js';
-import { TickFeed, InstrumentManager, fetchRecentCandles } from './data/index.js';
+import { TickFeed, InstrumentManager, fetchHistoricalData, fetchRecentCandles } from './data/index.js';
 import {
   EMACrossoverStrategy,
   RSIMeanReversionStrategy,
@@ -21,9 +21,13 @@ import {
   BreakoutVolumeStrategy,
 } from './strategies/index.js';
 import { createApiHandler } from './api/backend-api.js';
+import { EnhancedSignalPipeline } from './intelligence/enhanced-pipeline.js';
 
 const log = createLogger('main');
 const APP_VERSION = '1.0.0';
+
+// Nifty 50 instrument token on Kite Connect (NSE index)
+const NIFTY50_INSTRUMENT_TOKEN = 256265;
 
 /**
  * Quant8 — Automated Stock Trading Application
@@ -89,18 +93,16 @@ async function main() {
   const currentYear = new Date().getFullYear();
   if (MARKET_HOLIDAYS_YEAR !== currentYear) {
     log.warn({
-      holidayYear: MARKET_HOLIDAYS_YEAR,
-      currentYear,
+      holidayYear: MARKET_HOLIDAYS_YEAR, currentYear,
     }, `⚠️  MARKET_HOLIDAYS is for ${MARKET_HOLIDAYS_YEAR} but current year is ${currentYear}! Update constants.js`);
   }
 
   // ─── Initialize Kill Switch ────────────────────────────
-  // Note: telegram ref is set later (Telegram initializes after kill switch)
   let telegramRef = null;
 
   const killSwitch = new KillSwitch({
     cacheGet: redisHealthy ? cacheGet : async () => null,
-    cacheSet: redisHealthy ? cacheSet : async () => {},
+    cacheSet: redisHealthy ? cacheSet : async () => { },
     onEngage: async ({ reason, drawdownPct, engagedAt }) => {
       if (telegramRef?.enabled) {
         telegramRef.sendRaw(
@@ -126,18 +128,18 @@ async function main() {
     log.info('✅ Kill switch: Normal');
   }
 
-  // ─── Initialize Broker (from Redis access token) ───────
+  // ─── Initialize Broker ────────────────────────────────
   let broker = null;
+  let kiteClient = null;
   let accessToken = null;
 
   try {
     if (redisHealthy) {
-      // Read raw string (not JSON) — auto-login stores token as plain string
       accessToken = await getRedis().get('kite:access_token');
     }
 
     if (accessToken && config.KITE_API_KEY && config.KITE_API_KEY !== 'dev_placeholder') {
-      const kiteClient = new KiteClient({
+      kiteClient = new KiteClient({
         apiKey: config.KITE_API_KEY,
         apiSecret: config.KITE_API_SECRET,
         accessToken,
@@ -152,6 +154,7 @@ async function main() {
       } catch (err) {
         log.warn({ err: err.message }, '⚠️  Broker token may be expired — run: npm run login');
         broker = null;
+        kiteClient = null;
       }
     } else if (!accessToken) {
       log.warn('⚠️  No Kite access token in Redis — run: npm run login');
@@ -185,7 +188,7 @@ async function main() {
         apiKey: config.KITE_API_KEY,
         accessToken,
         respectMarketHours: true,
-        ohlcvIntervalMs: 60000, // 1-minute OHLCV candles
+        ohlcvIntervalMs: 60000,
         symbolMap: {},
       });
       log.info('✅ Tick feed created (will connect at market open)');
@@ -204,17 +207,16 @@ async function main() {
     perTradeStopLossPct: config.PER_TRADE_STOP_LOSS_PCT,
     maxPositionCount: config.MAX_POSITION_COUNT,
     killSwitchDrawdownPct: config.KILL_SWITCH_DRAWDOWN_PCT,
-    cacheGet: redisHealthy ? cacheGet : null,  // C2: Redis persistence
+    cacheGet: redisHealthy ? cacheGet : null,
     cacheSet: redisHealthy ? cacheSet : null,
   });
 
-  // C2: Restore daily state from Redis (survives restarts)
   if (redisHealthy) {
     await riskManager.loadFromRedis();
   }
   log.info('✅ Risk manager initialized');
 
-  // ─── Initialize Strategies ─────────────────────────────
+  // ─── Initialize Strategies + Consensus ─────────────────
   const consensus = new SignalConsensus({ minAgreement: 2 });
   consensus.addStrategy(new EMACrossoverStrategy());
   consensus.addStrategy(new RSIMeanReversionStrategy());
@@ -222,11 +224,35 @@ async function main() {
   consensus.addStrategy(new BreakoutVolumeStrategy());
   log.info(`✅ Signal consensus: ${consensus.strategies.length} strategies loaded`);
 
+  // ─── Initialize Enhanced Signal Pipeline ───────────────
+  let pipeline = null;
+  if (redisHealthy) {
+    pipeline = new EnhancedSignalPipeline({
+      redis: getRedis(),
+      broker,                          // for trend filter (Yahoo fallback if null)
+      instrumentManager,               // for token lookup in trend filter
+      anthropicApiKey: config.ANTHROPIC_API_KEY || null,
+      trendEnabled: true,
+      regimeEnabled: true,
+      adaptiveEnabled: dbHealthy,    // needs DB for signal_outcomes table
+      newsEnabled: !!config.ANTHROPIC_API_KEY,
+    });
+    log.info({
+      trend: true,
+      regime: true,
+      adaptive: dbHealthy,
+      news: !!config.ANTHROPIC_API_KEY,
+    }, '✅ Enhanced signal pipeline initialized');
+  } else {
+    log.warn('⚠️  Enhanced pipeline disabled — Redis not available');
+  }
+
   // ─── Initialize Execution Engine ───────────────────────
   const engine = new ExecutionEngine({
     riskManager,
     killSwitch,
     consensus,
+    pipeline,                          // ← pass pipeline here
     broker,
     paperMode: !config.LIVE_TRADING || !broker,
   });
@@ -240,7 +266,7 @@ async function main() {
     token: config.TELEGRAM_BOT_TOKEN,
     chatId: config.TELEGRAM_CHAT_ID,
   });
-  telegramRef = telegram; // Wire deferred reference for kill switch notifications
+  telegramRef = telegram;
 
   if (telegram.enabled) {
     log.info('✅ Telegram bot initialized');
@@ -249,6 +275,7 @@ async function main() {
       `📊 Mode: ${config.LIVE_TRADING ? '🔴 LIVE' : '🟢 PAPER'}\n` +
       `🔌 Broker: ${broker ? '✅ Connected' : '❌ Not connected'}\n` +
       `📈 Strategies: ${consensus.strategies.length}\n` +
+      `🧠 Pipeline: ${pipeline ? '✅ Active' : '❌ Disabled'}\n` +
       `📋 Watchlist: ${config.WATCHLIST}\n` +
       `💰 Capital: ₹${config.TRADING_CAPITAL.toLocaleString('en-IN')}\n` +
       `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
@@ -265,29 +292,25 @@ async function main() {
 
   log.info({ symbols: watchlistSymbols }, `📋 Watchlist: ${watchlistSymbols.length} symbols`);
 
-  // Resolve symbols to instrument tokens (if instrument manager loaded)
   let watchlistTokens = {};
   if (instrumentManager) {
     const resolved = instrumentManager.resolveSymbols(watchlistSymbols);
     watchlistTokens = resolved.symbolMap;
     log.info({ tokens: resolved.tokens.length }, '✅ Watchlist tokens resolved');
 
-    // Update tick feed's symbol map
     if (tickFeed) {
       tickFeed.symbolMap = resolved.symbolMap;
     }
   }
 
-  // ─── Watchlist Provider (for MarketScheduler) ──────────
+  // ─── Watchlist Provider ────────────────────────────────
   async function getWatchlist() {
     const items = [];
 
     for (const symbol of watchlistSymbols) {
       try {
-        // Get instrument token
         const instrumentToken = instrumentManager?.getToken(symbol);
 
-        // Get current price (from tick feed or broker LTP)
         let currentPrice = 0;
         if (tickFeed && instrumentToken) {
           const tick = tickFeed.getLatestTick(instrumentToken);
@@ -301,43 +324,62 @@ async function main() {
           } catch { /* skip */ }
         }
 
-        // Fetch recent candles for strategy analysis
         let candles = [];
         if (broker && instrumentToken) {
           try {
             candles = await fetchRecentCandles({
-              broker,
-              instrumentToken,
-              symbol,
-              interval: '5minute',
-              count: 50,
+              broker, instrumentToken, symbol,
+              interval: '5minute', count: 50,
             });
-          } catch { /* skip — strategies will get empty candles */ }
+          } catch { /* skip */ }
         }
 
-        // Calculate position size using Kelly Criterion
         const sizing = calculatePositionSize({
           capital: config.TRADING_CAPITAL,
-          winRate: 0.5,     // Default — will improve with real trade history
+          winRate: 0.5,
           avgWin: 1000,
           avgLoss: 500,
           entryPrice: currentPrice || 100,
           maxRiskPct: config.PER_TRADE_STOP_LOSS_PCT,
         });
 
-        items.push({
-          symbol,
-          instrumentToken,
-          candles,
-          price: currentPrice,
-          quantity: sizing.quantity || 1,
-        });
+        items.push({ symbol, instrumentToken, candles, price: currentPrice, quantity: sizing.quantity || 1 });
       } catch (err) {
         log.warn({ symbol, err: err.message }, 'Failed to build watchlist item');
       }
     }
 
     return items;
+  }
+
+  // ─── Nifty 50 Daily Candles Provider ───────────────────
+  // Used by regime detector during pre-market warm-up.
+  async function getNiftyCandles() {
+    if (!broker) return [];
+
+    try {
+      const to = new Date();
+      const from = new Date();
+      from.setDate(from.getDate() - 70); // 70 days for ATR/ADX
+
+      const fmt = (d) => d.toISOString().split('T')[0];
+
+      const candles = await fetchHistoricalData({
+        broker,
+        instrumentToken: NIFTY50_INSTRUMENT_TOKEN,
+        symbol: 'NIFTY 50',
+        interval: 'day',
+        from: fmt(from),
+        to: fmt(to),
+        cacheTTL: 6 * 3600,
+      });
+
+      log.info({ candles: candles.length }, 'Nifty 50 daily candles fetched for regime detector');
+      return candles;
+    } catch (err) {
+      log.warn({ err: err.message }, 'Failed to fetch Nifty 50 candles — regime detector will use cached data');
+      return [];
+    }
   }
 
   // ─── Open Positions Provider ───────────────────────────
@@ -354,16 +396,12 @@ async function main() {
     }
   }
 
-  // ─── Health Check Provider ─────────────────────
+  // ─── Health Check Provider ─────────────────────────────
   async function healthCheck() {
-    let dbOk = false;
-    let redisOk = false;
-    let brokerOk = false;
-
+    let dbOk = false, redisOk = false, brokerOk = false;
     try { dbOk = await checkDatabaseHealth(); } catch { /* */ }
     try { redisOk = await checkRedisHealth(); } catch { /* */ }
     try { brokerOk = broker ? await broker.isConnected() : false; } catch { /* */ }
-
     return { broker: brokerOk, redis: redisOk, db: dbOk };
   }
 
@@ -387,16 +425,18 @@ async function main() {
     killSwitch,
     riskManager,
     engine,
+    pipeline,          // ← pass pipeline for warmup + weekly maintenance
     broker,
     dataFeed: tickFeed,
     getWatchlist,
+    getNiftyCandles,   // ← new provider for regime detector
     getOpenPositions,
     sendReport,
     healthCheck,
   });
 
   scheduler.start();
-  log.info('✅ Market scheduler started (6 daily jobs registered)');
+  log.info('✅ Market scheduler started (7 daily jobs registered)');
 
   registerShutdown('scheduler', async () => {
     scheduler.stop();
@@ -411,10 +451,8 @@ async function main() {
       if (positions.length > 0) {
         log.warn({ count: positions.length }, '⚠️ Emergency square-off: closing open positions before shutdown');
         const { executeSquareOff } = await import('./risk/square-off-job.js');
-        // Force square-off regardless of time check
         const result = await executeSquareOff({ broker, riskManager, getOpenPositions, force: true });
-        log.warn({ squaredOff: result.squaredOff, errors: result.errors.length },
-          'Emergency square-off result');
+        log.warn({ squaredOff: result.squaredOff, errors: result.errors.length }, 'Emergency square-off result');
         if (telegram.enabled) {
           telegram.sendRaw(
             `⚠️ <b>Emergency Shutdown</b>\nClosed ${result.squaredOff} position(s)\n` +
@@ -454,21 +492,18 @@ async function main() {
         const execAsync = promisify(exec);
 
         const { stdout, stderr } = await execAsync('node scripts/auto-login.js', {
-          cwd: process.cwd(),
-          timeout: 120000,
-          env: process.env,
+          cwd: process.cwd(), timeout: 120000, env: process.env,
         });
         if (stdout) log.info({ stdout: stdout.slice(-500) }, 'Auto-login output');
         if (stderr) log.warn({ stderr: stderr.slice(-500) }, 'Auto-login stderr');
 
-        // Refresh broker token
         const newToken = await getRedis().get('kite:access_token');
         if (newToken && broker) {
           broker.primary.setAccessToken(newToken);
           log.info('✅ Broker access token refreshed');
         } else if (newToken && !broker) {
           try {
-            const kiteClient = new KiteClient({
+            kiteClient = new KiteClient({
               apiKey: config.KITE_API_KEY,
               apiSecret: config.KITE_API_SECRET,
               accessToken: newToken,
@@ -501,12 +536,7 @@ async function main() {
   // ─── Start REST API Server ─────────────────────────────
   const { createServer } = await import('node:http');
   const apiHandler = createApiHandler({
-    killSwitch,
-    riskManager,
-    engine,
-    config,
-    broker,
-    telegram,
+    killSwitch, riskManager, engine, config, broker, telegram,
   });
 
   const apiServer = createServer(apiHandler);
@@ -536,8 +566,9 @@ async function main() {
   log.info(`  📊 Mode: ${config.LIVE_TRADING && broker ? 'LIVE' : 'PAPER'}`);
   log.info(`  🔌 Broker: ${broker ? 'Connected' : 'Not connected (run: npm run login)'}`);
   log.info(`  📈 Strategies: ${consensus.strategies.length}`);
+  log.info(`  🧠 Pipeline: ${pipeline ? 'Active (trend + regime + adaptive + news)' : 'Disabled (Redis unavailable)'}`);
   log.info(`  📋 Watchlist: ${watchlistSymbols.join(', ')}`);
-  log.info(`  ⏰ Scheduler: 6 jobs (9:00-15:35 IST)`);
+  log.info(`  ⏰ Scheduler: 7 jobs (8:55 Sun + 9:00–15:35 IST Mon-Fri)`);
   log.info(`  🔐 Auto-login: 8:00 AM IST daily`);
   log.info('═══════════════════════════════════════════════════');
 }

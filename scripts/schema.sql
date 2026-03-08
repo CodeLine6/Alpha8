@@ -79,3 +79,21 @@ CREATE TABLE IF NOT EXISTS settings (
   value         TEXT NOT NULL,
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- ─── Signal Outcomes Table ────────────────────────────
+-- Used by AdaptiveWeightManager to track per-strategy accuracy.
+-- Each row = one signal's real-world outcome after the trade closed.
+CREATE TABLE IF NOT EXISTS signal_outcomes (
+  id          SERIAL PRIMARY KEY,
+  strategy    VARCHAR(50)  NOT NULL,
+  signal      VARCHAR(10)  NOT NULL,
+  symbol      VARCHAR(20)  NOT NULL,
+  outcome     VARCHAR(10)  NOT NULL CHECK (outcome IN ('WIN', 'LOSS')),
+  pnl         DECIMAL(12, 2),
+  recorded_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_outcomes_strategy
+  ON signal_outcomes(strategy, recorded_at);
+CREATE INDEX IF NOT EXISTS idx_signal_outcomes_symbol
+  ON signal_outcomes(symbol, recorded_at);

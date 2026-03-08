@@ -58,16 +58,21 @@ const envSchema = z.object({
 
   // ─── API Authentication ───────────────────────────────
   API_SECRET_KEY: z.string().optional().default(''),
+
+  // ─── News Sentiment Filter ────────────────────────────
+  // Optional — leave empty to disable news sentiment gate.
+  // Get your key at: https://console.anthropic.com/
+  ANTHROPIC_API_KEY: z.string().optional().default(''),
 }).refine(
   (data) => data.KILL_SWITCH_DRAWDOWN_PCT >= data.MAX_DAILY_LOSS_PCT, {
-    message: 'KILL_SWITCH_DRAWDOWN_PCT must be >= MAX_DAILY_LOSS_PCT',
-    path: ['KILL_SWITCH_DRAWDOWN_PCT'],
-  }
+  message: 'KILL_SWITCH_DRAWDOWN_PCT must be >= MAX_DAILY_LOSS_PCT',
+  path: ['KILL_SWITCH_DRAWDOWN_PCT'],
+}
 ).refine(
   (data) => data.PER_TRADE_STOP_LOSS_PCT <= data.MAX_DAILY_LOSS_PCT, {
-    message: 'PER_TRADE_STOP_LOSS_PCT should be <= MAX_DAILY_LOSS_PCT',
-    path: ['PER_TRADE_STOP_LOSS_PCT'],
-  }
+  message: 'PER_TRADE_STOP_LOSS_PCT should be <= MAX_DAILY_LOSS_PCT',
+  path: ['PER_TRADE_STOP_LOSS_PCT'],
+}
 );
 
 /**
