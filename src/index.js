@@ -271,6 +271,19 @@ async function main() {
 
   if (telegram.enabled) {
     log.info('✅ Telegram bot initialized');
+
+    // Start polling for secure remote commands
+    telegram.startPolling();
+
+    telegram.onCommand('/reset_kill_switch', async () => {
+      log.warn('Received remote kill switch reset via Telegram');
+      if (killSwitch.isEngaged()) {
+        await killSwitch.reset('CONFIRM_RESET');
+        telegram.sendRaw('✅ <b>Kill Switch Reset</b>\nTrading may resume.');
+      } else {
+        telegram.sendRaw('ℹ️ <b>Kill Switch</b> is not currently engaged.');
+      }
+    });
   } else {
     log.warn('⚠️  Telegram bot disabled — missing token or chatId');
   }

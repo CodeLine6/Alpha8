@@ -182,7 +182,9 @@ async function browserLogin() {
   let requestToken = null;
 
   try {
-    const page = await browser.newPage();
+    // Force a completely fresh browser context (clears cookies, cache, local storage)
+    const context = await browser.createIncognitoBrowserContext();
+    const page = await context.newPage();
 
     // Set viewport and user-agent
     await page.setViewport({ width: 1280, height: 800 });

@@ -46,6 +46,10 @@ export class TelegramBot {
     this._totalFailed = 0;
     this._totalDropped = 0;
 
+    this._commandHandlers = new Map();
+    this._isPolling = false;
+    this._lastUpdateId = 0;
+
     if (this.enabled) {
       log.info({ chatId: this.chatId }, 'TelegramBot initialized');
     } else {
@@ -103,6 +107,111 @@ export class TelegramBot {
    */
   sendRaw(html) {
     return this._enqueue(html);
+  }
+
+  /**
+   * Register a command listener (e.g. '/reset')
+   * @param {string} command
+   * @param {Function} handler - Async callback
+   */
+  onCommand(command, handler) {
+    this._commandHandlers.set(command, handler);
+    log.info({ command }, 'Telegram command handler registered');
+  }
+
+  /**
+   * Start polling for incoming messages.
+   * Discards all historical messages on boot to prevent replay of old commands.
+   */
+  async startPolling(intervalMs = 5000) {
+    if (!this.enabled || this._isPolling) return;
+    this._isPolling = true;
+
+    try {
+      // Discard previous messages by requesting the latest update without processing it
+      const url = `https://api.telegram.org/bot${this.token}/getUpdates`;
+      const response = await axios.get(url, { params: { timeout: 0 }, timeout: 5000 });
+      if (response.data?.ok && response.data.result.length > 0) {
+        const updates = response.data.result;
+        this._lastUpdateId = updates[updates.length - 1].update_id;
+      }
+    } catch (err) {
+      log.debug('Initial getUpdates failed to discard backlog (normal if no internet)');
+    }
+
+    log.info('Telegram polling started');
+
+    // Fire and forget polling loop
+    this._pollLoop(intervalMs).catch(err => {
+      log.error({ err: err.message }, 'Telegram polling loop crashed');
+      this._isPolling = false;
+    });
+  }
+
+  /**
+   * Stop polling.
+   */
+  stopPolling() {
+    this._isPolling = false;
+    log.info('Telegram polling stopped');
+  }
+
+  /**
+   * @private
+   */
+  async _pollLoop(intervalMs) {
+    while (this._isPolling) {
+      try {
+        const url = `https://api.telegram.org/bot${this.token}/getUpdates`;
+        const params = {
+          offset: this._lastUpdateId + 1,
+          timeout: 10,
+          allowed_updates: ['message']
+        };
+
+        const response = await axios.get(url, { params, timeout: 15000 });
+        const data = response.data;
+
+        if (data && data.ok && Array.isArray(data.result)) {
+          for (const update of data.result) {
+            this._lastUpdateId = Math.max(this._lastUpdateId, update.update_id);
+            this._handleIncomingUpdate(update); // Fire without awaiting to keep draining
+          }
+        }
+      } catch (err) {
+        log.debug({ err: err.message }, 'Telegram getUpdates polled');
+      }
+
+      await this._delay(intervalMs);
+    }
+  }
+
+  /**
+   * @private
+   */
+  async _handleIncomingUpdate(update) {
+    const message = update.message;
+    if (!message || !message.text) return;
+
+    const senderChatId = message.chat.id.toString();
+
+    // Security: Only process commands from our configured chatId
+    if (senderChatId !== this.chatId.toString()) {
+      return;
+    }
+
+    const text = message.text.trim();
+    for (const [cmd, handler] of this._commandHandlers.entries()) {
+      if (text.startsWith(cmd)) {
+        log.info({ command: cmd }, 'Executing Telegram command');
+        try {
+          await handler(text, message);
+        } catch (err) {
+          log.error({ err: err.message, command: cmd }, 'Telegram command handler failed');
+        }
+        return;
+      }
+    }
   }
 
   // ═══════════════════════════════════════════════════════
