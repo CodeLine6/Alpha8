@@ -183,7 +183,7 @@ async function browserLogin() {
 
   try {
     // Force a completely fresh browser context (clears cookies, cache, local storage)
-    const context = await browser.createIncognitoBrowserContext();
+    const context = await browser.createBrowserContext();
     const page = await context.newPage();
 
     // Set viewport and user-agent
