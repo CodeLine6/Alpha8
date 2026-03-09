@@ -43,3 +43,4 @@ __snapshots__/
 
 # Temporary
 tmp/
+.cache/
