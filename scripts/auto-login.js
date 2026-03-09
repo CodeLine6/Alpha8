@@ -90,7 +90,15 @@ async function storeTokenInRedis(accessToken) {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
       const { default: Redis } = await import('ioredis');
-      const redis = new Redis(REDIS_URL, { keyPrefix: 'alpha8:', lazyConnect: true });
+      const url = (REDIS_URL.includes('upstash.io') && REDIS_URL.startsWith('redis://'))
+        ? REDIS_URL.replace('redis://', 'rediss://')
+        : REDIS_URL;
+
+      const redis = new Redis(url, {
+        keyPrefix: 'alpha8:',
+        lazyConnect: true,
+        family: 4
+      });
 
       try {
         await redis.connect();
@@ -129,7 +137,15 @@ async function storeTokenInRedis(accessToken) {
 async function engageKillSwitch(reason) {
   try {
     const { default: Redis } = await import('ioredis');
-    const redis = new Redis(REDIS_URL, { keyPrefix: 'alpha8:', lazyConnect: true });
+    const url = (REDIS_URL.includes('upstash.io') && REDIS_URL.startsWith('redis://'))
+      ? REDIS_URL.replace('redis://', 'rediss://')
+      : REDIS_URL;
+
+    const redis = new Redis(url, {
+      keyPrefix: 'alpha8:',
+      lazyConnect: true,
+      family: 4
+    });
 
     await redis.connect();
     const killState = JSON.stringify({

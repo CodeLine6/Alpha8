@@ -13,16 +13,24 @@ let redisClient = null;
  * @returns {Redis} The Redis client instance
  */
 export function initRedis(url) {
-  redisClient = new Redis(url, {
+  // Auto-upgrade Upstash connections to use TLS (rediss://)
+  if (url.includes('upstash.io') && url.startsWith('redis://')) {
+    url = url.replace('redis://', 'rediss://');
+  }
+
+  const options = {
     keyPrefix: 'alpha8:',
     maxRetriesPerRequest: 3,
+    family: 4, // Force IPv4 to prevent Render/Upstash disconnect loops
     retryStrategy(times) {
       const delay = Math.min(times * 200, 5000);
       log.warn({ attempt: times, delayMs: delay }, 'Redis reconnecting...');
       return delay;
     },
     lazyConnect: true,
-  });
+  };
+
+  redisClient = new Redis(url, options);
 
   redisClient.on('connect', () => {
     log.info('Redis connected');
