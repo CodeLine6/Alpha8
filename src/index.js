@@ -22,6 +22,7 @@ import {
 } from './strategies/index.js';
 import { createApiHandler } from './api/backend-api.js';
 import { EnhancedSignalPipeline } from './intelligence/enhanced-pipeline.js';
+import { SymbolScout } from './intelligence/symbol-scout.js';
 
 const log = createLogger('main');
 const APP_VERSION = '1.0.0';
@@ -30,14 +31,14 @@ const APP_VERSION = '1.0.0';
 const NIFTY50_INSTRUMENT_TOKEN = 256265;
 
 /**
- * Quant8 — Automated Stock Trading Application
+ * Alpha8 — Automated Stock Trading Application
  * Entry point: initializes all services, wires the trading pipeline,
  * and starts the market-day scheduler.
  */
 async function main() {
   // ─── Startup Banner ────────────────────────────────────
   log.info('═══════════════════════════════════════════════════');
-  log.info(`  🚀 Quant8 v${APP_VERSION}`);
+  log.info(`  🚀 Alpha8 v${APP_VERSION}`);
   log.info(`  📊 Mode: ${config.LIVE_TRADING ? '🔴 LIVE TRADING' : '🟢 PAPER TRADING'}`);
   log.info(`  💰 Capital: ₹${config.TRADING_CAPITAL.toLocaleString('en-IN')}`);
   log.info(`  🌍 Timezone: ${TIMEZONE}`);
@@ -89,7 +90,7 @@ async function main() {
     log.warn({ err }, '⚠️  Redis initialization failed — running without cache');
   }
 
-  // ─── H6/L2: Holiday Year Validation ────────────────────
+  // ─── Holiday Year Validation ────────────────────────────
   const currentYear = new Date().getFullYear();
   if (MARKET_HOLIDAYS_YEAR !== currentYear) {
     log.warn({
@@ -229,12 +230,12 @@ async function main() {
   if (redisHealthy) {
     pipeline = new EnhancedSignalPipeline({
       redis: getRedis(),
-      broker,                          // for trend filter (Yahoo fallback if null)
-      instrumentManager,               // for token lookup in trend filter
+      broker,
+      instrumentManager,
       anthropicApiKey: config.ANTHROPIC_API_KEY || null,
       trendEnabled: true,
       regimeEnabled: true,
-      adaptiveEnabled: dbHealthy,    // needs DB for signal_outcomes table
+      adaptiveEnabled: dbHealthy,
       newsEnabled: !!config.ANTHROPIC_API_KEY,
     });
     log.info({
@@ -252,7 +253,7 @@ async function main() {
     riskManager,
     killSwitch,
     consensus,
-    pipeline,                          // ← pass pipeline here
+    pipeline,
     broker,
     paperMode: !config.LIVE_TRADING || !broker,
   });
@@ -270,46 +271,88 @@ async function main() {
 
   if (telegram.enabled) {
     log.info('✅ Telegram bot initialized');
-    telegram.sendRaw(
-      `🚀 <b>Quant8 Started</b>\n` +
-      `📊 Mode: ${config.LIVE_TRADING ? '🔴 LIVE' : '🟢 PAPER'}\n` +
-      `🔌 Broker: ${broker ? '✅ Connected' : '❌ Not connected'}\n` +
-      `📈 Strategies: ${consensus.strategies.length}\n` +
-      `🧠 Pipeline: ${pipeline ? '✅ Active' : '❌ Disabled'}\n` +
-      `📋 Watchlist: ${config.WATCHLIST}\n` +
-      `💰 Capital: ₹${config.TRADING_CAPITAL.toLocaleString('en-IN')}\n` +
-      `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
-    ).catch(err => log.error({ err: err.message }, 'Failed to send Telegram startup message'));
   } else {
     log.warn('⚠️  Telegram bot disabled — missing token or chatId');
   }
 
-  // ─── Parse Watchlist ───────────────────────────────────
-  const watchlistSymbols = config.WATCHLIST
+  // ─── Parse Pinned (config) Watchlist ───────────────────
+  // These symbols are always traded regardless of scout scores.
+  const pinnedSymbols = config.WATCHLIST
     .split(',')
-    .map((s) => s.trim())
+    .map(s => s.trim())
     .filter(Boolean);
 
-  log.info({ symbols: watchlistSymbols }, `📋 Watchlist: ${watchlistSymbols.length} symbols`);
+  log.info({ symbols: pinnedSymbols }, `📌 Pinned watchlist: ${pinnedSymbols.length} symbols`);
 
+  // ─── Initialize Symbol Scout ───────────────────────────
+  // Requires DB (reads/writes settings + symbol_scores tables).
+  let scout = null;
+  if (dbHealthy) {
+    scout = new SymbolScout({
+      broker,
+      telegram,
+      pinnedSymbols,
+      maxDynamic: config.SCOUT_MAX_DYNAMIC ?? 10,
+      excludeSymbols: config.SCOUT_EXCLUDE_SYMBOLS
+        ? config.SCOUT_EXCLUDE_SYMBOLS.split(',').map(s => s.trim()).filter(Boolean)
+        : [],
+    });
+    log.info({
+      pinned: pinnedSymbols.length,
+      maxDynamic: config.SCOUT_MAX_DYNAMIC ?? 10,
+    }, '✅ Symbol scout initialized');
+  } else {
+    log.warn('⚠️  Symbol scout disabled — DB not available (falling back to pinned watchlist only)');
+  }
+
+  // ─── Resolve Instrument Tokens ─────────────────────────
+  // Pre-resolve for pinned symbols. Dynamic symbols are resolved lazily
+  // inside getWatchlist() each scan cycle.
   let watchlistTokens = {};
-  if (instrumentManager) {
-    const resolved = instrumentManager.resolveSymbols(watchlistSymbols);
+  if (instrumentManager && pinnedSymbols.length > 0) {
+    const resolved = instrumentManager.resolveSymbols(pinnedSymbols);
     watchlistTokens = resolved.symbolMap;
-    log.info({ tokens: resolved.tokens.length }, '✅ Watchlist tokens resolved');
+    log.info({ tokens: resolved.tokens.length }, '✅ Pinned watchlist tokens resolved');
 
     if (tickFeed) {
       tickFeed.symbolMap = resolved.symbolMap;
     }
   }
 
+  // ─── Resubscribe Tick Feed After Watchlist Change ──────
+  async function resubscribeTickFeed(symbols) {
+    if (!tickFeed || !instrumentManager) return;
+    try {
+      const resolved = instrumentManager.resolveSymbols(symbols);
+      tickFeed.symbolMap = resolved.symbolMap;
+      if (resolved.tokens.length > 0) {
+        tickFeed.subscribe(resolved.tokens, 'full');
+        log.info({ tokens: resolved.tokens.length }, 'Tick feed resubscribed');
+      }
+    } catch (err) {
+      log.warn({ err: err.message }, 'Failed to resubscribe tick feed');
+    }
+  }
+
   // ─── Watchlist Provider ────────────────────────────────
+  // Returns the current active watchlist = pinned + dynamic (from scout).
+  // Called every scan cycle — always reflects the latest state.
   async function getWatchlist() {
+    // Get active symbols: scout manages dynamic list, falls back to pinned only
+    let activeSymbols;
+    if (scout) {
+      activeSymbols = await scout.getActiveWatchlist();
+    } else {
+      activeSymbols = pinnedSymbols;
+    }
+
     const items = [];
 
-    for (const symbol of watchlistSymbols) {
+    for (const symbol of activeSymbols) {
       try {
-        const instrumentToken = instrumentManager?.getToken(symbol);
+        const instrumentToken = instrumentManager?.getToken(symbol)
+          ?? watchlistTokens[symbol]
+          ?? null;
 
         let currentPrice = 0;
         if (tickFeed && instrumentToken) {
@@ -353,16 +396,15 @@ async function main() {
   }
 
   // ─── Nifty 50 Daily Candles Provider ───────────────────
-  // Used by regime detector during pre-market warm-up.
   async function getNiftyCandles() {
     if (!broker) return [];
 
     try {
       const to = new Date();
       const from = new Date();
-      from.setDate(from.getDate() - 70); // 70 days for ATR/ADX
+      from.setDate(from.getDate() - 70);
 
-      const fmt = (d) => d.toISOString().split('T')[0];
+      const fmt = d => d.toISOString().split('T')[0];
 
       const candles = await fetchHistoricalData({
         broker,
@@ -388,7 +430,7 @@ async function main() {
     try {
       const positions = await broker.getPositions();
       return (positions?.net || positions || []).filter(
-        (p) => (p.quantity || p.netQuantity || 0) !== 0
+        p => (p.quantity || p.netQuantity || 0) !== 0
       );
     } catch (err) {
       log.warn({ err: err.message }, 'Failed to fetch open positions');
@@ -408,15 +450,30 @@ async function main() {
   // ─── Daily Report Provider ─────────────────────────────
   async function sendReport(summary) {
     if (!telegram.enabled) return;
+
+    // Build watchlist change summary for report
+    let watchlistLine = '';
+    if (scout) {
+      try {
+        const active = await scout.getActiveWatchlist();
+        const dynamic = active.filter(s => !pinnedSymbols.includes(s));
+        watchlistLine = dynamic.length > 0
+          ? `\n🔍 Scout Watchlist: ${dynamic.join(', ')}`
+          : '';
+      } catch { /* */ }
+    }
+
     const msg =
-      `📊 <b>Quant8 Daily Report</b>\n` +
+      `📊 <b>Alpha8 Daily Report</b>\n` +
       `${summary.mode === 'PAPER' ? '🟢 Paper' : '🔴 Live'} Trading\n\n` +
       `💰 PnL: ₹${(summary.pnl || 0).toLocaleString('en-IN')}\n` +
       `📈 Trades: ${summary.trades || 0}\n` +
       `✅ Wins: ${summary.wins || 0}\n` +
       `❌ Losses: ${summary.losses || 0}\n` +
-      `🔘 Open: ${summary.openPositions || 0}\n\n` +
-      `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`;
+      `🔘 Open: ${summary.openPositions || 0}` +
+      watchlistLine +
+      `\n\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`;
+
     await telegram.sendRaw(msg);
   }
 
@@ -425,18 +482,19 @@ async function main() {
     killSwitch,
     riskManager,
     engine,
-    pipeline,          // ← pass pipeline for warmup + weekly maintenance
+    pipeline,
+    scout,             // ← NEW: passes scout for nightly job
     broker,
     dataFeed: tickFeed,
     getWatchlist,
-    getNiftyCandles,   // ← new provider for regime detector
+    getNiftyCandles,
     getOpenPositions,
     sendReport,
     healthCheck,
   });
 
   scheduler.start();
-  log.info('✅ Market scheduler started (7 daily jobs registered)');
+  log.info('✅ Market scheduler started (8 daily jobs registered)');
 
   registerShutdown('scheduler', async () => {
     scheduler.stop();
@@ -466,12 +524,12 @@ async function main() {
     }
   });
 
-  // ─── Subscribe Tick Feed to Watchlist ──────────────────
+  // ─── Subscribe Tick Feed to Pinned Watchlist ───────────
   if (tickFeed && instrumentManager) {
-    const resolved = instrumentManager.resolveSymbols(watchlistSymbols);
+    const resolved = instrumentManager.resolveSymbols(pinnedSymbols);
     if (resolved.tokens.length > 0) {
       tickFeed.subscribe(resolved.tokens, 'full');
-      log.info({ tokens: resolved.tokens.length }, '✅ Tick feed subscribed to watchlist');
+      log.info({ tokens: resolved.tokens.length }, '✅ Tick feed subscribed to pinned watchlist');
     }
 
     registerShutdown('tick-feed', async () => {
@@ -483,6 +541,19 @@ async function main() {
   // ─── Schedule Auto-Login Cron (8:00 AM IST) ────────────
   try {
     const { default: cron } = await import('node-cron');
+
+    // ─── Keep-Awake Cron (Every 10 mins) ───────────────────
+    cron.schedule('*/10 * * * *', async () => {
+      const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${config.PORT}`;
+      const pingUrl = url.endsWith('/') ? `${url}health` : `${url}/health`;
+      log.info(`🔌 Pinging service to keep awake: ${pingUrl}`);
+      try {
+        const { default: axios } = await import('axios');
+        await axios.get(pingUrl);
+      } catch (err) {
+        log.warn({ err: err.message }, '⚠️  Keep-awake ping failed');
+      }
+    });
 
     cron.schedule('0 8 * * 1-5', async () => {
       log.info('🔐 Running scheduled auto-login...');
@@ -512,6 +583,7 @@ async function main() {
             engine.broker = broker;
             engine.paperMode = !config.LIVE_TRADING;
             scheduler.broker = broker;
+            if (scout) scout.broker = broker;   // ← give scout live broker too
             log.info('✅ Broker initialized from scheduled auto-login');
           } catch (initErr) {
             log.error({ err: initErr.message }, 'Failed to init broker after login');
@@ -536,7 +608,7 @@ async function main() {
   // ─── Start REST API Server ─────────────────────────────
   const { createServer } = await import('node:http');
   const apiHandler = createApiHandler({
-    killSwitch, riskManager, engine, config, broker, telegram,
+    killSwitch, riskManager, engine, config, broker, telegram, scout,
   });
 
   const apiServer = createServer(apiHandler);
@@ -558,17 +630,45 @@ async function main() {
     log.info('API server closed');
   });
 
+  // ─── Send Startup Telegram ────────────────────────────
+  if (telegram.enabled) {
+    let activeWatchlist = pinnedSymbols;
+    if (scout) {
+      try { activeWatchlist = await scout.getActiveWatchlist(); } catch { /* */ }
+    }
+
+    telegram.sendRaw(
+      `🚀 <b>Alpha8 Started</b>\n` +
+      `📊 Mode: ${config.LIVE_TRADING ? '🔴 LIVE' : '🟢 PAPER'}\n` +
+      `🔌 Broker: ${broker ? '✅ Connected' : '❌ Not connected'}\n` +
+      `📈 Strategies: ${consensus.strategies.length}\n` +
+      `🧠 Pipeline: ${pipeline ? '✅ Active' : '❌ Disabled'}\n` +
+      `🔍 Scout: ${scout ? '✅ Active (nightly @ 8 PM)' : '❌ Disabled'}\n` +
+      `📌 Pinned: ${pinnedSymbols.join(', ')}\n` +
+      `📋 Active watchlist (${activeWatchlist.length}): ${activeWatchlist.join(', ')}\n` +
+      `💰 Capital: ₹${config.TRADING_CAPITAL.toLocaleString('en-IN')}\n` +
+      `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+    ).catch(err => log.error({ err: err.message }, 'Failed to send Telegram startup message'));
+  }
+
   // ─── Ready ─────────────────────────────────────────────
+  let activeWatchlist = pinnedSymbols;
+  if (scout) {
+    try { activeWatchlist = await scout.getActiveWatchlist(); } catch { /* */ }
+  }
+
   log.info('');
   log.info('═══════════════════════════════════════════════════');
-  log.info('  🎯 Quant8 initialized successfully');
+  log.info('  🎯 Alpha8 initialized successfully');
   log.info(`  📡 API: http://localhost:${config.PORT}`);
   log.info(`  📊 Mode: ${config.LIVE_TRADING && broker ? 'LIVE' : 'PAPER'}`);
   log.info(`  🔌 Broker: ${broker ? 'Connected' : 'Not connected (run: npm run login)'}`);
   log.info(`  📈 Strategies: ${consensus.strategies.length}`);
   log.info(`  🧠 Pipeline: ${pipeline ? 'Active (trend + regime + adaptive + news)' : 'Disabled (Redis unavailable)'}`);
-  log.info(`  📋 Watchlist: ${watchlistSymbols.join(', ')}`);
-  log.info(`  ⏰ Scheduler: 7 jobs (8:55 Sun + 9:00–15:35 IST Mon-Fri)`);
+  log.info(`  🔍 Scout: ${scout ? `Active — nightly scan @ 8 PM IST (${activeWatchlist.length - pinnedSymbols.length} dynamic symbols)` : 'Disabled (DB unavailable)'}`);
+  log.info(`  📌 Pinned: ${pinnedSymbols.join(', ')}`);
+  log.info(`  📋 Active watchlist (${activeWatchlist.length}): ${activeWatchlist.join(', ')}`);
+  log.info(`  ⏰ Scheduler: 8 jobs (8:55 Sun + 9:00–15:35 IST Mon-Fri + 20:00 Mon-Fri scout)`);
   log.info(`  🔐 Auto-login: 8:00 AM IST daily`);
   log.info('═══════════════════════════════════════════════════');
 }

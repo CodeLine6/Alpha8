@@ -4,7 +4,7 @@ import { config as dotenvConfig } from 'dotenv';
 dotenvConfig();
 
 const DATABASE_URL =
-  process.env.DATABASE_URL || 'postgresql://quant8:quant8_dev@localhost:5432/quant8';
+  process.env.DATABASE_URL || 'postgresql://alpha8:alpha8_dev@localhost:5432/alpha8';
 
 const { Client } = pg;
 

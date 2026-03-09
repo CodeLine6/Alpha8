@@ -1,4 +1,4 @@
--- Quant8 Database Schema
+-- Alpha8 Database Schema
 -- Run this against your PostgreSQL database to create required tables.
 -- Usage: psql $DATABASE_URL -f scripts/schema.sql
 
@@ -97,3 +97,47 @@ CREATE INDEX IF NOT EXISTS idx_signal_outcomes_strategy
   ON signal_outcomes(strategy, recorded_at);
 CREATE INDEX IF NOT EXISTS idx_signal_outcomes_symbol
   ON signal_outcomes(symbol, recorded_at);
+
+-- ─── Symbol Scores Table ──────────────────────────────
+-- Stores the nightly scout scores for all scanned symbols.
+-- Each nightly run inserts a fresh snapshot — last N days queryable.
+-- The dashboard reads latest scores to show why symbols were added/removed.
+CREATE TABLE IF NOT EXISTS symbol_scores (
+  id          SERIAL PRIMARY KEY,
+  symbol      VARCHAR(32)  NOT NULL,
+  score       INTEGER      NOT NULL CHECK (score >= 0 AND score <= 100),
+  breakdown   JSONB,       -- { liquidity, trend, volatility, momentum, trackRecord }
+  scanned_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_symbol_scores_symbol
+  ON symbol_scores(symbol, scanned_at DESC);
+CREATE INDEX IF NOT EXISTS idx_symbol_scores_scanned_at
+  ON symbol_scores(scanned_at DESC);
+
+-- Auto-purge: keep only last 30 days of scores (run via pg_cron or manually)
+-- DELETE FROM symbol_scores WHERE scanned_at < NOW() - INTERVAL '30 days';
+
+-- ─── Watchlist Log Table ──────────────────────────────
+-- Audit trail of every add/remove made by the symbol scout.
+-- Lets you review why a symbol was added or dropped on any given day.
+CREATE TABLE IF NOT EXISTS watchlist_log (
+  id          SERIAL PRIMARY KEY,
+  symbol      VARCHAR(32)  NOT NULL,
+  action      VARCHAR(10)  NOT NULL CHECK (action IN ('ADDED', 'REMOVED', 'PINNED')),
+  reason      TEXT,
+  score       INTEGER,
+  logged_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_watchlist_log_symbol
+  ON watchlist_log(symbol, logged_at DESC);
+CREATE INDEX IF NOT EXISTS idx_watchlist_log_logged_at
+  ON watchlist_log(logged_at DESC);
+
+-- ─── Seed: initial dynamic watchlist ─────────────────
+-- On first run the dynamic list is empty — the scout fills it that night.
+-- This insert is a no-op on subsequent runs (ON CONFLICT DO NOTHING).
+INSERT INTO settings (key, value, updated_at)
+VALUES ('dynamic_watchlist', '[]', NOW())
+ON CONFLICT (key) DO NOTHING;

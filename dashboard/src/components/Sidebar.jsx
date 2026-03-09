@@ -24,7 +24,7 @@ export default function Sidebar() {
                     Q
                 </div>
                 <span className="text-lg font-bold bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent whitespace-nowrap sidebar-label">
-                    Quant8
+                    Alpha8
                 </span>
             </div>
 
@@ -55,7 +55,7 @@ export default function Sidebar() {
             {/* Footer */}
             <div className="px-4 py-3 border-t border-[var(--border-subtle)] shrink-0">
                 <div className="text-xs text-[var(--text-muted)] sidebar-label whitespace-nowrap">
-                    Quant8 v1.0
+                    Alpha8 v1.0
                 </div>
             </div>
         </aside>

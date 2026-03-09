@@ -1,5 +1,5 @@
 /**
- * @fileoverview Adaptive Strategy Weighting for Quant8
+ * @fileoverview Adaptive Strategy Weighting for Alpha8
  *
  * Every Sunday after market close, reviews the last 2 weeks of signal outcomes
  * and adjusts how much each strategy is trusted in the consensus vote.
@@ -31,7 +31,7 @@ import { query } from '../lib/db.js';
 
 const log = createLogger('adaptive-weights');
 
-// NOTE: Redis keyPrefix 'quant8:' is applied automatically — don't add it here
+// NOTE: Redis keyPrefix 'alpha8:' is applied automatically — don't add it here
 const CACHE_KEY = 'strategy:weights';
 const CACHE_TTL_SEC = 7 * 24 * 60 * 60; // 1 week
 

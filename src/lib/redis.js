@@ -14,7 +14,7 @@ let redisClient = null;
  */
 export function initRedis(url) {
   redisClient = new Redis(url, {
-    keyPrefix: 'quant8:',
+    keyPrefix: 'alpha8:',
     maxRetriesPerRequest: 3,
     retryStrategy(times) {
       const delay = Math.min(times * 200, 5000);
@@ -75,7 +75,7 @@ export async function checkRedisHealth() {
 
 /**
  * Cache a value with optional TTL.
- * @param {string} key - Cache key (auto-prefixed with 'quant8:')
+ * @param {string} key - Cache key (auto-prefixed with 'alpha8:')
  * @param {any} value - Value to cache (will be JSON-stringified)
  * @param {number} [ttlSeconds] - Optional TTL in seconds
  */
@@ -91,7 +91,7 @@ export async function cacheSet(key, value, ttlSeconds) {
 
 /**
  * Retrieve a cached value.
- * @param {string} key - Cache key (auto-prefixed with 'quant8:')
+ * @param {string} key - Cache key (auto-prefixed with 'alpha8:')
  * @returns {Promise<any | null>} Parsed value or null if not found
  */
 export async function cacheGet(key) {

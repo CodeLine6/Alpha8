@@ -23,7 +23,7 @@ import { exportCsv }
   from '../src/backtesting/report-generator.js';
 
 import { tmpdir } from 'os';
-import { join }   from 'path';
+import { join } from 'path';
 import { readFileSync, existsSync, rmSync } from 'fs';
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -41,16 +41,16 @@ import { readFileSync, existsSync, rmSync } from 'fs';
 function makeCandle(isoDate, istTime, { open = 100, high, low, close = 100, volume = 10000 } = {}) {
   const [h, m] = istTime.split(':').map(Number);
   // Convert IST to UTC: subtract 5h30m
-  const utcHours   = h - 5;
+  const utcHours = h - 5;
   const utcMinutes = m - 30;
   const d = new Date(`${isoDate}T00:00:00Z`);
   d.setUTCHours(utcHours, utcMinutes, 0, 0);
 
   return {
-    date:   d,
+    date: d,
     open,
-    high:   high  ?? Math.max(open, close) + 2,
-    low:    low   ?? Math.min(open, close) - 2,
+    high: high ?? Math.max(open, close) + 2,
+    low: low ?? Math.min(open, close) - 2,
     close,
     volume,
   };
@@ -65,8 +65,8 @@ function makeTradingDay(isoDate, { trend = 'up', basePrice = 100 } = {}) {
   const times = [];
 
   for (let h = 9; h <= 15; h++) {
-    const startM = h === 9  ? 15 : 0;
-    const endM   = h === 15 ? 10 : 55;
+    const startM = h === 9 ? 15 : 0;
+    const endM = h === 15 ? 10 : 55;
     for (let m = startM; m <= endM; m += 5) {
       times.push(`${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`);
     }
@@ -76,10 +76,10 @@ function makeTradingDay(isoDate, { trend = 'up', basePrice = 100 } = {}) {
     const delta = trend === 'up' ? i * 0.1 : trend === 'down' ? -i * 0.1 : 0;
     const price = basePrice + delta;
     candles.push(makeCandle(isoDate, t, {
-      open:   price,
-      close:  price + (trend === 'up' ? 0.05 : -0.05),
-      high:   price + 1,
-      low:    price - 1,
+      open: price,
+      close: price + (trend === 'up' ? 0.05 : -0.05),
+      high: price + 1,
+      low: price - 1,
       volume: 10000 + i * 100,
     }));
   });
@@ -113,11 +113,11 @@ function mockStrategy(signalSequence) {
       const sig = signalSequence[callCount % signalSequence.length];
       callCount++;
       return {
-        signal:     sig,
+        signal: sig,
         confidence: 80,
-        reason:     `mock-${sig}`,
-        strategy:   'mock',
-        timestamp:  new Date().toISOString(),
+        reason: `mock-${sig}`,
+        strategy: 'mock',
+        timestamp: new Date().toISOString(),
       };
     },
   };
@@ -130,17 +130,17 @@ function mockStrategy(signalSequence) {
 describe('MetricsCalculator', () => {
 
   const makeTrade = (pnl, entryTime, exitTime) => ({
-    symbol:    'TEST',
-    strategy:  'ema-crossover',
-    side:      'BUY',
+    symbol: 'TEST',
+    strategy: 'ema-crossover',
+    side: 'BUY',
     entryPrice: 100,
-    exitPrice:  100 + pnl / 10,
-    quantity:   10,
+    exitPrice: 100 + pnl / 10,
+    quantity: 10,
     pnl,
-    pnlPct:     (pnl / 1000) * 100,
+    pnlPct: (pnl / 1000) * 100,
     exitReason: 'SIGNAL',
-    entryTime:  entryTime ?? new Date('2024-01-15T04:15:00Z'),
-    exitTime:   exitTime  ?? new Date('2024-01-15T06:00:00Z'),
+    entryTime: entryTime ?? new Date('2024-01-15T04:15:00Z'),
+    exitTime: exitTime ?? new Date('2024-01-15T06:00:00Z'),
     entryReason: 'mock signal',
   });
 
@@ -160,8 +160,8 @@ describe('MetricsCalculator', () => {
 
   describe('calculateMetrics() — winning trades', () => {
     const trades = [
-      makeTrade(500,  new Date('2024-01-15T04:15:00Z'), new Date('2024-01-15T06:00:00Z')),
-      makeTrade(300,  new Date('2024-01-16T04:15:00Z'), new Date('2024-01-16T06:00:00Z')),
+      makeTrade(500, new Date('2024-01-15T04:15:00Z'), new Date('2024-01-15T06:00:00Z')),
+      makeTrade(300, new Date('2024-01-16T04:15:00Z'), new Date('2024-01-16T06:00:00Z')),
       makeTrade(1000, new Date('2024-01-17T04:15:00Z'), new Date('2024-01-17T06:00:00Z')),
     ];
 
@@ -195,9 +195,9 @@ describe('MetricsCalculator', () => {
 
   describe('calculateMetrics() — mixed trades', () => {
     const trades = [
-      makeTrade( 500, new Date('2024-01-15T04:15:00Z'), new Date('2024-01-15T06:00:00Z')),
+      makeTrade(500, new Date('2024-01-15T04:15:00Z'), new Date('2024-01-15T06:00:00Z')),
       makeTrade(-200, new Date('2024-01-16T04:15:00Z'), new Date('2024-01-16T06:00:00Z')),
-      makeTrade( 800, new Date('2024-01-17T04:15:00Z'), new Date('2024-01-17T06:00:00Z')),
+      makeTrade(800, new Date('2024-01-17T04:15:00Z'), new Date('2024-01-17T06:00:00Z')),
       makeTrade(-100, new Date('2024-01-18T04:15:00Z'), new Date('2024-01-18T06:00:00Z')),
     ];
 
@@ -261,23 +261,23 @@ describe('MetricsCalculator', () => {
     it('positive Sharpe for varied positive returns', () => {
       // Must use varied returns — zero variance → zero Sharpe (mathematically correct)
       const returns = [0.5, 0.8, 0.3, 1.2, 0.6, 0.4, 0.9, 0.7, 0.5, 0.6,
-                       0.8, 0.4, 1.0, 0.5, 0.7, 0.6, 0.8, 0.5, 0.9, 0.4];
+        0.8, 0.4, 1.0, 0.5, 0.7, 0.6, 0.8, 0.5, 0.9, 0.4];
       expect(calculateSharpe(returns)).toBeGreaterThan(0);
     });
 
     it('negative Sharpe for varied negative returns', () => {
       const returns = [-0.5, -0.8, -0.3, -1.2, -0.6, -0.4, -0.9, -0.7, -0.5, -0.6,
-                       -0.8, -0.4, -1.0, -0.5, -0.7, -0.6, -0.8, -0.5, -0.9, -0.4];
+      -0.8, -0.4, -1.0, -0.5, -0.7, -0.6, -0.8, -0.5, -0.9, -0.4];
       expect(calculateSharpe(returns)).toBeLessThan(0);
     });
 
     it('higher Sharpe for lower volatility at same average return', () => {
       // low vol: consistent 0.2% daily
-      const lowVol  = [0.2, 0.3, 0.1, 0.4, 0.2, 0.3, 0.1, 0.2, 0.3, 0.2,
-                       0.2, 0.3, 0.1, 0.4, 0.2, 0.3, 0.1, 0.2, 0.3, 0.2];
+      const lowVol = [0.2, 0.3, 0.1, 0.4, 0.2, 0.3, 0.1, 0.2, 0.3, 0.2,
+        0.2, 0.3, 0.1, 0.4, 0.2, 0.3, 0.1, 0.2, 0.3, 0.2];
       // high vol: same avg (0.2) but much wider swings
       const highVol = [0.5, -0.3, 0.5, -0.3, 0.5, -0.3, 0.5, -0.3, 0.5, -0.3,
-                       0.5, -0.3, 0.5, -0.3, 0.5, -0.3, 0.5, -0.3, 0.5, -0.3];
+        0.5, -0.3, 0.5, -0.3, 0.5, -0.3, 0.5, -0.3, 0.5, -0.3];
       expect(calculateSharpe(lowVol)).toBeGreaterThan(calculateSharpe(highVol));
     });
   });
@@ -296,9 +296,9 @@ describe('MetricsCalculator', () => {
   describe('compareStrategies()', () => {
     it('sorts by Sharpe ratio descending', () => {
       const results = [
-        { name: 'low',  metrics: { totalReturnPct: 5, winRate: 50, sharpeRatio: 0.5, maxDrawdownPct: 10, profitFactor: 1.2, totalTrades: 20 } },
+        { name: 'low', metrics: { totalReturnPct: 5, winRate: 50, sharpeRatio: 0.5, maxDrawdownPct: 10, profitFactor: 1.2, totalTrades: 20 } },
         { name: 'high', metrics: { totalReturnPct: 10, winRate: 60, sharpeRatio: 1.5, maxDrawdownPct: 8, profitFactor: 1.8, totalTrades: 25 } },
-        { name: 'mid',  metrics: { totalReturnPct: 7, winRate: 55, sharpeRatio: 1.0, maxDrawdownPct: 12, profitFactor: 1.5, totalTrades: 22 } },
+        { name: 'mid', metrics: { totalReturnPct: 7, winRate: 55, sharpeRatio: 1.0, maxDrawdownPct: 12, profitFactor: 1.5, totalTrades: 22 } },
       ];
       const ranked = compareStrategies(results);
       expect(ranked[0].strategy).toBe('high');
@@ -389,11 +389,11 @@ describe('BacktestEngine', () => {
    */
   async function createEngineWithMock(signalSequence, config = {}) {
     const engine = new BacktestEngine({
-      symbol:         'TEST',
-      strategies:     ['ema-crossover'],
+      symbol: 'TEST',
+      strategies: ['ema-crossover'],
       initialCapital: 100000,
-      useConsensus:   false,
-      logger:         () => {},
+      useConsensus: false,
+      logger: () => { },
       ...config,
     });
 
@@ -408,8 +408,8 @@ describe('BacktestEngine', () => {
   describe('Basic engine creation', () => {
     it('creates engine with default config', () => {
       const engine = new BacktestEngine({
-        symbol:         'RELIANCE',
-        strategies:     ['all'],
+        symbol: 'RELIANCE',
+        strategies: ['all'],
         initialCapital: 100000,
       });
       expect(engine.symbol).toBe('RELIANCE');
@@ -418,8 +418,8 @@ describe('BacktestEngine', () => {
 
     it('resolves "all" to all 4 strategies', () => {
       const engine = new BacktestEngine({
-        symbol:         'TEST',
-        strategies:     ['all'],
+        symbol: 'TEST',
+        strategies: ['all'],
         initialCapital: 100000,
       });
       expect(engine.strategyNames).toEqual(ALL_STRATEGIES);
@@ -427,16 +427,16 @@ describe('BacktestEngine', () => {
 
     it('throws on unknown strategy', () => {
       expect(() => new BacktestEngine({
-        symbol:         'TEST',
-        strategies:     ['invalid-strategy'],
+        symbol: 'TEST',
+        strategies: ['invalid-strategy'],
         initialCapital: 100000,
       })).toThrow(/Unknown strategy/);
     });
 
     it('sets useConsensus to true when multiple strategies', () => {
       const engine = new BacktestEngine({
-        symbol:         'TEST',
-        strategies:     ['ema-crossover', 'rsi-reversion'],
+        symbol: 'TEST',
+        strategies: ['ema-crossover', 'rsi-reversion'],
         initialCapital: 100000,
       });
       expect(engine.useConsensus).toBe(true);
@@ -444,8 +444,8 @@ describe('BacktestEngine', () => {
 
     it('sets useConsensus to false for single strategy', () => {
       const engine = new BacktestEngine({
-        symbol:         'TEST',
-        strategies:     ['ema-crossover'],
+        symbol: 'TEST',
+        strategies: ['ema-crossover'],
         initialCapital: 100000,
       });
       expect(engine.useConsensus).toBe(false);
@@ -508,7 +508,7 @@ describe('BacktestEngine', () => {
         const crashPrice = candles[buyIdx].close * 0.98; // 2% below entry (stop is at 1% below)
         candles[buyIdx + 1] = {
           ...candles[buyIdx + 1],
-          low:  crashPrice - 5, // Force low below stop
+          low: crashPrice - 5, // Force low below stop
           high: candles[buyIdx + 1].high,
         };
       }
@@ -577,11 +577,11 @@ describe('BacktestEngine', () => {
     it('always uses at least 1 share', async () => {
       // Even with tiny capital
       const engine = new BacktestEngine({
-        symbol:         'TEST',
-        strategies:     ['ema-crossover'],
+        symbol: 'TEST',
+        strategies: ['ema-crossover'],
         initialCapital: 100, // Very low capital
-        useConsensus:   false,
-        logger:         () => {},
+        useConsensus: false,
+        logger: () => { },
       });
       engine._loadStrategies = async () => ({
         'ema-crossover': mockStrategy([...Array(25).fill('HOLD'), 'BUY']),
@@ -607,12 +607,12 @@ describe('BacktestEngine', () => {
   describe('Consensus mode', () => {
     it('fires trade when 2 strategies agree', async () => {
       const engine = new BacktestEngine({
-        symbol:         'TEST',
-        strategies:     ['ema-crossover', 'rsi-reversion'],
+        symbol: 'TEST',
+        strategies: ['ema-crossover', 'rsi-reversion'],
         initialCapital: 100000,
-        useConsensus:   true,
-        minConsensus:   2,
-        logger:         () => {},
+        useConsensus: true,
+        minConsensus: 2,
+        logger: () => { },
       });
 
       const buySignal = { signal: 'BUY', confidence: 80, reason: 'test', strategy: 'test', timestamp: new Date().toISOString() };
@@ -628,15 +628,15 @@ describe('BacktestEngine', () => {
 
     it('returns null when only 1 strategy agrees (minConsensus=2)', () => {
       const engine = new BacktestEngine({
-        symbol:         'TEST',
-        strategies:     ['ema-crossover', 'rsi-reversion'],
+        symbol: 'TEST',
+        strategies: ['ema-crossover', 'rsi-reversion'],
         initialCapital: 100000,
-        useConsensus:   true,
-        minConsensus:   2,
-        logger:         () => {},
+        useConsensus: true,
+        minConsensus: 2,
+        logger: () => { },
       });
 
-      const buySignal  = { signal: 'BUY',  confidence: 80, reason: 'test', strategy: 's1', timestamp: new Date().toISOString() };
+      const buySignal = { signal: 'BUY', confidence: 80, reason: 'test', strategy: 's1', timestamp: new Date().toISOString() };
       const sellSignal = { signal: 'SELL', confidence: 70, reason: 'test', strategy: 's2', timestamp: new Date().toISOString() };
 
       const decision = engine._consensusDecision([buySignal, sellSignal]);
@@ -645,10 +645,10 @@ describe('BacktestEngine', () => {
 
     it('returns null when no signals', () => {
       const engine = new BacktestEngine({
-        symbol:         'TEST',
-        strategies:     ['ema-crossover'],
+        symbol: 'TEST',
+        strategies: ['ema-crossover'],
         initialCapital: 100000,
-        logger:         () => {},
+        logger: () => { },
       });
       expect(engine._consensusDecision([])).toBeNull();
     });
@@ -711,41 +711,41 @@ describe('ReportGenerator', () => {
 
   const sampleTrades = [
     {
-      symbol:      'RELIANCE',
-      strategy:    'ema-crossover',
-      side:        'BUY',
-      entryPrice:  2500,
-      exitPrice:   2550,
-      quantity:    10,
-      pnl:         500,
-      pnlPct:      2.0,
-      exitReason:  'SIGNAL',
-      entryTime:   new Date('2024-01-15T04:15:00Z'),
-      exitTime:    new Date('2024-01-15T06:00:00Z'),
+      symbol: 'RELIANCE',
+      strategy: 'ema-crossover',
+      side: 'BUY',
+      entryPrice: 2500,
+      exitPrice: 2550,
+      quantity: 10,
+      pnl: 500,
+      pnlPct: 2.0,
+      exitReason: 'SIGNAL',
+      entryTime: new Date('2024-01-15T04:15:00Z'),
+      exitTime: new Date('2024-01-15T06:00:00Z'),
       entryReason: 'EMA crossover detected',
-      confidence:  78,
+      confidence: 78,
     },
     {
-      symbol:      'RELIANCE',
-      strategy:    'ema-crossover',
-      side:        'BUY',
-      entryPrice:  2560,
-      exitPrice:   2534.4,
-      quantity:    10,
-      pnl:         -256,
-      pnlPct:      -1.0,
-      exitReason:  'STOP_LOSS',
-      entryTime:   new Date('2024-01-16T04:15:00Z'),
-      exitTime:    new Date('2024-01-16T05:00:00Z'),
+      symbol: 'RELIANCE',
+      strategy: 'ema-crossover',
+      side: 'BUY',
+      entryPrice: 2560,
+      exitPrice: 2534.4,
+      quantity: 10,
+      pnl: -256,
+      pnlPct: -1.0,
+      exitReason: 'STOP_LOSS',
+      entryTime: new Date('2024-01-16T04:15:00Z'),
+      exitTime: new Date('2024-01-16T05:00:00Z'),
       entryReason: 'EMA crossover detected',
-      confidence:  65,
+      confidence: 65,
     },
   ];
 
   let tmpDir;
 
   beforeEach(() => {
-    tmpDir = join(tmpdir(), `quant8-test-${Date.now()}`);
+    tmpDir = join(tmpdir(), `alpha8-test-${Date.now()}`);
   });
 
   it('creates CSV file in specified directory', () => {
@@ -754,7 +754,7 @@ describe('ReportGenerator', () => {
   });
 
   it('CSV has correct header row', () => {
-    const path    = exportCsv(sampleTrades, tmpDir, 'test-header');
+    const path = exportCsv(sampleTrades, tmpDir, 'test-header');
     const content = readFileSync(path, 'utf8');
     const firstLine = content.split('\n')[0];
     expect(firstLine).toContain('symbol');
@@ -766,22 +766,22 @@ describe('ReportGenerator', () => {
   });
 
   it('CSV has correct number of data rows', () => {
-    const path    = exportCsv(sampleTrades, tmpDir, 'test-rows');
+    const path = exportCsv(sampleTrades, tmpDir, 'test-rows');
     const content = readFileSync(path, 'utf8');
-    const lines   = content.trim().split('\n');
+    const lines = content.trim().split('\n');
     // header + 2 trades
     expect(lines).toHaveLength(3);
   });
 
   it('CSV contains correct P&L values', () => {
-    const path    = exportCsv(sampleTrades, tmpDir, 'test-pnl');
+    const path = exportCsv(sampleTrades, tmpDir, 'test-pnl');
     const content = readFileSync(path, 'utf8');
     expect(content).toContain('500');
     expect(content).toContain('-256');
   });
 
   it('CSV contains exit reason', () => {
-    const path    = exportCsv(sampleTrades, tmpDir, 'test-reason');
+    const path = exportCsv(sampleTrades, tmpDir, 'test-reason');
     const content = readFileSync(path, 'utf8');
     expect(content).toContain('SIGNAL');
     expect(content).toContain('STOP_LOSS');
@@ -808,11 +808,11 @@ describe('Integration: full backtest pipeline', () => {
 
   it('produces valid metrics from a complete simulation run', async () => {
     const engine = new BacktestEngine({
-      symbol:         'TEST',
-      strategies:     ['ema-crossover'],
+      symbol: 'TEST',
+      strategies: ['ema-crossover'],
       initialCapital: 100000,
-      useConsensus:   false,
-      logger:         () => {},
+      useConsensus: false,
+      logger: () => { },
     });
 
     // Alternate BUY and SELL every 5 signals after warm-up

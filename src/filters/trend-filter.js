@@ -1,5 +1,5 @@
 /**
- * @fileoverview Trend Filter for Quant8
+ * @fileoverview Trend Filter for Alpha8
  *
  * Checks whether a stock is in a healthy uptrend before allowing a BUY signal.
  * Uses 20-day and 50-day Simple Moving Averages on daily close prices.
@@ -28,7 +28,7 @@ import { fetchHistoricalData } from '../data/historical-data.js';
 
 const log = createLogger('trend-filter');
 
-// NOTE: Redis client has keyPrefix: 'quant8:' — do NOT add 'quant8:' here
+// NOTE: Redis client has keyPrefix: 'alpha8:' — do NOT add 'alpha8:' here
 const CACHE_PREFIX = 'trend:';
 const CACHE_TTL_SEC = 6 * 60 * 60; // 6 hours — refreshed at pre-market
 const SMA_SHORT_DAYS = 20;

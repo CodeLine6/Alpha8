@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * @fileoverview Quant8 Backtesting CLI
+ * @fileoverview Alpha8 Backtesting CLI
  *
  * Usage:
  *   node scripts/backtest.js [options]
@@ -36,15 +36,15 @@
  *   node scripts/backtest.js --symbol HDFC --csv ./data/hdfc_5min.csv
  */
 
-import { parseArgs }          from 'util';
-import { join, resolve }      from 'path';
-import { fileURLToPath }      from 'url';
-import { dirname }            from 'path';
-import { existsSync }         from 'fs';
+import { parseArgs } from 'util';
+import { join, resolve } from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+import { existsSync } from 'fs';
 
 import { fetchHistoricalData } from '../src/backtesting/historical-data-fetcher.js';
 import { BacktestEngine, ALL_STRATEGIES } from '../src/backtesting/backtest-engine.js';
-import { calculateMetrics }    from '../src/backtesting/metrics-calculator.js';
+import { calculateMetrics } from '../src/backtesting/metrics-calculator.js';
 import { printReport, printComparison, exportCsv, exportDailyPnlCsv } from '../src/backtesting/report-generator.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -53,18 +53,18 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const { values: args } = parseArgs({
   options: {
-    symbol:    { type: 'string'  },
-    strategy:  { type: 'string',  default: 'all' },
-    from:      { type: 'string'  },
-    to:        { type: 'string'  },
-    capital:   { type: 'string',  default: '100000' },
-    interval:  { type: 'string',  default: '5minute' },
-    consensus: { type: 'string',  default: '2' },
-    csv:       { type: 'string'  },
-    'no-cache':{ type: 'boolean', default: false },
-    output:    { type: 'string',  default: join(__dirname, '../backtest-output') },
-    compare:   { type: 'boolean', default: false },
-    help:      { type: 'boolean', default: false },
+    symbol: { type: 'string' },
+    strategy: { type: 'string', default: 'all' },
+    from: { type: 'string' },
+    to: { type: 'string' },
+    capital: { type: 'string', default: '100000' },
+    interval: { type: 'string', default: '5minute' },
+    consensus: { type: 'string', default: '2' },
+    csv: { type: 'string' },
+    'no-cache': { type: 'boolean', default: false },
+    output: { type: 'string', default: join(__dirname, '../backtest-output') },
+    compare: { type: 'boolean', default: false },
+    help: { type: 'boolean', default: false },
   },
   strict: false,
 });
@@ -121,11 +121,11 @@ if (!args.symbol) {
   process.exit(1);
 }
 
-const symbol   = args.symbol.toUpperCase().trim();
-const capital  = Number(args.capital);
-const noCache  = args['no-cache'] ?? false;
+const symbol = args.symbol.toUpperCase().trim();
+const capital = Number(args.capital);
+const noCache = args['no-cache'] ?? false;
 const outputDir = resolve(args.output);
-const minCons  = parseInt(args.consensus, 10);
+const minCons = parseInt(args.consensus, 10);
 
 if (isNaN(capital) || capital <= 0) {
   console.error(`\n❌ Error: --capital must be a positive number, got: ${args.capital}\n`);
@@ -148,8 +148,8 @@ if (args.compare) {
 }
 
 // Date range
-const toDate   = args.to   ? new Date(args.to)   : new Date();
-const fromDate = args.from ? new Date(args.from)  : (() => {
+const toDate = args.to ? new Date(args.to) : new Date();
+const fromDate = args.from ? new Date(args.from) : (() => {
   const d = new Date();
   d.setMonth(d.getMonth() - 6);
   return d;
@@ -180,7 +180,7 @@ async function main() {
   console.log('  ╚══════════════════════════════════════════╝');
   console.log('');
   console.log(`  Symbol     : ${symbol}`);
-  console.log(`  Period     : ${fromDate.toISOString().slice(0,10)} → ${toDate.toISOString().slice(0,10)}`);
+  console.log(`  Period     : ${fromDate.toISOString().slice(0, 10)} → ${toDate.toISOString().slice(0, 10)}`);
   console.log(`  Capital    : ₹${capital.toLocaleString('en-IN')}`);
   console.log(`  Strategies : ${strategyList.join(', ')}`);
   console.log(`  Interval   : ${args.interval}`);
@@ -203,16 +203,16 @@ async function main() {
   try {
     candles = await fetchHistoricalData({
       symbol,
-      from:     fromDate,
-      to:       toDate,
+      from: fromDate,
+      to: toDate,
       interval: args.interval,
       kite,
-      csvPath:  args.csv ? resolve(args.csv) : null,
+      csvPath: args.csv ? resolve(args.csv) : null,
       noCache,
-      logger:   (msg) => console.log(`  ${msg}`),
+      logger: (msg) => console.log(`  ${msg}`),
     });
 
-    if (kite)     dataSource = 'kite';
+    if (kite) dataSource = 'kite';
     if (args.csv) dataSource = 'csv';
   } catch (err) {
     console.error(`\n❌ Failed to fetch data: ${err.message}\n`);
@@ -240,14 +240,14 @@ async function main() {
     try {
       const engine = new BacktestEngine({
         symbol,
-        strategies:     [strategyName],
+        strategies: [strategyName],
         initialCapital: capital,
-        useConsensus:   false, // Single-strategy mode
-        logger:         () => {}, // Silent during run
+        useConsensus: false, // Single-strategy mode
+        logger: () => { }, // Silent during run
       });
 
       const { trades } = await engine.run([...candles]); // clone to avoid mutation
-      const metrics    = calculateMetrics(trades, capital);
+      const metrics = calculateMetrics(trades, capital);
 
       results.push({ name: strategyName, trades, metrics });
 
@@ -275,19 +275,19 @@ async function main() {
   for (const result of results) {
     printReport({
       symbol,
-      strategies:  [result.name],
-      fromDate:    fromDate.toISOString().slice(0, 10),
-      toDate:      toDate.toISOString().slice(0, 10),
-      metrics:     result.metrics,
-      trades:      result.trades,
+      strategies: [result.name],
+      fromDate: fromDate.toISOString().slice(0, 10),
+      toDate: toDate.toISOString().slice(0, 10),
+      metrics: result.metrics,
+      trades: result.trades,
       dataSource,
     });
 
     // Export CSV trade log
     if (result.trades.length > 0) {
-      const csvName     = `${symbol}_${result.name}_${fromDate.toISOString().slice(0,10)}_${toDate.toISOString().slice(0,10)}`;
-      const tradeCsv    = exportCsv(result.trades, outputDir, csvName);
-      const dailyCsv    = exportDailyPnlCsv(result.metrics.dailyPnl, outputDir, csvName);
+      const csvName = `${symbol}_${result.name}_${fromDate.toISOString().slice(0, 10)}_${toDate.toISOString().slice(0, 10)}`;
+      const tradeCsv = exportCsv(result.trades, outputDir, csvName);
+      const dailyCsv = exportDailyPnlCsv(result.metrics.dailyPnl, outputDir, csvName);
 
       console.log(`  📄 Trade log  → ${tradeCsv}`);
       console.log(`  📄 Daily P&L  → ${dailyCsv}`);
@@ -302,28 +302,28 @@ async function main() {
     try {
       const engine = new BacktestEngine({
         symbol,
-        strategies:     strategyList,
+        strategies: strategyList,
         initialCapital: capital,
-        useConsensus:   true,
-        minConsensus:   minCons,
-        logger:         () => {},
+        useConsensus: true,
+        minConsensus: minCons,
+        logger: () => { },
       });
 
       const { trades } = await engine.run([...candles]);
-      const metrics    = calculateMetrics(trades, capital);
+      const metrics = calculateMetrics(trades, capital);
 
       printReport({
         symbol,
-        strategies:  ['CONSENSUS (' + strategyList.join('+') + ')'],
-        fromDate:    fromDate.toISOString().slice(0, 10),
-        toDate:      toDate.toISOString().slice(0, 10),
+        strategies: ['CONSENSUS (' + strategyList.join('+') + ')'],
+        fromDate: fromDate.toISOString().slice(0, 10),
+        toDate: toDate.toISOString().slice(0, 10),
         metrics,
         trades,
         dataSource,
       });
 
       if (trades.length > 0) {
-        const csvName  = `${symbol}_consensus_${fromDate.toISOString().slice(0,10)}_${toDate.toISOString().slice(0,10)}`;
+        const csvName = `${symbol}_consensus_${fromDate.toISOString().slice(0, 10)}_${toDate.toISOString().slice(0, 10)}`;
         const tradeCsv = exportCsv(trades, outputDir, csvName);
         console.log(`  📄 Consensus trade log → ${tradeCsv}`);
         console.log('');

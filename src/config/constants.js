@@ -1,5 +1,5 @@
 /**
- * Application-wide constants for Quant8.
+ * Application-wide constants for Alpha8.
  * All market times are in Asia/Kolkata (IST) timezone.
  * @module constants
  */

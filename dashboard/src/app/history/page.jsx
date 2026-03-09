@@ -40,7 +40,7 @@ export default function HistoryPage() {
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `quant8-trades-${new Date().toISOString().split('T')[0]}.csv`;
+        a.download = `alpha8-trades-${new Date().toISOString().split('T')[0]}.csv`;
         a.click();
         URL.revokeObjectURL(url);
     };

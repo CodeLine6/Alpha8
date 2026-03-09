@@ -1,5 +1,5 @@
 /**
- * @fileoverview Core backtest simulation engine for Quant8.
+ * @fileoverview Core backtest simulation engine for Alpha8.
  *
  * Simulates a full trading day cycle for each day in the historical dataset:
  *   - Runs all 4 strategies (or a single specified one) on each 5-min bar
@@ -22,9 +22,9 @@ import { groupByDay, toISTTimeString } from './historical-data-fetcher.js';
 // app boot sequence (no Redis, no DB, no broker needed).
 
 const STRATEGY_MAP = {
-  'ema-crossover':   () => import('../strategies/ema-crossover.js'),
-  'rsi-reversion':   () => import('../strategies/rsi-reversion.js'),
-  'vwap-momentum':   () => import('../strategies/vwap-momentum.js'),
+  'ema-crossover': () => import('../strategies/ema-crossover.js'),
+  'rsi-reversion': () => import('../strategies/rsi-reversion.js'),
+  'vwap-momentum': () => import('../strategies/vwap-momentum.js'),
   'breakout-volume': () => import('../strategies/breakout-volume.js'),
 };
 
@@ -32,9 +32,9 @@ const ALL_STRATEGIES = Object.keys(STRATEGY_MAP);
 
 /** Minimum candle warm-up window per strategy before we start trading */
 const WARMUP_CANDLES = {
-  'ema-crossover':   25, // EMA 21 + buffer
-  'rsi-reversion':   16, // RSI 14 + buffer
-  'vwap-momentum':    5, // Needs a few candles for volume average
+  'ema-crossover': 25, // EMA 21 + buffer
+  'rsi-reversion': 16, // RSI 14 + buffer
+  'vwap-momentum': 5, // Needs a few candles for volume average
   'breakout-volume': 22, // 20-period lookback + buffer
 };
 
@@ -80,12 +80,12 @@ export class BacktestEngine {
    * @param {BacktestConfig} config
    */
   constructor(config) {
-    this.symbol         = config.symbol;
-    this.strategyNames  = this._resolveStrategyNames(config.strategies);
+    this.symbol = config.symbol;
+    this.strategyNames = this._resolveStrategyNames(config.strategies);
     this.initialCapital = config.initialCapital;
-    this.useConsensus   = config.useConsensus ?? (this.strategyNames.length > 1);
-    this.minConsensus   = config.minConsensus ?? 2;
-    this.logger         = config.logger ?? console.log;
+    this.useConsensus = config.useConsensus ?? (this.strategyNames.length > 1);
+    this.minConsensus = config.minConsensus ?? 2;
+    this.logger = config.logger ?? console.log;
 
     /** Current capital (changes as trades complete) */
     this.capital = this.initialCapital;
@@ -109,9 +109,9 @@ export class BacktestEngine {
    * @returns {Promise<{ trades: Array, capital: number }>}
    */
   async run(candles) {
-    this.capital  = this.initialCapital;
+    this.capital = this.initialCapital;
     this.position = null;
-    this.trades   = [];
+    this.trades = [];
 
     // Load strategy instances
     this._strategies = await this._loadStrategies();
@@ -131,7 +131,7 @@ export class BacktestEngine {
     this.logger(`[BacktestEngine] Simulation complete: ${this.trades.length} trades`);
 
     return {
-      trades:  this.trades,
+      trades: this.trades,
       capital: this.capital,
     };
   }
@@ -161,8 +161,8 @@ export class BacktestEngine {
     }
 
     for (let i = 0; i < marketCandles.length; i++) {
-      const candle     = marketCandles[i];
-      const timeIST    = toISTTimeString(candle.date);
+      const candle = marketCandles[i];
+      const timeIST = toISTTimeString(candle.date);
 
       // ── Square-off check ──────────────────────────────────────────────────
       if (timeIST >= SQUARE_OFF_TIME) {
@@ -249,10 +249,10 @@ export class BacktestEngine {
   _consensusDecision(signals) {
     if (signals.length === 0) return null;
 
-    const buys  = signals.filter(s => s.signal === 'BUY');
+    const buys = signals.filter(s => s.signal === 'BUY');
     const sells = signals.filter(s => s.signal === 'SELL');
 
-    if (buys.length  >= this.minConsensus) {
+    if (buys.length >= this.minConsensus) {
       return buys.reduce((best, s) => s.confidence > best.confidence ? s : best, buys[0]);
     }
     if (sells.length >= this.minConsensus) {
@@ -270,30 +270,30 @@ export class BacktestEngine {
    */
   _openPosition(candle, signal) {
     const entryPrice = candle.close;
-    const stopLoss   = entryPrice * (1 - STOP_LOSS_PCT);
+    const stopLoss = entryPrice * (1 - STOP_LOSS_PCT);
 
     // Position sizing: risk 1% of capital, stop distance = 1%
     // => quantity = (capital * RISK_PER_TRADE_PCT) / (entryPrice * STOP_LOSS_PCT)
     // => simplified: risk amount / price drop to stop = shares
-    const riskAmount   = this.capital * RISK_PER_TRADE_PCT;
+    const riskAmount = this.capital * RISK_PER_TRADE_PCT;
     const stopDistance = entryPrice * STOP_LOSS_PCT;
-    let quantity       = Math.floor(riskAmount / stopDistance);
+    let quantity = Math.floor(riskAmount / stopDistance);
 
     // Cap at MAX_POSITION_PCT of capital
     const maxShares = Math.floor((this.capital * MAX_POSITION_PCT) / entryPrice);
-    quantity         = Math.min(quantity, maxShares);
-    quantity         = Math.max(quantity, 1); // At least 1 share
+    quantity = Math.min(quantity, maxShares);
+    quantity = Math.max(quantity, 1); // At least 1 share
 
     this.position = {
-      symbol:       this.symbol,
-      strategy:     signal.strategy,
+      symbol: this.symbol,
+      strategy: signal.strategy,
       entryPrice,
       stopLoss,
       quantity,
-      entryValue:   entryPrice * quantity,
-      entryTime:    candle.date,
-      entryReason:  signal.reason,
-      confidence:   signal.confidence,
+      entryValue: entryPrice * quantity,
+      entryTime: candle.date,
+      entryReason: signal.reason,
+      confidence: signal.confidence,
     };
   }
 
@@ -305,24 +305,24 @@ export class BacktestEngine {
    * @param {number} exitPrice   - actual fill price
    */
   _closePosition(candle, exitReason, exitPrice) {
-    const pos   = this.position;
-    const pnl   = (exitPrice - pos.entryPrice) * pos.quantity;
+    const pos = this.position;
+    const pnl = (exitPrice - pos.entryPrice) * pos.quantity;
     const pnlPct = ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100;
 
     const trade = {
-      symbol:      pos.symbol,
-      strategy:    pos.strategy,
-      side:        'BUY',
-      entryPrice:  pos.entryPrice,
+      symbol: pos.symbol,
+      strategy: pos.strategy,
+      side: 'BUY',
+      entryPrice: pos.entryPrice,
       exitPrice,
-      quantity:    pos.quantity,
-      pnl:         Math.round(pnl * 100) / 100,
-      pnlPct:      Math.round(pnlPct * 100) / 100,
+      quantity: pos.quantity,
+      pnl: Math.round(pnl * 100) / 100,
+      pnlPct: Math.round(pnlPct * 100) / 100,
       exitReason,
-      entryTime:   pos.entryTime,
-      exitTime:    candle.date,
+      entryTime: pos.entryTime,
+      exitTime: candle.date,
       entryReason: pos.entryReason,
-      confidence:  pos.confidence,
+      confidence: pos.confidence,
     };
 
     this.trades.push(trade);
@@ -344,10 +344,10 @@ export class BacktestEngine {
       }
 
       try {
-        const mod      = await loader();
+        const mod = await loader();
         // Support default export (class) or named export
         const StratClass = mod.default ?? mod[Object.keys(mod)[0]];
-        instances[name]  = new StratClass();
+        instances[name] = new StratClass();
       } catch (err) {
         throw new Error(`Failed to load strategy "${name}": ${err.message}`);
       }

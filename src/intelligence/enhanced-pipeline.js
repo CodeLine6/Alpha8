@@ -1,5 +1,5 @@
 /**
- * @fileoverview Enhanced Signal Pipeline for Quant8
+ * @fileoverview Enhanced Signal Pipeline for Alpha8
  *
  * Drop-in upgrade for the original SignalConsensus. Adds 4 gates that each
  * block a different class of bad trade:
@@ -14,7 +14,7 @@
  *             VOLATILE market → pause all trading.
  *             SIDEWAYS market → reduce position size 50%.
  *
- *   Gate 4 — News Sentiment (Claude API + Google News RSS)
+ *   Gate 4 — News Sentiment (Gemini API + Google News RSS)
  *             Block BUYs when recent headlines are strongly negative.
  *
  * INTEGRATION:
@@ -50,7 +50,7 @@ export class EnhancedSignalPipeline {
      * @param {object}   opts.redis
      * @param {object}   [opts.broker]           - BrokerManager (for trend filter)
      * @param {object}   [opts.instrumentManager] - For token lookup in trend filter
-     * @param {string}   [opts.anthropicApiKey]   - For news sentiment
+     * @param {string}   [opts.geminiApiKey]      - For news sentiment
      * @param {boolean}  [opts.trendEnabled=true]
      * @param {boolean}  [opts.regimeEnabled=true]
      * @param {boolean}  [opts.adaptiveEnabled=true]
@@ -61,7 +61,7 @@ export class EnhancedSignalPipeline {
         redis,
         broker = null,
         instrumentManager = null,
-        anthropicApiKey = null,
+        geminiApiKey = null,
         trendEnabled = true,
         regimeEnabled = true,
         adaptiveEnabled = true,
@@ -82,13 +82,13 @@ export class EnhancedSignalPipeline {
             ? new AdaptiveWeightManager({ redis, logger: logFn })
             : null;
 
-        this.newsSentiment = newsEnabled && anthropicApiKey
-            ? new NewsSentimentFilter({ redis, anthropicApiKey, logger: logFn })
+        this.newsSentiment = newsEnabled && geminiApiKey
+            ? new NewsSentimentFilter({ redis, geminiApiKey, logger: logFn })
             : null;
 
         this._logger = logFn;
 
-        logFn(`[Pipeline] Initialized — trend=${trendEnabled} regime=${regimeEnabled} adaptive=${adaptiveEnabled} news=${!!anthropicApiKey}`);
+        logFn(`[Pipeline] Initialized — trend=${trendEnabled} regime=${regimeEnabled} adaptive=${adaptiveEnabled} news=${!!geminiApiKey}`);
     }
 
     /**

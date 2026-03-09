@@ -1,5 +1,5 @@
 /**
- * Database migration script for Quant8.
+ * Database migration script for Alpha8.
  * Creates all required tables and indexes. Idempotent — safe to re-run.
  *
  * Usage: node scripts/migrate.js
@@ -117,7 +117,7 @@ const MIGRATIONS = [
 ];
 
 async function migrate() {
-  console.log('🗄️  Quant8 Database Migration');
+  console.log('🗄️  Alpha8 Database Migration');
   console.log('─'.repeat(50));
 
   const client = await pool.connect();

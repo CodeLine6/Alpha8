@@ -1,5 +1,5 @@
 /**
- * @fileoverview News Sentiment Filter for Quant8
+ * @fileoverview News Sentiment Filter for Alpha8
  *
  * Before acting on a BUY signal, fetches the latest headlines for that
  * stock from Google News RSS and asks Claude API to classify sentiment.
@@ -14,7 +14,7 @@
  * technical indicators say.
  *
  * DATA SOURCE: Google News RSS (free, no API key)
- * AI:          Claude API (claude-haiku-4-5-20251001 — cheapest, ~₹1-2/day)
+ * AI:          Google Gemini API (gemini-2.5-flash)
  *
  * FAIL-OPEN: Any failure (network, API) allows the signal through.
  *            A missing news filter is better than blocking valid trades.
@@ -24,13 +24,13 @@ import { createLogger } from '../lib/logger.js';
 
 const log = createLogger('news-sentiment');
 
-// NOTE: Redis keyPrefix 'quant8:' is applied automatically — don't add it here
+// NOTE: Redis keyPrefix 'alpha8:' is applied automatically — don't add it here
 const NEWS_CACHE_PREFIX = 'news:sentiment:';
 const BLOCK_CACHE_PREFIX = 'news:blocked:';
 const NEWS_CACHE_TTL_SEC = 30 * 60;     // 30 min — refresh headlines
 const BLOCK_TTL_SEC = 4 * 60 * 60; // 4 hours — hold negative block
 const MAX_HEADLINES = 5;
-const CLAUDE_MODEL = 'claude-haiku-4-5-20251001';
+const GEMINI_MODEL = 'gemini-3.1-flash-lite-preview';
 
 /**
  * Fetch news headlines from Google News RSS.
@@ -44,7 +44,7 @@ export async function fetchNewsHeadlines(symbol, max = MAX_HEADLINES) {
     const url = `https://news.google.com/rss/search?q=${query}&hl=en-IN&gl=IN&ceid=IN:en`;
 
     const resp = await fetch(url, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Quant8/1.0)' },
+        headers: { 'User-Agent': 'Mozilla/5.0 (Alpha8/1.0)' },
         signal: AbortSignal.timeout(5000),
     });
 
@@ -60,11 +60,11 @@ export async function fetchNewsHeadlines(symbol, max = MAX_HEADLINES) {
 }
 
 /**
- * Classify headlines using Claude API.
+ * Classify headlines using Gemini API.
  * Returns sentiment, score (-100 to +100), and a brief summary.
  * @param {string}   symbol
  * @param {string[]} headlines
- * @param {string}   apiKey - ANTHROPIC_API_KEY
+ * @param {string}   apiKey - GEMINI_API_KEY
  */
 export async function classifySentiment(symbol, headlines, apiKey) {
     if (!headlines || headlines.length === 0) {
@@ -73,45 +73,50 @@ export async function classifySentiment(symbol, headlines, apiKey) {
 
     const headlineText = headlines.map((h, i) => `${i + 1}. ${h}`).join('\n');
 
-    const prompt =
-        `You are analyzing news headlines about ${symbol} (Indian stock market, NSE/BSE) ` +
+    const prompt = `Headlines:\n${headlineText}`;
+
+    const systemInstruction =
+        `You are analyzing news headlines about a stock (Indian stock market, NSE/BSE) ` +
         `to determine if they would positively or negatively impact the stock price TODAY.\n\n` +
-        `Headlines:\n${headlineText}\n\n` +
         `Respond ONLY with this exact JSON (no markdown, no preamble):\n` +
         `{"sentiment":"POSITIVE|NEGATIVE|NEUTRAL","score":-100_to_100,"summary":"max 20 words"}\n\n` +
         `NEGATIVE (-100 to -20): fraud, lawsuit, major loss, CEO resign, regulatory action, earnings miss\n` +
         `POSITIVE (20 to 100): record profit, new contract, upgrade, buyback, strong results\n` +
         `NEUTRAL (-19 to 19): routine news, analyst commentary, general market news`;
 
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
+    const resp = await fetch(url, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
-            'x-api-key': apiKey,
-            'anthropic-version': '2023-06-01',
         },
         body: JSON.stringify({
-            model: CLAUDE_MODEL,
-            max_tokens: 100,
-            messages: [{ role: 'user', content: prompt }],
+            systemInstruction: { parts: [{ text: systemInstruction }] },
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: {
+                maxOutputTokens: 100
+            }
         }),
         signal: AbortSignal.timeout(8000),
     });
 
-    if (!resp.ok) throw new Error(`Claude API ${resp.status}: ${await resp.text().then(t => t.slice(0, 100))}`);
+    if (!resp.ok) throw new Error(`Gemini API ${resp.status}: ${await resp.text().then(t => t.slice(0, 100))}`);
 
     const data = await resp.json();
-    const text = data.content?.[0]?.text ?? '{}';
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? '{}';
 
     try {
-        const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
+        const jsonMatch = text.match(/\{[\s\S]*?\}/);
+        if (!jsonMatch) throw new Error('No JSON object found in response');
+
+        const parsed = JSON.parse(jsonMatch[0].trim());
         return {
             sentiment: parsed.sentiment ?? 'NEUTRAL',
             score: Number(parsed.score ?? 0),
             summary: parsed.summary ?? 'No summary',
         };
-    } catch {
-        throw new Error(`Unparseable Claude response: ${text.slice(0, 80)}`);
+    } catch (err) {
+        throw new Error(`Unparseable Gemini response: ${text.slice(0, 80)}`, { cause: text });
     }
 }
 
@@ -119,17 +124,17 @@ export class NewsSentimentFilter {
     /**
      * @param {object} opts
      * @param {object}   opts.redis
-     * @param {string}   [opts.anthropicApiKey]  - from ANTHROPIC_API_KEY env var
+     * @param {string}   [opts.geminiApiKey]  - from GEMINI_API_KEY env var
      * @param {Function} [opts.logger]
      */
-    constructor({ redis, anthropicApiKey, logger }) {
+    constructor({ redis, geminiApiKey, logger }) {
         this.redis = redis;
-        this.apiKey = anthropicApiKey;
+        this.apiKey = geminiApiKey;
         this.logger = logger || ((msg, meta) => log.info(meta || {}, msg));
-        this.enabled = !!anthropicApiKey;
+        this.enabled = !!geminiApiKey;
 
         if (!this.enabled) {
-            this.logger('[NewsSentimentFilter] Disabled — no ANTHROPIC_API_KEY set');
+            this.logger('[NewsSentimentFilter] Disabled — no GEMINI_API_KEY set');
         }
     }
 

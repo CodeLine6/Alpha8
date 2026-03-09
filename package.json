@@ -1,5 +1,5 @@
 {
-  "name": "quant8",
+  "name": "alpha8",
   "version": "1.0.0",
   "description": "Automated stock trading application for Indian markets (NSE/BSE)",
   "type": "module",
@@ -8,13 +8,13 @@
     "dev": "nodemon src/index.js",
     "start": "node src/index.js",
     "test": "npx --node-options=--experimental-vm-modules jest --forceExit",
-    "migrate": "node scripts/migrate.js",
+    "migrate": "node scripts/setup-db.js",
     "backtest": "node scripts/backtest.js",
     "dashboard": "next dev src/dashboard -p 4000",
     "lint": "eslint src/",
     "docker:up": "docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d",
     "docker:down": "docker compose -f docker-compose.yml -f docker-compose.dev.yml down",
-    "db:init": "node scripts/init-db.js",
+    "db:init": "node scripts/setup-db.js",
     "login": "node scripts/auto-login.js"
   },
   "keywords": [

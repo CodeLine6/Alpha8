@@ -1,7 +1,7 @@
 /**
  * Backend HTTP client for the dashboard.
  * 
- * Proxies requests from Next.js API routes to the Quant8 backend
+ * Proxies requests from Next.js API routes to the Alpha8 backend
  * running at BACKEND_URL (default: http://localhost:3000).
  * 
  * Falls back to offline-safe defaults when the backend is unreachable.

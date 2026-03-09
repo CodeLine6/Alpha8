@@ -1,5 +1,5 @@
 /**
- * @fileoverview Regime Detector for Quant8
+ * @fileoverview Regime Detector for Alpha8
  *
  * Measures the overall market "weather" using the Nifty 50 index.
  * Classifies the market into one of three states every 30 minutes.
@@ -24,7 +24,7 @@ import { createLogger } from '../lib/logger.js';
 
 const log = createLogger('regime-detector');
 
-// NOTE: Redis client has keyPrefix: 'quant8:' — do NOT add 'quant8:' here
+// NOTE: Redis client has keyPrefix: 'alpha8:' — do NOT add 'alpha8:' here
 const CACHE_KEY = 'regime';
 const CACHE_TTL_SEC = 30 * 60; // 30 min
 

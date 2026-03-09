@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * Quant8 — Automated Zerodha Daily Login
+ * Alpha8 — Automated Zerodha Daily Login
  *
  * Automates the Kite Connect login flow:
  *   1. Opens Kite login page in headless Chromium (Puppeteer)
@@ -90,12 +90,12 @@ async function storeTokenInRedis(accessToken) {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
       const { default: Redis } = await import('ioredis');
-      const redis = new Redis(REDIS_URL, { keyPrefix: 'quant8:', lazyConnect: true });
+      const redis = new Redis(REDIS_URL, { keyPrefix: 'alpha8:', lazyConnect: true });
 
       try {
         await redis.connect();
         await redis.set(REDIS_KEY, accessToken, 'EX', REDIS_TTL);
-        console.log(`✅ Access token stored in Redis (key: quant8:${REDIS_KEY}, TTL: 24h)`);
+        console.log(`✅ Access token stored in Redis (key: alpha8:${REDIS_KEY}, TTL: 24h)`);
         return; // Success!
       } finally {
         await redis.quit();
@@ -129,7 +129,7 @@ async function storeTokenInRedis(accessToken) {
 async function engageKillSwitch(reason) {
   try {
     const { default: Redis } = await import('ioredis');
-    const redis = new Redis(REDIS_URL, { keyPrefix: 'quant8:', lazyConnect: true });
+    const redis = new Redis(REDIS_URL, { keyPrefix: 'alpha8:', lazyConnect: true });
 
     await redis.connect();
     const killState = JSON.stringify({
@@ -252,8 +252,8 @@ async function browserLogin() {
         () => {
           const url = window.location.href;
           return url.includes('request_token') ||
-                 url.includes('status=success') ||
-                 (!url.includes('kite.zerodha.com') && !url.includes('kite.trade'));
+            url.includes('status=success') ||
+            (!url.includes('kite.zerodha.com') && !url.includes('kite.trade'));
         },
         { timeout: 30000 }
       );
@@ -314,7 +314,7 @@ async function main() {
 
   console.log('');
   console.log('═══════════════════════════════════════════════════');
-  console.log('  🔐 Quant8 Auto-Login');
+  console.log('  🔐 Alpha8 Auto-Login');
   console.log(`  🕐 ${timestamp}`);
   console.log('═══════════════════════════════════════════════════');
   console.log('');
@@ -341,7 +341,7 @@ async function main() {
 
     // Step 5: Telegram success alert
     await sendTelegram(
-      `✅ <b>Quant8 Authenticated</b>\n` +
+      `✅ <b>Alpha8 Authenticated</b>\n` +
       `👤 User: ${profile.user_name} (${profile.user_id})\n` +
       `🔑 Token: ${accessToken.slice(0, 8)}...\n` +
       `⏱️ Took: ${elapsed}s\n` +
@@ -363,7 +363,7 @@ async function main() {
 
     // Telegram failure alert
     await sendTelegram(
-      `🛑 <b>Quant8 Login FAILED</b>\n` +
+      `🛑 <b>Alpha8 Login FAILED</b>\n` +
       `❌ Error: ${err.message}\n` +
       `🕐 ${timestamp}\n\n` +
       `⚠️ Kill switch ENGAGED — trading halted\n` +

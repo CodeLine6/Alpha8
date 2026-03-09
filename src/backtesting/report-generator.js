@@ -1,5 +1,5 @@
 /**
- * @fileoverview Backtest report generator for Quant8.
+ * @fileoverview Backtest report generator for Alpha8.
  *
  * Produces two outputs:
  *   1. Rich formatted terminal report with all key metrics
@@ -19,8 +19,8 @@ function formatINR(amount) {
     return `₹${(amount / 100_000).toFixed(2)}L`;
   }
   // Indian grouping: 12,34,567
-  const num     = Math.abs(Math.round(amount));
-  const numStr  = num.toString();
+  const num = Math.abs(Math.round(amount));
+  const numStr = num.toString();
   let formatted = '';
 
   if (numStr.length <= 3) {
@@ -46,12 +46,12 @@ const lpad = (s, n) => String(s).padStart(n);
 
 /** Colour helpers (ANSI — gracefully degrade in non-TTY) */
 const isTTY = process.stdout.isTTY ?? false;
-const green  = s => isTTY ? `\x1b[32m${s}\x1b[0m` : s;
-const red    = s => isTTY ? `\x1b[31m${s}\x1b[0m` : s;
+const green = s => isTTY ? `\x1b[32m${s}\x1b[0m` : s;
+const red = s => isTTY ? `\x1b[31m${s}\x1b[0m` : s;
 const yellow = s => isTTY ? `\x1b[33m${s}\x1b[0m` : s;
-const bold   = s => isTTY ? `\x1b[1m${s}\x1b[0m`  : s;
-const dim    = s => isTTY ? `\x1b[2m${s}\x1b[0m`  : s;
-const cyan   = s => isTTY ? `\x1b[36m${s}\x1b[0m` : s;
+const bold = s => isTTY ? `\x1b[1m${s}\x1b[0m` : s;
+const dim = s => isTTY ? `\x1b[2m${s}\x1b[0m` : s;
+const cyan = s => isTTY ? `\x1b[36m${s}\x1b[0m` : s;
 
 /**
  * Colour a P&L number: green if positive, red if negative.
@@ -80,7 +80,7 @@ export function printReport({ symbol, strategies, fromDate, toDate, metrics, tra
   const dhr = '═'.repeat(W);
 
   const returnSign = metrics.totalReturnPct >= 0 ? '+' : '';
-  const returnStr  = `${returnSign}${metrics.totalReturnPct}%`;
+  const returnStr = `${returnSign}${metrics.totalReturnPct}%`;
 
   console.log('');
   console.log(bold(`╔${'═'.repeat(W)}╗`));
@@ -123,8 +123,8 @@ export function printReport({ symbol, strategies, fromDate, toDate, metrics, tra
   console.log(bold(`  RISK METRICS`));
   console.log(`  ${hr}`);
   const sharpeColour = metrics.sharpeRatio >= 1 ? green : (metrics.sharpeRatio >= 0.5 ? yellow : red);
-  const ddColour     = metrics.maxDrawdownPct <= 5 ? green : (metrics.maxDrawdownPct <= 15 ? yellow : red);
-  const pfColour     = metrics.profitFactor >= 1.5 ? green : (metrics.profitFactor >= 1 ? yellow : red);
+  const ddColour = metrics.maxDrawdownPct <= 5 ? green : (metrics.maxDrawdownPct <= 15 ? yellow : red);
+  const pfColour = metrics.profitFactor >= 1.5 ? green : (metrics.profitFactor >= 1 ? yellow : red);
 
   console.log(`  Sharpe Ratio  : ${sharpeColour(bold(metrics.sharpeRatio))}`);
   console.log(`  Sortino Ratio : ${metrics.sortinoRatio}`);
@@ -135,8 +135,8 @@ export function printReport({ symbol, strategies, fromDate, toDate, metrics, tra
 
   // ── Exit breakdown ─────────────────────────────────────────────────────────
   if (trades.length > 0) {
-    const signalExits    = trades.filter(t => t.exitReason === 'SIGNAL').length;
-    const stopExits      = trades.filter(t => t.exitReason === 'STOP_LOSS').length;
+    const signalExits = trades.filter(t => t.exitReason === 'SIGNAL').length;
+    const stopExits = trades.filter(t => t.exitReason === 'STOP_LOSS').length;
     const squareOffExits = trades.filter(t => t.exitReason === 'SQUARE_OFF').length;
 
     console.log(bold(`  EXIT BREAKDOWN`));
@@ -183,13 +183,13 @@ export function printComparison(results) {
   console.log(`  ${'─'.repeat(W)}`);
 
   const header = [
-    rpad('Strategy',        20),
-    lpad('Return',           9),
-    lpad('Win Rate',         9),
-    lpad('Sharpe',           8),
-    lpad('MaxDD',            8),
-    lpad('PF',               6),
-    lpad('Trades',           7),
+    rpad('Strategy', 20),
+    lpad('Return', 9),
+    lpad('Win Rate', 9),
+    lpad('Sharpe', 8),
+    lpad('MaxDD', 8),
+    lpad('PF', 6),
+    lpad('Trades', 7),
   ].join('  ');
 
   console.log(`  ${bold(header)}`);
@@ -197,13 +197,13 @@ export function printComparison(results) {
 
   for (const r of ranked) {
     const row = [
-      rpad(r.strategy,        20),
+      rpad(r.strategy, 20),
       lpad((r.returnPct >= 0 ? '+' : '') + r.returnPct + '%', 9),
-      lpad(r.winRate + '%',    9),
-      lpad(r.sharpe,           8),
+      lpad(r.winRate + '%', 9),
+      lpad(r.sharpe, 8),
       lpad(r.maxDrawdown + '%', 8),
       lpad(r.profitFactor === Infinity ? '∞' : r.profitFactor, 6),
-      lpad(r.totalTrades,      7),
+      lpad(r.totalTrades, 7),
     ].join('  ');
 
     const colour = r.returnPct > 0 ? green : red;
@@ -270,7 +270,7 @@ export function exportDailyPnlCsv(dailyPnl, outputDir, fileName) {
   if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
 
   const headers = ['date', 'pnl'];
-  const rows    = dailyPnl.map(d => [d.date, d.pnl]);
+  const rows = dailyPnl.map(d => [d.date, d.pnl]);
 
   const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
 
@@ -283,8 +283,8 @@ export function exportDailyPnlCsv(dailyPnl, outputDir, fileName) {
 
 function centre(text, width) {
   const pad = Math.max(0, width - text.length);
-  const left  = Math.floor(pad / 2);
-  const right  = pad - left;
+  const left = Math.floor(pad / 2);
+  const right = pad - left;
   return ' '.repeat(left) + text + ' '.repeat(right);
 }
 
@@ -295,15 +295,15 @@ function centre(text, width) {
  * @returns {string}
  */
 function miniEquityCurve(curve, width) {
-  const CHARS = ['▁','▂','▃','▄','▅','▆','▇','█'];
-  const min   = Math.min(...curve);
-  const max   = Math.max(...curve);
+  const CHARS = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+  const min = Math.min(...curve);
+  const max = Math.max(...curve);
   const range = max - min;
 
   if (range === 0) return '─'.repeat(width);
 
   // Sample `width` points from the curve
-  const step    = (curve.length - 1) / (width - 1);
+  const step = (curve.length - 1) / (width - 1);
   const sampled = [];
   for (let i = 0; i < width; i++) {
     const idx = Math.round(i * step);
@@ -313,7 +313,7 @@ function miniEquityCurve(curve, width) {
   return sampled.map(v => {
     const normalised = (v - min) / range;
     const idx = Math.min(Math.floor(normalised * CHARS.length), CHARS.length - 1);
-    const ch  = CHARS[idx];
+    const ch = CHARS[idx];
     return v >= curve[0] ? green(ch) : red(ch);
   }).join('');
 }

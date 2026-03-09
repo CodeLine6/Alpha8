@@ -61,8 +61,8 @@ const envSchema = z.object({
 
   // ─── News Sentiment Filter ────────────────────────────
   // Optional — leave empty to disable news sentiment gate.
-  // Get your key at: https://console.anthropic.com/
-  ANTHROPIC_API_KEY: z.string().optional().default(''),
+  // Get your key from Google AI Studio
+  GEMINI_API_KEY: z.string().optional().default(''),
 }).refine(
   (data) => data.KILL_SWITCH_DRAWDOWN_PCT >= data.MAX_DAILY_LOSS_PCT, {
   message: 'KILL_SWITCH_DRAWDOWN_PCT must be >= MAX_DAILY_LOSS_PCT',

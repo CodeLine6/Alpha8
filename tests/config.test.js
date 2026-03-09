@@ -33,7 +33,7 @@ const VALID_ENV = {
   KITE_API_KEY: 'test_api_key',
   KITE_API_SECRET: 'test_api_secret',
   KITE_ACCESS_TOKEN: 'test_access_token',
-  DATABASE_URL: 'postgresql://user:pass@localhost:5432/quant8',
+  DATABASE_URL: 'postgresql://user:pass@localhost:5432/alpha8',
   REDIS_URL: 'redis://localhost:6379',
 };
 
@@ -43,7 +43,7 @@ describe('Environment Validation', () => {
     expect(result.success).toBe(true);
     if (result.success) {
       expect(result.data.KITE_API_KEY).toBe('test_api_key');
-      expect(result.data.DATABASE_URL).toBe('postgresql://user:pass@localhost:5432/quant8');
+      expect(result.data.DATABASE_URL).toBe('postgresql://user:pass@localhost:5432/alpha8');
     }
   });
 

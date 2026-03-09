@@ -2,8 +2,8 @@ import './globals.css';
 import Sidebar from '@/components/Sidebar';
 
 export const metadata = {
-    title: 'Quant8 — Trading Dashboard',
-    description: 'Real-time algorithmic trading dashboard for Quant8',
+    title: 'Alpha8 — Trading Dashboard',
+    description: 'Real-time algorithmic trading dashboard for Alpha8',
 };
 
 export default function RootLayout({ children }) {

@@ -7,7 +7,7 @@ import { executeSquareOff } from '../risk/square-off-job.js';
 const log = createLogger('scheduler');
 
 /**
- * Market Day Scheduler — the nervous system of Quant8.
+ * Market Day Scheduler — the nervous system of Alpha8.
  *
  * Orchestrates the full daily trading cycle using node-cron
  * with Asia/Kolkata timezone. Each job:
@@ -16,12 +16,14 @@ const log = createLogger('scheduler');
  *   3. Handles errors without crashing other jobs
  *
  * Schedule:
- *   09:00 — Pre-market: health checks + verifyIntegrity
+ *   08:55 Sun — Weekly maintenance: update adaptive strategy weights
+ *   09:00 — Pre-market: health checks + verifyIntegrity + pipeline warm-up
  *   09:15 — Market open: start feeds + activate scanning
  *   Every 5min 09:15–15:10 — Strategy scan loop
  *   15:10 — Square-off warning: log open positions
  *   15:15 — Square-off: close all positions + cancel pending
  *   15:35 — Post-market: daily summary + reset counters
+ *   20:00 Mon-Fri — Nightly symbol scout: auto-update dynamic watchlist
  *
  * @module scheduler
  */
@@ -29,25 +31,31 @@ const log = createLogger('scheduler');
 export class MarketScheduler {
   /**
    * @param {Object} deps
-   * @param {import('../risk/kill-switch.js').KillSwitch} deps.killSwitch
-   * @param {import('../risk/risk-manager.js').RiskManager} deps.riskManager
-   * @param {import('../engine/execution-engine.js').ExecutionEngine} deps.engine
-   * @param {Object} [deps.broker] - BrokerManager instance
-   * @param {Object} [deps.dataFeed] - TickFeed or data feed manager
-   * @param {Function} [deps.getWatchlist] - Returns array of { symbol, candles, price, quantity }
-   * @param {Function} [deps.getOpenPositions] - Returns array of open positions
-   * @param {Function} [deps.sendReport] - Sends daily summary (e.g., Telegram)
-   * @param {Function} [deps.healthCheck] - Returns { broker, redis, db } health status
+   * @param {import('../risk/kill-switch.js').KillSwitch}                             deps.killSwitch
+   * @param {import('../risk/risk-manager.js').RiskManager}                           deps.riskManager
+   * @param {import('../engine/execution-engine.js').ExecutionEngine}                 deps.engine
+   * @param {import('../intelligence/enhanced-pipeline.js').EnhancedSignalPipeline}  [deps.pipeline]
+   * @param {import('../intelligence/symbol-scout.js').SymbolScout}                  [deps.scout]
+   * @param {Object}   [deps.broker]
+   * @param {Object}   [deps.dataFeed]
+   * @param {Function} [deps.getWatchlist]      - Returns [{ symbol, candles, price, quantity }]
+   * @param {Function} [deps.getNiftyCandles]   - Returns daily Nifty 50 candles for regime detector
+   * @param {Function} [deps.getOpenPositions]
+   * @param {Function} [deps.sendReport]
+   * @param {Function} [deps.healthCheck]
    */
   constructor(deps) {
     this.killSwitch = deps.killSwitch;
     this.riskManager = deps.riskManager;
     this.engine = deps.engine;
+    this.pipeline = deps.pipeline || null;
+    this.scout = deps.scout || null;   // ← NEW
     this.broker = deps.broker || null;
     this.dataFeed = deps.dataFeed || null;
     this.getWatchlist = deps.getWatchlist || (async () => []);
+    this.getNiftyCandles = deps.getNiftyCandles || (async () => []);
     this.getOpenPositions = deps.getOpenPositions || (async () => []);
-    this.sendReport = deps.sendReport || (async () => {});
+    this.sendReport = deps.sendReport || (async () => { });
     this.healthCheck = deps.healthCheck || (async () => ({ broker: true, redis: true, db: true }));
 
     /** @type {cron.ScheduledTask[]} */
@@ -56,7 +64,7 @@ export class MarketScheduler {
     /** @type {boolean} */
     this._scanning = false;
 
-    /** @type {boolean} H5: Prevent overlapping scans */
+    /** @type {boolean} Prevent overlapping scans */
     this._scanInProgress = false;
 
     log.info('MarketScheduler created');
@@ -66,11 +74,13 @@ export class MarketScheduler {
   // LIFECYCLE
   // ═══════════════════════════════════════════════════════
 
-  /**
-   * Start all scheduled jobs.
-   */
   start() {
     const opts = { timezone: TIMEZONE };
+
+    // 0. Weekly maintenance: Sunday 8:55 AM IST — update adaptive weights
+    this._cronJobs.push(
+      cron.schedule('55 8 * * 0', () => this._runJob('weekly-maintenance', () => this._weeklyMaintenance()), opts)
+    );
 
     // 1. Pre-market: 9:00 AM IST
     this._cronJobs.push(
@@ -89,7 +99,6 @@ export class MarketScheduler {
     this._cronJobs.push(
       cron.schedule('0,5,10,15,20,25,30,35,40,45,50,55 10-14 * * 1-5', () => this._runJob('strategy-scan', () => this._strategyScan()), opts)
     );
-    // H7: Last scan at 15:05, not 15:10 (avoid race with squareoff-warning at 15:10)
     this._cronJobs.push(
       cron.schedule('0,5 15 * * 1-5', () => this._runJob('strategy-scan', () => this._strategyScan()), opts)
     );
@@ -109,45 +118,38 @@ export class MarketScheduler {
       cron.schedule('35 15 * * 1-5', () => this._runJob('post-market', () => this._postMarket()), opts)
     );
 
-    log.info({
-      jobs: this._cronJobs.length,
-      timezone: TIMEZONE,
-    }, '🕐 MarketScheduler started — all jobs scheduled');
+    // 7. Nightly symbol scout: 8:00 PM IST Mon–Fri  ← NEW
+    //    Runs AFTER market close — safe to hit Yahoo Finance without disrupting live data
+    this._cronJobs.push(
+      cron.schedule('0 20 * * 1-5', () => this._runJob('symbol-scout', () => this._nightlyScout()), opts)
+    );
+
+    log.info({ jobs: this._cronJobs.length, timezone: TIMEZONE },
+      '🕐 MarketScheduler started — all jobs scheduled');
   }
 
-  /**
-   * Stop all scheduled jobs.
-   */
   stop() {
-    for (const job of this._cronJobs) {
-      job.stop();
-    }
+    for (const job of this._cronJobs) job.stop();
     this._cronJobs = [];
     this._scanning = false;
     log.info('MarketScheduler stopped — all jobs cancelled');
   }
 
   // ═══════════════════════════════════════════════════════
-  // JOB WRAPPER — kill switch guard + timing + error isolation
+  // JOB WRAPPER
   // ═══════════════════════════════════════════════════════
 
-  /**
-   * Run a job with kill switch check, timing, and error isolation.
-   * @private
-   * @param {string} jobName
-   * @param {Function} fn - Async job function
-   */
   async _runJob(jobName, fn) {
-    // Skip on non-trading days
-    if (!isTradingDay()) {
+    // Symbol scout and weekly-maintenance can run on non-trading days too
+    const nonTradingAllowed = ['weekly-maintenance', 'symbol-scout'];
+    if (!isTradingDay() && !nonTradingAllowed.includes(jobName)) {
       log.info({ job: jobName }, 'Job skipped — not a trading day');
       return { skipped: true, reason: 'not_trading_day' };
     }
 
-    // Kill switch guard (allow post-market and square-off even when engaged)
-    const bypassJobs = ['post-market', 'square-off', 'squareoff-warning'];
+    const bypassJobs = ['post-market', 'square-off', 'squareoff-warning', 'weekly-maintenance', 'symbol-scout'];
     if (this.killSwitch.isEngaged() && !bypassJobs.includes(jobName)) {
-      log.warn({ job: jobName }, `Job skipped — kill switch ENGAGED`);
+      log.warn({ job: jobName }, 'Job skipped — kill switch ENGAGED');
       return { skipped: true, reason: 'kill_switch_engaged' };
     }
 
@@ -157,23 +159,13 @@ export class MarketScheduler {
     try {
       const result = await fn();
       const durationMs = Date.now() - startTime;
-      log.info({
-        job: jobName,
-        durationMs,
-        durationSec: +(durationMs / 1000).toFixed(2),
-      }, `✅ Job [${jobName}] COMPLETED in ${(durationMs / 1000).toFixed(2)}s`);
-
+      log.info({ job: jobName, durationMs, durationSec: +(durationMs / 1000).toFixed(2) },
+        `✅ Job [${jobName}] COMPLETED in ${(durationMs / 1000).toFixed(2)}s`);
       return { skipped: false, durationMs, result };
     } catch (err) {
       const durationMs = Date.now() - startTime;
-      log.error({
-        job: jobName,
-        err: err.message,
-        stack: err.stack,
-        durationMs,
-      }, `❌ Job [${jobName}] FAILED after ${(durationMs / 1000).toFixed(2)}s: ${err.message}`);
-
-      // Never rethrow — other jobs must continue
+      log.error({ job: jobName, err: err.message, stack: err.stack, durationMs },
+        `❌ Job [${jobName}] FAILED after ${(durationMs / 1000).toFixed(2)}s: ${err.message}`);
       return { skipped: false, durationMs, error: err.message };
     }
   }
@@ -183,8 +175,27 @@ export class MarketScheduler {
   // ═══════════════════════════════════════════════════════
 
   /**
+   * Job 0: Weekly maintenance (Sunday 8:55 AM IST)
+   * Updates adaptive strategy weights from last 2 weeks of signal outcomes.
+   * @private
+   */
+  async _weeklyMaintenance() {
+    log.info('═══ WEEKLY MAINTENANCE ═══');
+
+    if (this.pipeline) {
+      await this.pipeline.weeklyMaintenance();
+      log.info('Adaptive strategy weights updated');
+    } else {
+      log.info('Pipeline not enabled — weekly maintenance skipped');
+    }
+
+    log.info('═══ WEEKLY MAINTENANCE COMPLETE ═══');
+    return { done: true };
+  }
+
+  /**
    * Job 1: Pre-market (9:00 AM IST)
-   * Validate broker connection, check Redis/DB health, verify kill switch.
+   * Health checks, kill switch verification, pipeline warm-up.
    * @private
    */
   async _preMarket() {
@@ -210,6 +221,24 @@ export class MarketScheduler {
     const engineResult = await this.engine.initialize();
     log.info({ engineReady: engineResult.ready }, 'Execution engine status');
 
+    // Pipeline warm-up: pre-fetch trend data + compute regime
+    if (this.pipeline) {
+      try {
+        const watchlist = await this.getWatchlist();
+        const symbols = watchlist.map(w => w.symbol).filter(Boolean);
+        const niftyCandles = await this.getNiftyCandles().catch(err => {
+          log.warn({ err: err.message }, 'Failed to fetch Nifty candles for regime detector');
+          return [];
+        });
+
+        await this.pipeline.warmUp(symbols, niftyCandles);
+        log.info({ symbols: symbols.length, niftyCandles: niftyCandles.length },
+          '✅ Pipeline warm-up complete');
+      } catch (err) {
+        log.warn({ err: err.message }, '⚠ Pipeline warm-up failed — continuing (fail-open)');
+      }
+    }
+
     const status = getMarketStatus();
     log.info({ status }, '═══ PRE-MARKET COMPLETE ═══');
 
@@ -218,13 +247,12 @@ export class MarketScheduler {
 
   /**
    * Job 2: Market Open (9:15 AM IST)
-   * Start market data feeds and activate strategy scanning.
+   * Start market data feeds, activate scanning.
    * @private
    */
   async _marketOpen() {
     log.info('═══ MARKET OPEN ═══');
 
-    // Start data feed if available
     if (this.dataFeed && typeof this.dataFeed.connect === 'function') {
       try {
         await this.dataFeed.connect();
@@ -234,7 +262,6 @@ export class MarketScheduler {
       }
     }
 
-    // Activate scanning
     this._scanning = true;
     log.info('Strategy scanning ACTIVATED');
 
@@ -243,7 +270,6 @@ export class MarketScheduler {
 
   /**
    * Job 3: Strategy Scan (every 5 minutes, 9:15 AM – 3:10 PM IST)
-   * Run all strategies on watchlist, feed signals to execution engine.
    * @private
    */
   async _strategyScan() {
@@ -252,7 +278,6 @@ export class MarketScheduler {
       return { scanned: 0 };
     }
 
-    // H5: Overlap guard — skip if previous scan still running
     if (this._scanInProgress) {
       log.warn('Strategy scan skipped — previous scan still in progress');
       return { scanned: 0, reason: 'overlap' };
@@ -283,6 +308,7 @@ export class MarketScheduler {
             symbol: item.symbol,
             action: result.action,
             signal: result.consensus?.signal || 'N/A',
+            pipelineLog: result.pipelineLog,
           });
 
           if (result.action === 'EXECUTED') {
@@ -291,56 +317,55 @@ export class MarketScheduler {
               signal: result.consensus?.signal,
               orderId: result.order?.id,
             }, `🔔 Trade executed: ${item.symbol}`);
+          } else if (result.action?.startsWith('BLOCKED:')) {
+            log.info({
+              symbol: item.symbol,
+              blockedBy: result.action.replace('BLOCKED:', ''),
+              pipelineLog: result.pipelineLog,
+            }, `🚫 Signal blocked: ${item.symbol}`);
           }
         } catch (err) {
-          log.error({
-            symbol: item.symbol,
-            err: err.message,
-          }, `Strategy scan failed for ${item.symbol}`);
+          log.error({ symbol: item.symbol, err: err.message },
+            `Strategy scan failed for ${item.symbol}`);
           results.push({ symbol: item.symbol, action: 'ERROR', error: err.message });
         }
       }
 
       log.info({
         scanned: watchlist.length,
-        executed: results.filter((r) => r.action === 'EXECUTED').length,
+        executed: results.filter(r => r.action === 'EXECUTED').length,
+        blocked: results.filter(r => r.action?.startsWith('BLOCKED:')).length,
       }, 'Strategy scan complete');
 
       return { scanned: watchlist.length, results };
     } finally {
-      this._scanInProgress = false; // H5: ALWAYS release mutex
+      this._scanInProgress = false;
     }
   }
 
   /**
    * Job 4: Square-off Warning (3:10 PM IST)
-   * Log all open positions, prepare for close.
    * @private
    */
   async _squareOffWarning() {
     log.warn('═══ ⚠ SQUARE-OFF WARNING — T-5 minutes ═══');
 
-    // Stop scanning — no new trades
     this._scanning = false;
     log.info('Strategy scanning DEACTIVATED — approaching square-off');
 
     const positions = await this.getOpenPositions();
-
     log.warn({
       openCount: positions.length,
-      positions: positions.map((p) => ({
+      positions: positions.map(p => ({
         symbol: p.symbol || p.tradingsymbol,
         qty: p.quantity || p.netQuantity,
         side: (p.quantity || p.netQuantity || 0) > 0 ? 'LONG' : 'SHORT',
       })),
     }, 'Open positions entering square-off window');
 
-    // List pending orders
     const activeOrders = this.engine.getActiveOrders();
     if (activeOrders.length > 0) {
-      log.warn({
-        pendingCount: activeOrders.length,
-      }, 'Active orders will be cancelled at 3:15 PM');
+      log.warn({ pendingCount: activeOrders.length }, 'Active orders will be cancelled at 3:15 PM');
     }
 
     return { positions: positions.length, activeOrders: activeOrders.length };
@@ -348,28 +373,21 @@ export class MarketScheduler {
 
   /**
    * Job 5: Square-off (3:15 PM IST)
-   * Trigger square-off-job.js and cancel all pending orders.
    * @private
    */
   async _squareOff() {
     log.warn('═══ AUTO SQUARE-OFF TRIGGERED ═══');
 
-    // Cancel all pending/placed orders
     const activeOrders = this.engine.getActiveOrders();
     let cancelled = 0;
 
     for (const order of activeOrders) {
       const result = this.engine.cancelOrder(order.id);
-      if (result && result.state === 'CANCELLED') {
-        cancelled++;
-      }
+      if (result && result.state === 'CANCELLED') cancelled++;
     }
 
-    if (cancelled > 0) {
-      log.warn({ cancelled }, `Cancelled ${cancelled} active orders`);
-    }
+    if (cancelled > 0) log.warn({ cancelled }, `Cancelled ${cancelled} active orders`);
 
-    // Execute square-off
     const squareOffResult = await executeSquareOff({
       broker: this.broker,
       riskManager: this.riskManager,
@@ -387,13 +405,11 @@ export class MarketScheduler {
 
   /**
    * Job 6: Post-market (3:35 PM IST)
-   * Generate daily summary, send report, reset counters.
    * @private
    */
   async _postMarket() {
     log.info('═══ POST-MARKET PROCESSING ═══');
 
-    // Disconnect data feed
     if (this.dataFeed && typeof this.dataFeed.disconnect === 'function') {
       try {
         await this.dataFeed.disconnect();
@@ -403,7 +419,6 @@ export class MarketScheduler {
       }
     }
 
-    // Generate daily summary
     const riskStatus = this.riskManager.getStatus();
     const engineStatus = this.engine.getStatus();
 
@@ -417,13 +432,12 @@ export class MarketScheduler {
       rejected: engineStatus.ordersByState.rejected,
       cancelled: engineStatus.ordersByState.cancelled,
       killSwitchEngaged: riskStatus.killSwitch.engaged,
+      pipelineEnabled: engineStatus.pipelineEnabled,
+      scoutEnabled: !!this.scout,
     };
 
-    log.info({
-      summary,
-    }, '📊 DAILY SUMMARY');
+    log.info({ summary }, '📊 DAILY SUMMARY');
 
-    // Send report (Telegram, etc.)
     try {
       await this.sendReport(summary);
       log.info('Daily report sent');
@@ -431,7 +445,6 @@ export class MarketScheduler {
       log.error({ err: err.message }, 'Failed to send daily report');
     }
 
-    // Reset daily counters
     this.riskManager.resetDaily();
     this.engine.resetDaily();
     log.info('Risk manager and engine daily counters reset');
@@ -442,20 +455,60 @@ export class MarketScheduler {
     return summary;
   }
 
+  /**
+   * Job 7: Nightly Symbol Scout (8:00 PM IST, Mon–Fri)  ← NEW
+   *
+   * Scans the full NSE universe, scores each symbol, and auto-updates
+   * the dynamic watchlist in the database. Sends Telegram summary.
+   * @private
+   */
+  async _nightlyScout() {
+    log.info('═══ NIGHTLY SYMBOL SCOUT ═══');
+
+    if (!this.scout) {
+      log.info('Symbol scout not configured — skipping');
+      return { skipped: true, reason: 'scout_not_configured' };
+    }
+
+    try {
+      const result = await this.scout.runNightly();
+
+      log.info({
+        scanned: result.scored?.length || 0,
+        added: result.added?.length || 0,
+        removed: result.removed?.length || 0,
+        duration: `${((result.durationMs || 0) / 1000).toFixed(1)}s`,
+      }, '✅ Nightly scout complete');
+
+      // Log watchlist changes to main log for visibility
+      if (result.added?.length > 0) {
+        log.info({ symbols: result.added.map(a => `${a.symbol}(${a.score})`) },
+          '➕ Scout added to watchlist');
+      }
+      if (result.removed?.length > 0) {
+        log.info({ symbols: result.removed.map(r => `${r.symbol}: ${r.reason}`) },
+          '➖ Scout removed from watchlist');
+      }
+
+      return result;
+    } catch (err) {
+      log.error({ err: err.message }, '❌ Nightly symbol scout failed');
+      throw err; // Let _runJob handle and log it
+    }
+  }
+
   // ═══════════════════════════════════════════════════════
   // STATUS
   // ═══════════════════════════════════════════════════════
 
-  /**
-   * Get scheduler status.
-   * @returns {Object}
-   */
   getStatus() {
     return {
       activeJobs: this._cronJobs.length,
       scanning: this._scanning,
       marketStatus: getMarketStatus(),
       killSwitchEngaged: this.killSwitch.isEngaged(),
+      pipelineEnabled: !!this.pipeline,
+      scoutEnabled: !!this.scout,
     };
   }
 }

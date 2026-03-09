@@ -20,17 +20,17 @@ const rootLogger = pino({
   ...(isProduction
     ? {}
     : {
-        transport: {
-          target: 'pino-pretty',
-          options: {
-            colorize: true,
-            translateTime: 'SYS:yyyy-mm-dd HH:MM:ss.l',
-            ignore: 'pid,hostname',
-          },
+      transport: {
+        target: 'pino-pretty',
+        options: {
+          colorize: true,
+          translateTime: 'SYS:yyyy-mm-dd HH:MM:ss.l',
+          ignore: 'pid,hostname',
         },
-      }),
+      },
+    }),
   base: {
-    app: 'quant8',
+    app: 'alpha8',
     env: process.env.NODE_ENV || 'development',
   },
 });
