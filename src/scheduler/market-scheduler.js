@@ -126,6 +126,13 @@ export class MarketScheduler {
 
     log.info({ jobs: this._cronJobs.length, timezone: TIMEZONE },
       '🕐 MarketScheduler started — all jobs scheduled');
+
+    // 8. Catch-up: Check if app was started mid-day during market hours
+    const status = getMarketStatus();
+    if (status.isOpen) {
+      log.info('App started mid-day during market runs. Trigerring market open routines now.');
+      this._runJob('market-open', () => this._marketOpen());
+    }
   }
 
   stop() {
