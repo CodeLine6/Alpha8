@@ -81,7 +81,7 @@ export const RETRY_DELAY_MS = 1000;
 export const MARKET_HOLIDAYS_YEAR = 2026;
 export const MARKET_HOLIDAYS_2026 = Object.freeze([
   '2026-01-26', // Republic Day
-  '2026-03-10', // Holi
+  '2026-03-04', // Holi
   '2026-03-30', // Id-Ul-Fitr
   '2026-04-02', // Ram Navami
   '2026-04-03', // Good Friday
