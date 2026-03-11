@@ -36,7 +36,7 @@ const MIGRATIONS = [
     quantity   INTEGER      NOT NULL,
     price      NUMERIC(12,2) NOT NULL,
     pnl        NUMERIC(12,2) DEFAULT 0,
-    strategy   VARCHAR(50),
+    strategy   VARCHAR(255),
     status     VARCHAR(20)  NOT NULL DEFAULT 'PENDING',
     paper_mode BOOLEAN      NOT NULL DEFAULT true,
     metadata   JSONB        DEFAULT '{}',

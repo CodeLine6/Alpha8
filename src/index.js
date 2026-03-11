@@ -380,6 +380,14 @@ async function main() {
           } catch { /* skip */ }
         }
 
+        // Task 4: Skip symbol if price cannot be determined.
+        // A zero price would create orders with price=0 in the DB, which is misleading
+        // and causes incorrect P&L calculations. Skip and retry next scan cycle.
+        if (!currentPrice || currentPrice <= 0) {
+          log.warn({ symbol }, 'Skipping symbol — could not resolve current price');
+          continue;
+        }
+
         let candles = [];
         if (broker && instrumentToken) {
           try {

@@ -135,7 +135,7 @@ describe('SignalConsensus', () => {
   });
 
   test('should return BUY when 2+ strategies agree on BUY', () => {
-    const consensus = new SignalConsensus({ minAgreement: 2 });
+    const consensus = new SignalConsensus({ minAgreement: 2, groupedConsensus: false });
     consensus.addStrategy(mockStrategy('EMA', 'BUY', 70));
     consensus.addStrategy(mockStrategy('RSI', 'BUY', 65));
     consensus.addStrategy(mockStrategy('VWAP', 'HOLD', 0));
@@ -149,7 +149,7 @@ describe('SignalConsensus', () => {
   });
 
   test('should return SELL when 2+ strategies agree on SELL', () => {
-    const consensus = new SignalConsensus({ minAgreement: 2 });
+    const consensus = new SignalConsensus({ minAgreement: 2, groupedConsensus: false });
     consensus.addStrategy(mockStrategy('EMA', 'SELL', 80));
     consensus.addStrategy(mockStrategy('RSI', 'SELL', 60));
     consensus.addStrategy(mockStrategy('VWAP', 'HOLD', 0));
@@ -161,7 +161,7 @@ describe('SignalConsensus', () => {
   });
 
   test('should return HOLD when no consensus reached', () => {
-    const consensus = new SignalConsensus({ minAgreement: 2 });
+    const consensus = new SignalConsensus({ minAgreement: 2, groupedConsensus: false });
     consensus.addStrategy(mockStrategy('EMA', 'BUY', 70));
     consensus.addStrategy(mockStrategy('RSI', 'SELL', 60));
     consensus.addStrategy(mockStrategy('VWAP', 'HOLD', 0));
@@ -173,7 +173,7 @@ describe('SignalConsensus', () => {
   });
 
   test('low-confidence signals should count as HOLD', () => {
-    const consensus = new SignalConsensus({ minAgreement: 2, minConfidence: 50 });
+    const consensus = new SignalConsensus({ minAgreement: 2, minConfidence: 50, groupedConsensus: false });
     consensus.addStrategy(mockStrategy('EMA', 'BUY', 70));  // counts
     consensus.addStrategy(mockStrategy('RSI', 'BUY', 30));  // too low → HOLD
     consensus.addStrategy(mockStrategy('VWAP', 'HOLD', 0)); // HOLD
@@ -185,7 +185,7 @@ describe('SignalConsensus', () => {
   });
 
   test('should handle strategy errors gracefully', () => {
-    const consensus = new SignalConsensus({ minAgreement: 1 });
+    const consensus = new SignalConsensus({ minAgreement: 1, groupedConsensus: false });
     consensus.addStrategy({
       name: 'broken',
       analyze: () => { throw new Error('Strategy crashed'); },
@@ -209,7 +209,7 @@ describe('SignalConsensus', () => {
   });
 
   test('BUY should win over SELL when BUY has more votes', () => {
-    const consensus = new SignalConsensus({ minAgreement: 2 });
+    const consensus = new SignalConsensus({ minAgreement: 2, groupedConsensus: false });
     consensus.addStrategy(mockStrategy('EMA', 'BUY', 70));
     consensus.addStrategy(mockStrategy('RSI', 'BUY', 60));
     consensus.addStrategy(mockStrategy('VWAP', 'SELL', 80));
@@ -240,7 +240,7 @@ describe('ExecutionEngine', () => {
       killSwitchDrawdownPct: 5,
     });
 
-    consensus = new SignalConsensus({ minAgreement: 2 });
+    consensus = new SignalConsensus({ minAgreement: 2, groupedConsensus: false });
     consensus.addStrategy(mockStrategy('EMA', 'BUY', 70));
     consensus.addStrategy(mockStrategy('RSI', 'BUY', 65));
 
@@ -523,10 +523,13 @@ describe('ExecutionEngine', () => {
       retryDelayMs: 10,
       broker: {
         placeOrder: jest.fn().mockResolvedValue({
-          orderId: 'KITE-12345',
+          order_id: 'KITE-12345',
           status: 'COMPLETE',
           broker: 'kite',
         }),
+        getOrderHistory: jest.fn().mockResolvedValue([
+          { average_price: 2505 }
+        ]),
       },
     });
 
@@ -536,7 +539,7 @@ describe('ExecutionEngine', () => {
       symbol: 'RELIANCE', side: 'BUY', quantity: 10, price: 2500,
     });
 
-    expect(order.state).toBe('PLACED');
+    expect(order.state).toBe('FILLED');
     expect(order.brokerId).toBe('KITE-12345');
   });
 

@@ -127,6 +127,9 @@ export class AdaptiveWeightManager {
      * Weighted consensus — replaces simple "2+ strategies agree".
      * Combined trust score of agreeing strategies must reach `threshold`.
      *
+     * The threshold is regime-adaptive (passed in from EnhancedSignalPipeline):
+     *   TRENDING → 1.8, SIDEWAYS → 2.0, VOLATILE → 2.5, UNKNOWN → 2.0
+     *
      * @param {Array}  signals   - [{ signal, confidence, strategy, reason }]
      * @param {number} threshold - default 2.0 (matches original "min 2 agree")
      * @returns {Promise<object|null>}
@@ -144,9 +147,18 @@ export class AdaptiveWeightManager {
             if (sig.signal === 'SELL') sellWeight += w;
         }
 
+        // Log at the decision point so you can see { threshold, buyWeight, sellWeight }
+        // and understand whether a raise in threshold (e.g. VOLATILE → 2.5) blocked the signal.
+        log.debug({
+            threshold,
+            buyWeight: Math.round(buyWeight * 100) / 100,
+            sellWeight: Math.round(sellWeight * 100) / 100,
+        }, 'Weighted consensus threshold check');
+
         if (buyWeight >= threshold) {
             const buys = signals.filter(s => s.signal === 'BUY');
             const best = buys.reduce((m, s) => s.confidence > m.confidence ? s : m, buys[0]);
+            log.debug({ threshold, buyWeight }, 'BUY weighted consensus passed');
             return {
                 ...best,
                 weightedScore: Math.round(buyWeight * 100) / 100,
@@ -157,6 +169,7 @@ export class AdaptiveWeightManager {
         if (sellWeight >= threshold) {
             const sells = signals.filter(s => s.signal === 'SELL');
             const best = sells.reduce((m, s) => s.confidence > m.confidence ? s : m, sells[0]);
+            log.debug({ threshold, sellWeight }, 'SELL weighted consensus passed');
             return {
                 ...best,
                 weightedScore: Math.round(sellWeight * 100) / 100,
@@ -164,6 +177,7 @@ export class AdaptiveWeightManager {
             };
         }
 
+        log.debug({ threshold, buyWeight, sellWeight }, 'Weighted consensus blocked — weights below threshold');
         return null;
     }
 

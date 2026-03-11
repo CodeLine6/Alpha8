@@ -113,7 +113,7 @@ export function createApiHandler(deps) {
 
       const summary = {
         pnl: dbSummary ? parseFloat(dbSummary.pnl) : tradeStats.totalPnl || 0,
-        pnlPct: dbSummary ? parseFloat(dbSummary.pnl_pct) : 
+        pnlPct: dbSummary ? parseFloat(dbSummary.pnl_pct) :
           (tradeStats.totalPnl / config.TRADING_CAPITAL * 100) || 0,
         tradeCount: dbSummary ? dbSummary.trade_count : tradeStats.count,
         winCount: dbSummary ? dbSummary.win_count : tradeStats.wins,

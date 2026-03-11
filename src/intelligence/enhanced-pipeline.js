@@ -1,11 +1,19 @@
 /**
  * @fileoverview Enhanced Signal Pipeline for Alpha8
  *
+ * CHANGES (Tier 1 — Task 3):
+ *   - Exported REGIME_THRESHOLDS constant (TRENDING/SIDEWAYS/VOLATILE/UNKNOWN → threshold)
+ *   - process() accepts optional `regime` parameter passed from execution-engine.js.
+ *     The regime is fetched once per scan cycle in execution-engine, passed here, then
+ *     looked up in REGIME_THRESHOLDS to set the weightedConsensus threshold.
+ *     This avoids double-detection and keeps separation of concerns clean.
+ *
  * Drop-in upgrade for the original SignalConsensus. Adds 4 gates that each
  * block a different class of bad trade:
  *
  *   Gate 1 — Adaptive Weighted Consensus
  *             Strategies that have been accurate recently get more trust.
+ *             Threshold is now regime-adaptive (see REGIME_THRESHOLDS).
  *
  *   Gate 2 — Trend Filter (SMA20 + SMA50)
  *             Only BUY when the stock is actually going up in the big picture.
@@ -18,9 +26,8 @@
  *             Block BUYs when recent headlines are strongly negative.
  *
  * INTEGRATION:
- *   In execution-engine.js, call pipeline.process(symbol, consensusDetails)
+ *   In execution-engine.js, call pipeline.process(symbol, consensusDetails, regime)
  *   instead of using the consensus signal directly.
- *   See execution-engine.js for the full integration.
  *
  * ALL GATES FAIL-OPEN:
  *   If a gate errors or has no data, it allows the signal through.
@@ -34,6 +41,26 @@ import { AdaptiveWeightManager } from './adaptive-weights.js';
 import { NewsSentimentFilter } from './news-sentiment.js';
 
 const log = createLogger('enhanced-pipeline');
+
+/**
+ * Consensus threshold by market regime.
+ *
+ * TRENDING  → 1.8  Lower bar — strong directional conviction, capture moves early.
+ * SIDEWAYS  → 2.0  Default — unchanged from original implementation.
+ * VOLATILE  → 2.5  Higher bar — noisy signals, reduce false positives.
+ * UNKNOWN   → 2.0  Default — no regime data available.
+ *
+ * These values are passed into AdaptiveWeightManager.weightedConsensus() as the
+ * `threshold` argument. A signal's combined weight must exceed this number to trade.
+ *
+ * @type {Record<string, number>}
+ */
+export const REGIME_THRESHOLDS = {
+    TRENDING: 1.8,
+    SIDEWAYS: 2.0,
+    VOLATILE: 2.5,
+    UNKNOWN: 2.0,
+};
 
 /**
  * @typedef {object} PipelineResult
@@ -117,19 +144,30 @@ export class EnhancedSignalPipeline {
     /**
      * Main pipeline function — runs a signal through all 4 gates.
      *
-     * @param {string}  symbol
-     * @param {Array}   strategySignals  - details array from SignalConsensus.evaluate()
-     *                                    Each: { signal, confidence, strategy, reason }
+     * @param {string}       symbol
+     * @param {Array}        strategySignals  - details array from SignalConsensus.evaluate()
+     *                                         Each: { signal, confidence, strategy, reason }
+     * @param {string|null}  [regime=null]    - current market regime from execution-engine.js.
+     *                                         One of: 'TRENDING'|'SIDEWAYS'|'VOLATILE'|'UNKNOWN'.
+     *                                         Fetched ONCE per scan cycle in execution-engine.js
+     *                                         and passed here to avoid double-detection.
+     *                                         Falls back to default threshold (2.0) if null.
      * @returns {Promise<PipelineResult>}
      */
-    async process(symbol, strategySignals) {
+    async process(symbol, strategySignals, regime = null) {
         const gateLog = [];
         let positionSizeMult = 1.0;
 
         // ── Gate 1: Adaptive Weighted Consensus ────────────────────────────────
+        // Regime-adaptive threshold: TRENDING=1.8 | SIDEWAYS=2.0 | VOLATILE=2.5
+        // The regime is detected once per scan cycle in execution-engine.js,
+        // passed here as a parameter to keep detection logic in one place.
+        const threshold = REGIME_THRESHOLDS[regime] ?? 2.0;
+        log.debug({ regime, threshold }, 'Gate 1 threshold resolved from regime');
+
         let finalSignal;
         if (this.adaptiveWeights) {
-            finalSignal = await this.adaptiveWeights.weightedConsensus(strategySignals);
+            finalSignal = await this.adaptiveWeights.weightedConsensus(strategySignals, threshold);
             if (finalSignal) {
                 gateLog.push(`✅ Weighted consensus: ${finalSignal.signal} (score=${finalSignal.weightedScore})`);
             } else {
