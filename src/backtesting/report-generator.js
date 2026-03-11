@@ -84,7 +84,7 @@ export function printReport({ symbol, strategies, fromDate, toDate, metrics, tra
 
   console.log('');
   console.log(bold(`╔${'═'.repeat(W)}╗`));
-  console.log(bold(`║${centre('QUANT8 — BACKTEST REPORT', W)}║`));
+  console.log(bold(`║${centre('Alpha8 — BACKTEST REPORT', W)}║`));
   console.log(bold(`╚${'═'.repeat(W)}╝`));
   console.log('');
 

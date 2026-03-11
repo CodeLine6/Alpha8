@@ -16,7 +16,7 @@ const log = createLogger('backend-api');
  * @returns {Function} HTTP request handler
  */
 export function createApiHandler(deps) {
-  const { killSwitch, riskManager, engine, config, broker, telegram } = deps;
+  const { killSwitch, riskManager, engine, config, broker, telegram, holdingsManager } = deps;
   const API_KEY = process.env.API_SECRET_KEY || '';
 
   /** Check API key for protected endpoints */
@@ -195,6 +195,20 @@ export function createApiHandler(deps) {
       });
     } catch (err) {
       log.error({ err }, 'Error in /api/health');
+      json(res, { error: err.message }, 500);
+    }
+  }
+
+  async function handleHoldings(req, res) {
+    try {
+      const timestamp = new Date().toISOString();
+      if (!holdingsManager || !broker) {
+        return json(res, { holdings: [], totalValue: 0, timestamp });
+      }
+      const { totalValue, holdings } = await holdingsManager.getTotalExposureValue();
+      json(res, { holdings, totalValue, timestamp });
+    } catch (err) {
+      log.error({ err }, 'Error in /api/holdings');
       json(res, { error: err.message }, 500);
     }
   }
@@ -463,6 +477,8 @@ export function createApiHandler(deps) {
             return handleStrategiesSignals(req, res);
           case '/api/settings':
             return handleSettingsGet(req, res);
+          case '/api/holdings':
+            return handleHoldings(req, res);
         }
       }
 

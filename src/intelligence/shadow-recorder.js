@@ -1,5 +1,5 @@
 /**
- * @fileoverview Shadow Signal Recorder for Quant8
+ * @fileoverview Shadow Signal Recorder for Alpha8
  *
  * PROBLEM SOLVED:
  *   Adaptive weights only train on trades that passed consensus (Gate 1).
@@ -49,9 +49,11 @@ export class ShadowRecorder {
     /**
      * @param {Object} opts
      * @param {Object} [opts.broker] - BrokerManager with getLTP() for price lookups
+     * @param {import('../intelligence/intraday-decay.js').IntradayDecayManager} [opts.intradayDecay]
      */
-    constructor({ broker = null } = {}) {
+    constructor({ broker = null, intradayDecay = null } = {}) {
         this.broker = broker;
+        this.intradayDecay = intradayDecay;
     }
 
     /**
@@ -157,6 +159,7 @@ export class ShadowRecorder {
         SELECT
           id,
           symbol,
+          strategy,
           direction,
           price_at_signal,
           created_at,
@@ -206,7 +209,7 @@ export class ShadowRecorder {
                 const values = [row.id];
                 let paramIdx = 2;
 
-                const updateWithCorrectness = (priceCol, correctCol, needed) => {
+                const updateWithCorrectness = (priceCol, correctCol, needed, is30min) => {
                     if (!needed) return;
                     setClauses.push(`${priceCol} = $${paramIdx++}`);
                     values.push(currentPrice);
@@ -216,11 +219,17 @@ export class ShadowRecorder {
                         : currentPrice < parseFloat(row.price_at_signal);
                     setClauses.push(`${correctCol} = $${paramIdx++}`);
                     values.push(isCorrect);
+
+                    // Feature 7: Record wrong 30-min signals for intraday weight decay.
+                    // Only the 30-minute window is authoritative — 15/60 min are supplementary.
+                    if (is30min && !isCorrect && this.intradayDecay && row.strategy) {
+                        this.intradayDecay.recordWrong(row.strategy).catch(() => { });
+                    }
                 };
 
-                updateWithCorrectness('price_after_15min', 'was_correct_15min', row.needs_15min);
-                updateWithCorrectness('price_after_30min', 'was_correct_30min', row.needs_30min);
-                updateWithCorrectness('price_after_60min', 'was_correct_60min', row.needs_60min);
+                updateWithCorrectness('price_after_15min', 'was_correct_15min', row.needs_15min, false);
+                updateWithCorrectness('price_after_30min', 'was_correct_30min', row.needs_30min, true);
+                updateWithCorrectness('price_after_60min', 'was_correct_60min', row.needs_60min, false);
 
                 if (row.needs_eod) {
                     setClauses.push(`price_eod = $${paramIdx++}`);

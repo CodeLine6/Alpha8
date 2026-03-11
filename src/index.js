@@ -24,6 +24,9 @@ import { createApiHandler } from './api/backend-api.js';
 import { EnhancedSignalPipeline } from './intelligence/enhanced-pipeline.js';
 import { SymbolScout } from './intelligence/symbol-scout.js';
 import { ShadowRecorder } from './intelligence/shadow-recorder.js';
+import { PositionStats } from './risk/position-stats.js';
+import { HoldingsManager } from './data/holdings.js';
+import { IntradayDecayManager } from './intelligence/intraday-decay.js';
 
 const log = createLogger('main');
 const APP_VERSION = '1.0.0';
@@ -89,6 +92,22 @@ async function main() {
     }
   } catch (err) {
     log.warn({ err }, '⚠️  Redis initialization failed — running without cache');
+  }
+
+  // ─── Initialize PositionStats (Feature 4) ─────────────
+  const positionStats = redisHealthy ? new PositionStats({ redis: getRedis() }) : null;
+  if (positionStats) {
+    log.info('✅ Position stats initialized (Kelly inputs from signal_outcomes)');
+  } else {
+    log.warn('⚠️  Position stats disabled — Redis not available (using fixed Kelly inputs)');
+  }
+
+  // ─── Initialize Intraday Decay (Feature 7) ────────────
+  const intradayDecay = redisHealthy ? new IntradayDecayManager({ redis: getRedis() }) : null;
+  if (intradayDecay) {
+    log.info('✅ Intraday decay initialized — strategy weights decay on repeated wrong signals');
+  } else {
+    log.warn('⚠️  Intraday decay disabled — Redis not available (Sunday weights used as-is)');
   }
 
   // ─── Holiday Year Validation ────────────────────────────
@@ -167,6 +186,16 @@ async function main() {
     log.warn({ err: err.message }, '⚠️  Broker initialization failed');
   }
 
+  // ─── Initialize Holdings Manager (Feature 5) ──────────
+  const holdingsManager = broker
+    ? new HoldingsManager({ broker, redis: getRedis(), capital: config.TRADING_CAPITAL })
+    : null;
+  if (holdingsManager) {
+    log.info('✅ Holdings manager initialized');
+  } else {
+    log.warn('⚠️  Holdings manager disabled — no broker');
+  }
+
   // ─── Initialize Instrument Manager ─────────────────────
   let instrumentManager = null;
   if (broker) {
@@ -238,6 +267,7 @@ async function main() {
       regimeEnabled: true,
       adaptiveEnabled: dbHealthy,
       newsEnabled: !!config.ANTHROPIC_API_KEY,
+      intradayDecay,  // Feature 7: applies intraday decay before weightedConsensus
     });
     log.info({
       trend: true,
@@ -249,6 +279,15 @@ async function main() {
     log.warn('⚠️  Enhanced pipeline disabled — Redis not available');
   }
 
+  // ─── Initialize Shadow Recorder ───────────────────────
+  let shadowRecorder = null;
+  if (dbHealthy) {
+    shadowRecorder = new ShadowRecorder({ broker, intradayDecay });  // Feature 7: recordWrong() on 30min miss
+    log.info('✅ Shadow recorder initialized');
+  } else {
+    log.warn('⚠️  Shadow recorder disabled — DB not available');
+  }
+
   // ─── Initialize Execution Engine ───────────────────────
   const engine = new ExecutionEngine({
     riskManager,
@@ -257,8 +296,17 @@ async function main() {
     pipeline,
     broker,
     paperMode: !config.LIVE_TRADING || !broker,
-    shadowRecorder,   // ← add this line
+    shadowRecorder,
+    holdingsManager,  // Feature 5: proactive exposure check
+    telegram: telegramRef,  // Feature 9: conflict detection alerts
+    redis: redisHealthy ? getRedis() : null,  // Feature 9: conflict rate limit
   });
+
+  if (telegramRef?.enabled && redisHealthy) {
+    log.info('✅ Conflict detection active — Telegram alerts enabled');
+  } else {
+    log.warn('⚠️  Conflict detection disabled — requires Telegram + Redis');
+  }
 
   const engineInit = await engine.initialize();
   log.info({ ready: engineInit.ready, paperMode: !config.LIVE_TRADING || !broker },
@@ -294,14 +342,6 @@ async function main() {
       '⚠️  DB unavailable — position hydration skipped. ' +
       'SELL guard is disabled for this session. Restart with DB connectivity to re-enable.'
     );
-  }
-
-  let shadowRecorder = null;
-  if (dbHealthy) {
-    shadowRecorder = new ShadowRecorder({ broker });
-    log.info('✅ Shadow recorder initialized');
-  } else {
-    log.warn('⚠️  Shadow recorder disabled — DB not available');
   }
 
   // ─── Initialize Telegram Bot ───────────────────────────
@@ -440,14 +480,30 @@ async function main() {
           } catch { /* skip */ }
         }
 
+        // Feature 4: Use real historical win-rate / avg P&L from signal_outcomes
+        // instead of fixed defaults. Falls back to defaults if sample size < 10.
+        const stats = positionStats
+          ? await positionStats.getStats(symbol)
+          : { winRate: 0.5, avgWin: 1000, avgLoss: 500 };
+
         const sizing = calculatePositionSize({
           capital: config.TRADING_CAPITAL,
-          winRate: 0.5,
-          avgWin: 1000,
-          avgLoss: 500,
+          winRate: stats.winRate,
+          avgWin: stats.avgWin,
+          avgLoss: stats.avgLoss,
           entryPrice: currentPrice || 100,
           maxRiskPct: config.PER_TRADE_STOP_LOSS_PCT,
         });
+
+        log.debug({
+          symbol,
+          winRate: stats.winRate,
+          avgWin: stats.avgWin,
+          avgLoss: stats.avgLoss,
+          usingDefaults: stats.usingDefaults,
+          sampleSize: stats.sampleSize,
+          quantity: sizing.quantity,
+        }, 'Position sizing (Kelly inputs)');
 
         items.push({ symbol, instrumentToken, candles, price: currentPrice, quantity: sizing.quantity || 1 });
       } catch (err) {
@@ -548,6 +604,7 @@ async function main() {
     pipeline,
     scout,             // ← NEW: passes scout for nightly job
     shadowRecorder,
+    intradayDecay,     // Feature 7: resetDay() at market open
     broker,
     dataFeed: tickFeed,
     getWatchlist,
@@ -672,7 +729,7 @@ async function main() {
   // ─── Start REST API Server ─────────────────────────────
   const { createServer } = await import('node:http');
   const apiHandler = createApiHandler({
-    killSwitch, riskManager, engine, config, broker, telegram, scout,
+    killSwitch, riskManager, engine, config, broker, telegram, scout, holdingsManager,
   });
 
   const apiServer = createServer(apiHandler);

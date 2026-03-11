@@ -83,6 +83,7 @@ export class EnhancedSignalPipeline {
      * @param {boolean}  [opts.adaptiveEnabled=true]
      * @param {boolean}  [opts.newsEnabled=true]
      * @param {Function} [opts.logger]
+     * @param {import('../intelligence/intraday-decay.js').IntradayDecayManager} [opts.intradayDecay]
      */
     constructor({
         redis,
@@ -93,6 +94,7 @@ export class EnhancedSignalPipeline {
         regimeEnabled = true,
         adaptiveEnabled = true,
         newsEnabled = true,
+        intradayDecay = null,
         logger,
     }) {
         const logFn = logger || ((msg, meta) => log.info(meta || {}, msg));
@@ -112,6 +114,8 @@ export class EnhancedSignalPipeline {
         this.newsSentiment = newsEnabled && geminiApiKey
             ? new NewsSentimentFilter({ redis, geminiApiKey, logger: logFn })
             : null;
+
+        this.intradayDecay = intradayDecay || null;
 
         this._logger = logFn;
 
@@ -167,7 +171,21 @@ export class EnhancedSignalPipeline {
 
         let finalSignal;
         if (this.adaptiveWeights) {
-            finalSignal = await this.adaptiveWeights.weightedConsensus(strategySignals, threshold);
+            // Feature 7: Fetch base weights, apply intraday decay multipliers (if available),
+            // then call weightedConsensusWithWeights() to skip the redundant Redis fetch.
+            // On any failure, falls back to the original weightedConsensus() call.
+            try {
+                const baseWeights = await this.adaptiveWeights.getWeights();
+                const effectiveWeights = this.intradayDecay
+                    ? await this.intradayDecay.applyDecay(baseWeights)
+                    : baseWeights;
+                finalSignal = this.adaptiveWeights.weightedConsensusWithWeights(
+                    strategySignals, effectiveWeights, threshold
+                );
+            } catch (err) {
+                log.warn({ err: err.message }, 'Intraday decay failed — falling back to standard weighted consensus');
+                finalSignal = await this.adaptiveWeights.weightedConsensus(strategySignals, threshold);
+            }
             if (finalSignal) {
                 gateLog.push(`✅ Weighted consensus: ${finalSignal.signal} (score=${finalSignal.weightedScore})`);
             } else {

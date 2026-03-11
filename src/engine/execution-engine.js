@@ -1,5 +1,5 @@
 /**
- * @fileoverview Order Execution Engine for Quant8
+ * @fileoverview Order Execution Engine for Alpha8
  *
  * CHANGES (Tier 1):
  *   Task 2 — _filledPositions converted from Set to Map. Stores BUY entry context
@@ -50,6 +50,9 @@ export class ExecutionEngine {
    * @param {number}  [deps.maxRetries]
    * @param {number}  [deps.retryDelayMs]
    * @param {import('../intelligence/shadow-recorder.js').ShadowRecorder} [deps.shadowRecorder]
+   * @param {import('../data/holdings.js').HoldingsManager} [deps.holdingsManager]
+   * @param {import('../notifications/telegram-bot.js').TelegramBot} [deps.telegram]
+   * @param {import('ioredis').Redis} [deps.redis] - For conflict alert rate limiting
    */
   constructor(deps) {
     this.riskManager = deps.riskManager;
@@ -58,6 +61,9 @@ export class ExecutionEngine {
     this.pipeline = deps.pipeline || null;
     this.broker = deps.broker || null;
     this.shadowRecorder = deps.shadowRecorder || null;
+    this.holdingsManager = deps.holdingsManager || null;
+    this.telegram = deps.telegram || null;
+    this.redis = deps.redis || null;
     this.paperMode = deps.paperMode ?? true;
     this.maxRetries = deps.maxRetries ?? MAX_ORDER_RETRIES;
     this.retryDelayMs = deps.retryDelayMs ?? RETRY_DELAY_MS;
@@ -229,6 +235,11 @@ export class ExecutionEngine {
     // If no strategy fired anything (all HOLD), skip the pipeline entirely.
     // Still record shadow signals — strategies did run, their votes just cancelled out.
     if (consensusResult.signal === 'HOLD') {
+      // Feature 9: Conflict detection — alert when strategies actively disagree
+      if (consensusResult.isConflicted && this.telegram && this.redis) {
+        this._alertConflict(symbol, consensusResult).catch(() => { });
+      }
+
       if (this.shadowRecorder && (consensusResult.details?.length ?? 0) > 0) {
         this.shadowRecorder.recordSignals(
           symbol, consensusResult.details, consensusResult, false, currentPrice, null
@@ -416,6 +427,27 @@ export class ExecutionEngine {
       log.warn({ symbol: params.symbol, orderId: order.id },
         'Order REJECTED — already holding position for symbol');
       return order;
+    }
+
+    // Feature 5: Holdings awareness — block BUY if exposure exists in broker
+    // (delivery holdings or intraday positions opened outside this engine).
+    // Non-fatal on failure — a broken holdings check must never block a trade.
+    if (params.side === 'BUY' && this.holdingsManager) {
+      try {
+        const existing = await this.holdingsManager.getExposure(params.symbol);
+        if (existing && existing.quantity > 0) {
+          transitionOrder(order, ORDER_STATE.REJECTED, {
+            rejectionReason: `Holdings check: already hold ${existing.quantity} units of ${params.symbol} (source: ${existing.source})`,
+          });
+          log.warn({ symbol: params.symbol, existing, orderId: order.id },
+            'BUY rejected — existing holding detected via HoldingsManager');
+          return order;
+        }
+      } catch (err) {
+        // Non-fatal — log and continue. Never block a trade on a holdings check failure.
+        log.warn({ symbol: params.symbol, err: err.message },
+          'Holdings check failed — proceeding without exposure check');
+      }
     }
 
     // Bug Fix 2: SELL guard — reject if no open position exists after DB hydration.
@@ -831,6 +863,38 @@ export class ExecutionEngine {
     } catch (err) {
       log.error({ signalId, symbol, err: err.message },
         `CRITICAL: Failed to mark signal as acted_on — manual reconciliation needed (signalId=${signalId})`);
+    }
+  }
+
+  /**
+   * Feature 9: Send a Telegram conflict alert when BUY and SELL strategies cancel exactly.
+   * Rate-limited per symbol to one alert per 30 minutes via Redis.
+   * Fire-and-forget — caller uses .catch(() => {}).
+   *
+   * @private
+   * @param {string} symbol
+   * @param {Object} consensusResult - from SignalConsensus.evaluate()
+   */
+  async _alertConflict(symbol, consensusResult) {
+    const rateLimitKey = `conflict:alerted:${symbol}`;
+    try {
+      const alreadyAlerted = await this.redis.get(rateLimitKey);
+      if (alreadyAlerted) return;
+
+      await this.redis.setex(rateLimitKey, 1800, '1');
+
+      const { buyStrategies, sellStrategies } = consensusResult.conflictDetails;
+      const msg =
+        `⚡ <b>Signal Conflict — ${symbol}</b>\n\n` +
+        `📈 BUY: ${buyStrategies.join(', ')}\n` +
+        `📉 SELL: ${sellStrategies.join(', ')}\n\n` +
+        `Result: HOLD (strategies cancel out)\n` +
+        `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`;
+
+      await this.telegram.sendRaw(msg);
+      log.info({ symbol, buyStrategies, sellStrategies }, 'Conflict alert sent via Telegram');
+    } catch (err) {
+      log.warn({ symbol, err: err.message }, 'Conflict alert failed — continuing');
     }
   }
 }

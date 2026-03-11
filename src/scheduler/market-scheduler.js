@@ -52,6 +52,7 @@ export class MarketScheduler {
     this.pipeline = deps.pipeline || null;
     this.scout = deps.scout || null;   // ← NEW
     this.shadowRecorder = deps.shadowRecorder || null;
+    this.intradayDecay = deps.intradayDecay || null;
     this.broker = deps.broker || null;
     this.dataFeed = deps.dataFeed || null;
     this.getWatchlist = deps.getWatchlist || (async () => []);
@@ -276,6 +277,14 @@ export class MarketScheduler {
    */
   async _marketOpen() {
     log.info('═══ MARKET OPEN ═══');
+
+    // Feature 7: Reset intraday wrong-signal counters before first scan
+    if (this.intradayDecay) {
+      await this.intradayDecay.resetDay().catch(err =>
+        log.warn({ err: err.message }, 'Intraday decay reset failed — continuing')
+      );
+      log.info('Intraday strategy decay counters reset for new session');
+    }
 
     if (this.dataFeed && typeof this.dataFeed.connect === 'function') {
       try {

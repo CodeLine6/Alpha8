@@ -182,6 +182,63 @@ export class AdaptiveWeightManager {
     }
 
     /**
+     * Weighted consensus with a pre-fetched / intraday-decayed weight Map.
+     *
+     * Identical logic to weightedConsensus() but skips the Redis fetch —
+     * the caller provides the weights (e.g. after IntradayDecayManager.applyDecay()).
+     * Backward compatibility: existing weightedConsensus() signature is unchanged.
+     *
+     * @param {Array}           signals   - [{ signal, confidence, strategy, reason }]
+     * @param {Map<string,number>} weights - Pre-fetched weight map (from getWeights() + applyDecay())
+     * @param {number}          threshold - default 2.0
+     * @returns {object|null}
+     */
+    weightedConsensusWithWeights(signals, weights, threshold = 2.0) {
+        if (!signals || signals.length === 0) return null;
+
+        let buyWeight = 0;
+        let sellWeight = 0;
+
+        for (const sig of signals) {
+            const w = weights.get(sig.strategy) ?? WEIGHT_DEFAULT;
+            if (sig.signal === 'BUY') buyWeight += w;
+            if (sig.signal === 'SELL') sellWeight += w;
+        }
+
+        log.debug({
+            threshold,
+            buyWeight: Math.round(buyWeight * 100) / 100,
+            sellWeight: Math.round(sellWeight * 100) / 100,
+        }, 'Weighted consensus (with pre-fetched weights) threshold check');
+
+        if (buyWeight >= threshold) {
+            const buys = signals.filter(s => s.signal === 'BUY');
+            const best = buys.reduce((m, s) => s.confidence > m.confidence ? s : m, buys[0]);
+            log.debug({ threshold, buyWeight }, 'BUY weighted consensus (pre-fetched) passed');
+            return {
+                ...best,
+                weightedScore: Math.round(buyWeight * 100) / 100,
+                votingSummary: this._voteSummary(signals, weights),
+            };
+        }
+
+        if (sellWeight >= threshold) {
+            const sells = signals.filter(s => s.signal === 'SELL');
+            const best = sells.reduce((m, s) => s.confidence > m.confidence ? s : m, sells[0]);
+            log.debug({ threshold, sellWeight }, 'SELL weighted consensus (pre-fetched) passed');
+            return {
+                ...best,
+                weightedScore: Math.round(sellWeight * 100) / 100,
+                votingSummary: this._voteSummary(signals, weights),
+            };
+        }
+
+        log.debug({ threshold, buyWeight, sellWeight },
+            'Weighted consensus (pre-fetched) blocked — weights below threshold');
+        return null;
+    }
+
+    /**
      * Record a signal outcome for future weight evaluation.
      * Call this when a position closes.
      *

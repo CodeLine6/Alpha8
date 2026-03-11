@@ -1,5 +1,5 @@
 /**
- * @fileoverview Signal Consensus Layer for Quant8
+ * @fileoverview Signal Consensus Layer for Alpha8
  *
  * CHANGES (Tier 1):
  *   - Exported STRATEGY_GROUPS constant (reversal + momentum role groups)
@@ -9,12 +9,57 @@
  *     momentum strategy and they cancel each other out.
  *   - Added `groupVotes` field to result for dashboard visibility.
  *   - When `groupedConsensus: false`, falls back to original "any N agree" logic.
+ *
+ * CHANGES (Tier 2 — Feature 6):
+ *   - Added CONFIDENCE_FLOORS per strategy. REVERSAL strategies (EMA, RSI)
+ *     require ≥55% confidence; MOMENTUM strategies (VWAP, Breakout) require ≥45%.
+ *     DEFAULT_FLOOR = 40 for any unrecognised strategy.
+ *   - Signals below their floor are included in `details` (for shadow recording
+ *     and dashboard visibility) but marked meetsFloor: false and do NOT count
+ *     as a vote. This prevents weak noise signals from forming false consensus.
+ *
+ * CHANGES (Tier 3 — Feature 8):
+ *   - Added OPEN_WINDOW_SUPPRESSED set: EMA_CROSSOVER and BREAKOUT_VOLUME are
+ *     suppressed during the first 15 minutes after market open (09:15–09:30 IST).
+ *     Gap-open flush makes crossovers and breakouts unreliable in this window.
+ *     RSI and VWAP are unaffected — they use cumulative/mean data.
+ *   - isInOpenNoiseWindow() is a synchronous helper (no external deps, zero latency).
+ *   - suppressedByTime is included in details even when false — downstream
+ *     shadow recording reads the full details array.
+ *
+ * CHANGES (Tier 3 — Feature 9):
+ *   - Conflict detection added at end of evaluate(). A "conflict" is defined as
+ *     buyCount > 0 AND sellCount > 0 AND buyCount === sellCount (after floor +
+ *     time-gate filtering). isConflicted and conflictDetails are added to the
+ *     return object for ExecutionEngine to act on.
  */
 
 import { SIGNAL } from '../config/constants.js';
 import { createLogger } from '../lib/logger.js';
 
 const log = createLogger('signal-consensus');
+
+/**
+ * Minimum confidence required for a strategy's signal to count as a vote.
+ * REVERSAL strategies (EMA, RSI) require higher conviction — they trade against momentum.
+ * MOMENTUM strategies (VWAP, Breakout) have a slightly lower bar — they follow direction.
+ */
+const CONFIDENCE_FLOORS = {
+  EMA_CROSSOVER: 55,
+  RSI_MEAN_REVERSION: 55,
+  VWAP_MOMENTUM: 45,
+  BREAKOUT_VOLUME: 45,
+};
+const DEFAULT_FLOOR = 40;
+
+/**
+ * Strategies that are suppressed during the market open noise window (09:15–09:30 IST).
+ * EMA crossovers and breakouts are unreliable during gap-open flush — they generate
+ * signals that reverse within 1–2 candles as overnight orders clear.
+ * RSI and VWAP are unaffected — they use cumulative/mean data less sensitive to gaps.
+ */
+const OPEN_WINDOW_SUPPRESSED = new Set(['EMA_CROSSOVER', 'BREAKOUT_VOLUME']);
+const OPEN_WINDOW_END_MINUTES = 15; // suppress for first 15 minutes after 09:15
 
 /**
  * Strategy role groups.
@@ -32,6 +77,28 @@ export const STRATEGY_GROUPS = {
   REVERSAL: ['ema-crossover', 'rsi-reversion'],
   MOMENTUM: ['vwap-momentum', 'breakout-volume'],
 };
+
+/**
+ * Pure helper — no external dependencies, synchronous, zero latency.
+ * Returns true during first 15 minutes of market session (09:15–09:30 IST).
+ * Uses the same toLocaleString IST pattern as market-hours.js.
+ *
+ * IMPORTANT: This function is called ONCE per evaluate() call (before the loop),
+ * not once per strategy — the result is stored in const inOpenWindow.
+ *
+ * @returns {boolean}
+ */
+function isInOpenNoiseWindow() {
+  const now = new Date();
+  // Convert to IST using the same pattern as market-hours.js
+  const istString = now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
+  const ist = new Date(istString);
+  const hours = ist.getHours();
+  const minutes = ist.getMinutes();
+  const totalMinutes = hours * 60 + minutes;
+  const openMinutes = 9 * 60 + 15;  // 09:15
+  return totalMinutes >= openMinutes && totalMinutes < openMinutes + OPEN_WINDOW_END_MINUTES;
+}
 
 /**
  * Signal Consensus Layer.
@@ -80,7 +147,9 @@ export class SignalConsensus {
    *   reason: string,
    *   votes: { buy: number, sell: number, hold: number },
    *   groupVotes: { reversal: { buy: number, sell: number }, momentum: { buy: number, sell: number } },
-   *   details: Object[]
+   *   details: Object[],
+   *   isConflicted: boolean,
+   *   conflictDetails: { buyStrategies: string[], sellStrategies: string[] } | null
    * }}
    */
   evaluate(candles) {
@@ -92,8 +161,13 @@ export class SignalConsensus {
         votes: { buy: 0, sell: 0, hold: 0 },
         groupVotes: { reversal: { buy: 0, sell: 0 }, momentum: { buy: 0, sell: 0 } },
         details: [],
+        isConflicted: false,
+        conflictDetails: null,
       };
     }
+
+    // ── Feature 8: compute time gate ONCE before the loop ─────────────────────
+    const inOpenWindow = isInOpenNoiseWindow();
 
     const results = [];
     const votes = { buy: 0, sell: 0, hold: 0 };
@@ -108,7 +182,6 @@ export class SignalConsensus {
       let result;
       try {
         result = strategy.analyze(candles);
-        results.push(result);
       } catch (err) {
         log.error({ strategy: strategy.name, err: err.message },
           'Strategy threw an error — counting as HOLD');
@@ -118,32 +191,83 @@ export class SignalConsensus {
           confidence: 0,
           reason: `Error: ${err.message}`,
           strategy: strategy.name,
+          meetsFloor: false,
+          confidenceFloor: CONFIDENCE_FLOORS[strategy.name] ?? DEFAULT_FLOOR,
+          suppressedByTime: false,
         });
         continue;
       }
 
-      // ── Confidence gate — must pass before any vote is counted ──────────
+      // ── Confidence gate — must pass minConfidence before any vote is counted ─
       if (result.confidence < this.minConfidence) {
-        votes.hold++; // Low-confidence signals count as HOLD
+        votes.hold++;
+        results.push({
+          ...result,
+          meetsFloor: false,
+          confidenceFloor: CONFIDENCE_FLOORS[result.strategy ?? strategy.name] ?? DEFAULT_FLOOR,
+          suppressedByTime: false,
+        });
         continue;
       }
 
-      // ── Vote tallying ────────────────────────────────────────────────────
+      // ── Feature 6: Per-strategy confidence floor ──────────────────────────────
+      const strategyKey = result.strategy ?? strategy.name;
+      const floor = CONFIDENCE_FLOORS[strategyKey] ?? DEFAULT_FLOOR;
+      const meetsFloor = result.confidence >= floor;
+
+      if (!meetsFloor) {
+        log.debug({
+          strategy: strategyKey,
+          confidence: result.confidence,
+          floor,
+        }, 'Signal filtered — below confidence floor');
+      }
+
+      // ── Feature 8: Time gate — suppress EMA/Breakout during open noise window ─
+      const suppressedByTime = inOpenWindow && OPEN_WINDOW_SUPPRESSED.has(strategyKey);
+
+      if (suppressedByTime) {
+        log.debug({
+          strategy: strategyKey,
+          signal: result.signal,
+        }, 'Signal suppressed — open noise window (09:15–09:30 IST)');
+      }
+
+      // Include in details ALWAYS — shadow recording and dashboard need full picture.
+      // suppressedByTime:false is explicit so downstream always has the field.
+      results.push({
+        ...result,
+        meetsFloor,
+        confidenceFloor: floor,
+        suppressedByTime,
+      });
+
+      // Only count as vote if it meets floor AND is not time-suppressed
+      if (!meetsFloor || suppressedByTime) {
+        votes.hold++; // filtered signals count as HOLD
+        continue;
+      }
+
+      if (result.signal === SIGNAL.HOLD) {
+        votes.hold++;
+        continue;
+      }
+
+      // ── Vote tallying ─────────────────────────────────────────────────────────
       if (result.signal === SIGNAL.BUY) {
         votes.buy++;
       } else if (result.signal === SIGNAL.SELL) {
         votes.sell++;
       } else {
         votes.hold++;
-        continue; // HOLD signals don't belong to either group
+        continue;
       }
 
-      // ── Group vote tallying (for grouped consensus mode) ─────────────────
-      const stratName = result.strategy ?? strategy.name;
-      if (STRATEGY_GROUPS.REVERSAL.includes(stratName)) {
+      // ── Group vote tallying (for grouped consensus mode) ──────────────────────
+      if (STRATEGY_GROUPS.REVERSAL.includes(strategyKey)) {
         if (result.signal === SIGNAL.BUY) groupVotes.reversal.buy++;
         else groupVotes.reversal.sell++;
-      } else if (STRATEGY_GROUPS.MOMENTUM.includes(stratName)) {
+      } else if (STRATEGY_GROUPS.MOMENTUM.includes(strategyKey)) {
         if (result.signal === SIGNAL.BUY) groupVotes.momentum.buy++;
         else groupVotes.momentum.sell++;
       }
@@ -155,13 +279,11 @@ export class SignalConsensus {
     let reason = '';
 
     if (this.groupedConsensus) {
-      // ── Grouped mode: ≥1 REVERSAL + ≥1 MOMENTUM must agree ─────────────
       const result = this._groupedConsensus(results, votes, groupVotes);
       finalSignal = result.signal;
       finalConfidence = result.confidence;
       reason = result.reason;
     } else {
-      // ── Fallback mode: original "any minAgreement agree" logic ───────────
       const result = this._simpleConsensus(results, votes);
       finalSignal = result.signal;
       finalConfidence = result.confidence;
@@ -174,8 +296,21 @@ export class SignalConsensus {
       votes,
       groupVotes,
       mode: this.groupedConsensus ? 'grouped' : 'simple',
+      inOpenWindow,
       strategiesRun: this.strategies.length,
     }, reason);
+
+    // ── Feature 9: Conflict detection ────────────────────────────────────────
+    // A conflict is BUY and SELL votes that perfectly cancel — both > 0 and equal.
+    // Only counts votes that met floor AND were not time-suppressed.
+    const buyCount = results.filter(d => d.signal === SIGNAL.BUY && d.meetsFloor && !d.suppressedByTime).length;
+    const sellCount = results.filter(d => d.signal === SIGNAL.SELL && d.meetsFloor && !d.suppressedByTime).length;
+    const isConflicted = buyCount > 0 && sellCount > 0 && buyCount === sellCount;
+
+    const conflictDetails = isConflicted ? {
+      buyStrategies: results.filter(d => d.signal === SIGNAL.BUY && d.meetsFloor && !d.suppressedByTime).map(d => d.strategy),
+      sellStrategies: results.filter(d => d.signal === SIGNAL.SELL && d.meetsFloor && !d.suppressedByTime).map(d => d.strategy),
+    } : null;
 
     return {
       signal: finalSignal,
@@ -184,6 +319,8 @@ export class SignalConsensus {
       votes,
       groupVotes,
       details: results,
+      isConflicted,
+      conflictDetails,
     };
   }
 
@@ -197,13 +334,12 @@ export class SignalConsensus {
     // ── BUY check ─────────────────────────────────────────────────────────
     if (groupVotes.reversal.buy >= 1 && groupVotes.momentum.buy >= 1) {
       const buyResults = results.filter(
-        (r) => r.signal === SIGNAL.BUY && r.confidence >= this.minConfidence
+        (r) => r.signal === SIGNAL.BUY && r.confidence >= this.minConfidence && r.meetsFloor && !r.suppressedByTime
       );
       const confidence = Math.round(
         buyResults.reduce((sum, r) => sum + r.confidence, 0) / buyResults.length
       );
 
-      // Build descriptive reason listing contributing strategies
       const reversalNames = this._groupContributors(results, STRATEGY_GROUPS.REVERSAL, SIGNAL.BUY);
       const momentumNames = this._groupContributors(results, STRATEGY_GROUPS.MOMENTUM, SIGNAL.BUY);
       const reason = `BUY consensus: ${reversalNames.map(n => `${n}(reversal)`).join(' + ')} + ${momentumNames.map(n => `${n}(momentum)`).join(' + ')} agree`;
@@ -214,7 +350,7 @@ export class SignalConsensus {
     // ── SELL check ────────────────────────────────────────────────────────
     if (groupVotes.reversal.sell >= 1 && groupVotes.momentum.sell >= 1) {
       const sellResults = results.filter(
-        (r) => r.signal === SIGNAL.SELL && r.confidence >= this.minConfidence
+        (r) => r.signal === SIGNAL.SELL && r.confidence >= this.minConfidence && r.meetsFloor && !r.suppressedByTime
       );
       const confidence = Math.round(
         sellResults.reduce((sum, r) => sum + r.confidence, 0) / sellResults.length
@@ -242,7 +378,7 @@ export class SignalConsensus {
   _simpleConsensus(results, votes) {
     if (votes.buy >= this.minAgreement && votes.buy > votes.sell) {
       const buyResults = results.filter(
-        (r) => r.signal === SIGNAL.BUY && r.confidence >= this.minConfidence
+        (r) => r.signal === SIGNAL.BUY && r.confidence >= this.minConfidence && r.meetsFloor !== false && !r.suppressedByTime
       );
       const confidence = Math.round(
         buyResults.reduce((sum, r) => sum + r.confidence, 0) / buyResults.length
@@ -256,7 +392,7 @@ export class SignalConsensus {
 
     if (votes.sell >= this.minAgreement && votes.sell > votes.buy) {
       const sellResults = results.filter(
-        (r) => r.signal === SIGNAL.SELL && r.confidence >= this.minConfidence
+        (r) => r.signal === SIGNAL.SELL && r.confidence >= this.minConfidence && r.meetsFloor !== false && !r.suppressedByTime
       );
       const confidence = Math.round(
         sellResults.reduce((sum, r) => sum + r.confidence, 0) / sellResults.length
@@ -279,15 +415,18 @@ export class SignalConsensus {
 
   /**
    * Get strategy names that voted for a given signal within a group.
+   * Only includes signals that met their confidence floor AND were not time-suppressed.
    * @private
-   * @param {Object[]} results
-   * @param {string[]} groupNames
-   * @param {string}   targetSignal
-   * @returns {string[]}
    */
   _groupContributors(results, groupNames, targetSignal) {
     return results
-      .filter(r => groupNames.includes(r.strategy) && r.signal === targetSignal && r.confidence >= this.minConfidence)
+      .filter(r =>
+        groupNames.includes(r.strategy) &&
+        r.signal === targetSignal &&
+        r.confidence >= this.minConfidence &&
+        r.meetsFloor !== false &&
+        !r.suppressedByTime
+      )
       .map(r => r.strategy);
   }
 }

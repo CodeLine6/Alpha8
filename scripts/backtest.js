@@ -74,7 +74,7 @@ const { values: args } = parseArgs({
 if (args.help) {
   const helpText = `
 ╔══════════════════════════════════════════════════════════════╗
-║              QUANT8 — Backtesting CLI                        ║
+║              Alpha8 — Backtesting CLI                        ║
 ╚══════════════════════════════════════════════════════════════╝
 
 USAGE
@@ -176,7 +176,7 @@ if (args.csv && !existsSync(resolve(args.csv))) {
 async function main() {
   console.log('\n');
   console.log('  ╔══════════════════════════════════════════╗');
-  console.log('  ║         QUANT8 — Backtesting             ║');
+  console.log('  ║         Alpha8 — Backtesting             ║');
   console.log('  ╚══════════════════════════════════════════╝');
   console.log('');
   console.log(`  Symbol     : ${symbol}`);
