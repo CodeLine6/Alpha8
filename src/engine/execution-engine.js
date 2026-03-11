@@ -3,7 +3,7 @@
  *
  * CHANGES (Tier 1):
  *   Task 2 — _filledPositions converted from Set to Map. Stores BUY entry context
- *            (strategies, price, quantity, timestamp) so SELL fills can compute P\u0026L
+ *            (strategies, price, quantity, timestamp) so SELL fills can compute P&L
  *            and feed data to the adaptive weight system via recordPositionOutcome().
  *
  *   Task 3 — Before calling pipeline.process(), fetches the current market regime
@@ -16,12 +16,24 @@
  *
  *   Task 4B — _persistSignals() accepts currentPrice as 3rd param and inserts it
  *             into both per-strategy and CONSENSUS signal rows.
+ *
+ * BUG FIXES:
+ *   Bug 1 — acted_on race condition: _persistSignals() is now awaited before order
+ *            execution and returns the CONSENSUS signal row ID. _markSignalActedOn()
+ *            uses that ID directly (no timestamp-based lookup race).
+ *
+ *   Bug 2 — SELL without BUY: Added hydratePositions() for startup DB hydration.
+ *            Added SELL guard in executeOrder() — rejects if symbol not in _filledPositions.
+ *
+ *   Bug 3 — Counter drift: removePosition() is now called on SELL fills. hydratePositions()
+ *            returns the hydrated count so the caller can sync the risk manager.
  */
 
 import { createLogger } from '../lib/logger.js';
 import { ORDER_STATE, MAX_ORDER_RETRIES, RETRY_DELAY_MS } from '../config/constants.js';
 import { createOrder, transitionOrder, isTerminal } from './order-state-machine.js';
 import { query } from '../lib/db.js';
+import { ShadowRecorder } from '../intelligence/shadow-recorder.js';
 
 const log = createLogger('execution-engine');
 
@@ -37,13 +49,15 @@ export class ExecutionEngine {
    * @param {boolean} [deps.paperMode=true]
    * @param {number}  [deps.maxRetries]
    * @param {number}  [deps.retryDelayMs]
+   * @param {import('../intelligence/shadow-recorder.js').ShadowRecorder} [deps.shadowRecorder]
    */
   constructor(deps) {
     this.riskManager = deps.riskManager;
     this.killSwitch = deps.killSwitch;
     this.consensus = deps.consensus;
-    this.pipeline = deps.pipeline || null;   // ← enhanced pipeline (optional)
+    this.pipeline = deps.pipeline || null;
     this.broker = deps.broker || null;
+    this.shadowRecorder = deps.shadowRecorder || null;
     this.paperMode = deps.paperMode ?? true;
     this.maxRetries = deps.maxRetries ?? MAX_ORDER_RETRIES;
     this.retryDelayMs = deps.retryDelayMs ?? RETRY_DELAY_MS;
@@ -66,9 +80,16 @@ export class ExecutionEngine {
     /**
      * @type {Map<string, string[]>}
      * Tracks which strategy names fired for each symbol's last BUY.
-     * Kept for backward-compat. Primary usage now via _filledPositions map.
      */
     this._lastSignalStrategies = new Map();
+
+    /**
+     * @type {Map<string, number>}
+     * Bug Fix 1: Tracks the DB row ID of the most recently inserted CONSENSUS signal
+     * per symbol. Used by _markSignalActedOn() to avoid the race condition where the
+     * UPDATE ran before the INSERT committed (fire-and-forget timing issue).
+     */
+    this._pendingSignalIds = new Map();
 
     /** @type {boolean} */
     this._initialized = false;
@@ -110,6 +131,61 @@ export class ExecutionEngine {
     return { ready: true, integrity };
   }
 
+  /**
+   * Bug Fix 2: Hydrate _filledPositions from DB on startup.
+   *
+   * Queries the trades table for BUY orders placed today (IST) that have no
+   * corresponding SELL. Reconstructs the in-memory position Map so the engine
+   * has accurate state after a server restart or Render redeploy.
+   *
+   * MUST be awaited in src/index.js before scheduler.start() is called.
+   * Throws if DB is unreachable — the caller must handle this and block startup.
+   *
+   * @returns {Promise<number>} Number of open positions hydrated
+   */
+  async hydratePositions() {
+    log.info('Hydrating open positions from DB...');
+
+    // Query BUY trades from today (IST) that have no SELL counterpart today.
+    // Using AT TIME ZONE 'Asia/Kolkata' for all date comparisons — never raw UTC.
+    const result = await query(`
+      SELECT DISTINCT ON (symbol)
+        symbol, price, quantity, strategy, created_at
+      FROM trades
+      WHERE side = 'BUY'
+        AND status = 'FILLED'
+        AND (created_at AT TIME ZONE 'Asia/Kolkata')::date =
+            (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+        AND symbol NOT IN (
+          SELECT symbol FROM trades
+          WHERE side = 'SELL'
+            AND status = 'FILLED'
+            AND (created_at AT TIME ZONE 'Asia/Kolkata')::date =
+                (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+        )
+      ORDER BY symbol, created_at DESC
+    `);
+
+    this._filledPositions.clear();
+
+    for (const row of result.rows) {
+      this._filledPositions.set(row.symbol, {
+        strategies: [],  // Strategy names not stored in trades table — leave empty
+        price: parseFloat(row.price),
+        quantity: parseInt(row.quantity, 10),
+        timestamp: new Date(row.created_at).getTime(),
+      });
+    }
+
+    const count = this._filledPositions.size;
+    const symbols = Array.from(this._filledPositions.keys());
+
+    log.info({ count, symbols },
+      `✅ Position hydration complete — ${count} open position(s) restored from DB`);
+
+    return count;
+  }
+
   // ═══════════════════════════════════════════════════════
   // SIGNAL PROCESSING
   // ═══════════════════════════════════════════════════════
@@ -120,9 +196,11 @@ export class ExecutionEngine {
    *
    * Flow:
    *   1. SignalConsensus runs all 4 strategies on today's candles
-   *   2. Regime is fetched once (Task 3) and passed to pipeline.process()
-   *   3. EnhancedSignalPipeline runs results through 4 gates with regime-adaptive threshold
-   *   4. If all gates pass → RiskManager validates → ExecutionEngine places order
+   *   2. _persistSignals is AWAITED and returns the CONSENSUS signal DB id (Bug Fix 1)
+   *   3. Regime is fetched once (Task 3) and passed to pipeline.process()
+   *   4. EnhancedSignalPipeline runs results through 4 gates with regime-adaptive threshold
+   *   5. If all gates pass → RiskManager validates → ExecutionEngine places order
+   *   6. _markSignalActedOn uses the stored signal ID — no race condition
    *
    * @param {string}   symbol
    * @param {import('../data/historical-data.js').Candle[]} candles
@@ -138,21 +216,32 @@ export class ExecutionEngine {
     // ── Step 1: Run all strategies via existing consensus layer ──────────
     const consensusResult = this.consensus.evaluate(candles);
 
-    // Persist all individual strategy signals to DB (fire-and-forget).
-    // Task 4B: currentPrice is now passed so the signals table price column is populated.
-    this._persistSignals(symbol, consensusResult, currentPrice).catch((err) =>
-      log.error({ symbol, err: err.message }, 'Signal persistence failed')
-    );
+    // Bug Fix 1: _persistSignals is now AWAITED (not fire-and-forget).
+    // It returns the DB row ID of the CONSENSUS signal row, which we store
+    // in _pendingSignalIds so _markSignalActedOn can use it directly —
+    // eliminating the race where the UPDATE ran before the INSERT committed.
+    const consensusSignalId = await this._persistSignals(symbol, consensusResult, currentPrice)
+      .catch((err) => {
+        log.error({ symbol, err: err.message }, 'Signal persistence failed');
+        return null;
+      });
 
-    // If no strategy fired anything (all HOLD), skip the pipeline entirely
+    if (consensusSignalId) {
+      this._pendingSignalIds.set(symbol, consensusSignalId);
+    }
+
+    // If no strategy fired anything (all HOLD), skip the pipeline entirely.
+    // Still record shadow signals — strategies did run, their votes just cancelled out.
     if (consensusResult.signal === 'HOLD') {
+      if (this.shadowRecorder && (consensusResult.details?.length ?? 0) > 0) {
+        this.shadowRecorder.recordSignals(
+          symbol, consensusResult.details, consensusResult, false, currentPrice, null
+        ).catch(err => log.warn({ symbol, err: err.message }, 'Shadow signal (HOLD) recording failed'));
+      }
       return { action: 'HOLD', order: null, consensus: consensusResult };
     }
 
     // ── Step 2: Fetch current market regime (Task 3) ─────────────────────
-    // Fetched here (once per scan cycle) so the pipeline does not call getRegime()
-    // twice per symbol. Both the positionSizeMult gate and the threshold gate share
-    // the same value. Wrapped in try/catch — regime failure must never crash the loop.
     let regime = null;
     if (this.pipeline?.regimeDetector) {
       try {
@@ -170,9 +259,6 @@ export class ExecutionEngine {
     let pipelineLog = null;
 
     if (this.pipeline) {
-      // Pass raw strategy-level results (details) and current regime.
-      // The pipeline uses regime to set the weighted consensus threshold:
-      //   TRENDING=1.8 | SIDEWAYS=2.0 | VOLATILE=2.5 | null=2.0 (default)
       const pipelineResult = await this.pipeline.process(symbol, consensusResult.details || [], regime);
       pipelineLog = pipelineResult.log;
 
@@ -192,7 +278,6 @@ export class ExecutionEngine {
         };
       }
 
-      // Apply regime detector's position size multiplier
       if (pipelineResult.positionSizeMult < 1.0) {
         const original = adjustedQuantity;
         adjustedQuantity = Math.max(1, Math.floor(quantity * pipelineResult.positionSizeMult));
@@ -204,14 +289,12 @@ export class ExecutionEngine {
         }, 'Position size reduced by regime detector');
       }
 
-      // Use pipeline's final signal (may have news-based confidence boost)
       if (pipelineResult.signal) {
         finalSignal = { ...consensusResult, ...pipelineResult.signal };
       }
     }
 
     // ── Step 4: Execute ──────────────────────────────────────────────────
-    // Track which strategies fired this BUY (for outcome attribution later)
     if (finalSignal.signal === 'BUY') {
       const firingStrategies = (consensusResult.details || [])
         .filter(d => d.signal === 'BUY')
@@ -231,7 +314,24 @@ export class ExecutionEngine {
     const acted = order.state === ORDER_STATE.FILLED;
 
     if (acted) {
-      this._markSignalActedOn(symbol, finalSignal.signal).catch(() => { });
+      // Bug Fix 1: Pass the stored signal ID — avoids the timestamp race condition.
+      const signalId = this._pendingSignalIds.get(symbol);
+      await this._markSignalActedOn(signalId, symbol, finalSignal.signal);
+      this._pendingSignalIds.delete(symbol);
+    }
+
+    // Record shadow signals fire-and-forget — captures all strategy votes including
+    // those that didn't reach consensus, enabling unbiased accuracy measurement.
+    // Must never block or throw into the trading loop.
+    if (this.shadowRecorder) {
+      this.shadowRecorder.recordSignals(
+        symbol,
+        consensusResult.details || [],
+        consensusResult,
+        acted,
+        currentPrice,
+        regime,
+      ).catch(err => log.warn({ symbol, err: err.message }, 'Shadow signal recording failed'));
     }
 
     return {
@@ -248,10 +348,7 @@ export class ExecutionEngine {
 
   /**
    * Record the outcome of a closed position.
-   *
-   * Called internally after a confirmed SELL fill (Task 2).
-   * Also callable externally from the scheduler for manual square-off scenarios.
-   * Feeds data to AdaptiveWeightManager for weekly weight recalibration.
+   * Called internally after a confirmed SELL fill.
    *
    * @param {string} symbol
    * @param {number} pnl  - positive = profit, negative = loss
@@ -272,10 +369,8 @@ export class ExecutionEngine {
     log.info({ symbol, pnl, outcome, strategies }, 'Recording position outcome for adaptive weights');
 
     for (const strategy of strategies) {
-      // Lightweight wrapper that calls adaptiveWeights.recordOutcome internally
       await this.pipeline.recordTradeOutcome(strategy, 'BUY', symbol, pnl);
 
-      // Also call recordOutcome directly for guaranteed DB persistence
       if (this.pipeline.adaptiveWeights) {
         await this.pipeline.adaptiveWeights.recordOutcome({ strategy, signal: 'BUY', symbol, outcome, pnl });
       }
@@ -283,12 +378,6 @@ export class ExecutionEngine {
 
     this._lastSignalStrategies.delete(symbol);
   }
-
-  /**
-   * Duplicate filled-position guard (BUY only).
-   * Uses Map.has() — compatible with the new Map type for _filledPositions.
-   */
-  // NOTE: This is not a separate method — the check is inline in executeOrder below.
 
   // ═══════════════════════════════════════════════════════
   // ORDER EXECUTION — The core loop
@@ -323,13 +412,24 @@ export class ExecutionEngine {
       return order;
     }
 
-    // H1: Duplicate filled position guard (BUY only) — Map.has() works same as Set.has()
+    // H1: Duplicate filled position guard (BUY only)
     if (params.side === 'BUY' && this._filledPositions.has(params.symbol)) {
       transitionOrder(order, ORDER_STATE.REJECTED, {
         rejectionReason: `Already holding position in ${params.symbol}`,
       });
       log.warn({ symbol: params.symbol, orderId: order.id },
         'Order REJECTED — already holding position for symbol');
+      return order;
+    }
+
+    // Bug Fix 2: SELL guard — reject if no open position exists after DB hydration.
+    // Prevents phantom SELLs when the engine restarts and _filledPositions is empty.
+    if (params.side === 'SELL' && !this._filledPositions.has(params.symbol)) {
+      transitionOrder(order, ORDER_STATE.REJECTED, {
+        rejectionReason: `SELL rejected — no open position found for ${params.symbol} after DB hydration`,
+      });
+      log.warn({ symbol: params.symbol, orderId: order.id },
+        `SELL rejected — no open position found for ${params.symbol} after DB hydration`);
       return order;
     }
 
@@ -362,7 +462,6 @@ export class ExecutionEngine {
 
   /**
    * Place order with retry logic.
-   * Only retries transient/network errors — not deterministic broker rejections.
    * @private
    */
   async _placeWithRetry(order) {
@@ -385,18 +484,18 @@ export class ExecutionEngine {
         transitionOrder(order, ORDER_STATE.PLACED, { brokerId: result.orderId });
         transitionOrder(order, ORDER_STATE.FILLED);
 
-        this.riskManager.addPosition();
-
-        // Task 2: Store BUY context in Map so we can compute P&L on SELL.
-        // For SELL fills, record the outcome and clean up.
         if (order.side === 'BUY') {
+          // Track BUY context for P&L calculation on SELL
           const strategies = this._lastSignalStrategies.get(order.symbol) || [];
           this._filledPositions.set(order.symbol, {
             strategies,
-            price: order.price,       // entry price (actual fill price if live, scan-time for paper)
+            price: order.price,
             quantity: order.quantity,
             timestamp: Date.now(),
           });
+          // Bug Fix 3: Sync position count to risk manager after map change
+          this.riskManager.addPosition();
+
         } else if (order.side === 'SELL') {
           const posCtx = this._filledPositions.get(order.symbol);
           if (posCtx) {
@@ -410,22 +509,15 @@ export class ExecutionEngine {
               pnl,
             }, 'SELL filled — recording position outcome');
 
-            // Fire-and-forget: outcome recording is non-critical
             this.recordPositionOutcome(order.symbol, pnl).catch((err) =>
               log.warn({ symbol: order.symbol, err: err.message },
                 'Position outcome recording failed — adaptive weights not updated')
             );
 
             this._filledPositions.delete(order.symbol);
+            // Bug Fix 3: Decrement position count on SELL fill
+            this.riskManager.removePosition();
           }
-        } else {
-          // Any other side (shouldn't happen), just mark filled
-          this._filledPositions.set(order.symbol, {
-            strategies: [],
-            price: order.price,
-            quantity: order.quantity,
-            timestamp: Date.now(),
-          });
         }
 
         this._persistTrade(order).catch((err) =>
@@ -436,7 +528,6 @@ export class ExecutionEngine {
       } catch (err) {
         lastError = err;
 
-        // Requirement #4: Log broker rejection verbatim
         log.error({
           orderId: order.id,
           attempt,
@@ -508,14 +599,9 @@ export class ExecutionEngine {
       product: order.product,
     });
 
-    // Task 4A: Fetch actual fill price from broker post-placement.
-    // Kite MARKET orders return only { order_id } at placement time.
-    // The real execution price is only available after the order reaches COMPLETE status.
-    // Non-fatal: if this fails, the scan-time price already set on order.price is kept.
+    // Task 4A: Fetch actual fill price post-placement. Non-fatal.
     try {
       const history = await this.broker.getOrderHistory(response.order_id);
-      // History is an array of status updates; last entry has the final state.
-      // average_price is the actual fill price for MARKET orders.
       const fillPrice = history?.average_price
         || (Array.isArray(history) ? history[history.length - 1]?.average_price : null)
         || null;
@@ -525,12 +611,11 @@ export class ExecutionEngine {
           scanPrice: order.price,
           fillPrice,
         }, 'Fill price fetched — overwriting scan-time price with actual executed price');
-        order.price = fillPrice;  // overwrite with actual executed price
+        order.price = fillPrice;
       }
     } catch (err) {
       log.warn({ orderId: response.order_id, err: err.message },
         'Could not fetch fill price — using scan-time price');
-      // Non-fatal: order.price remains as scan-time price
     }
 
     return { orderId: response.order_id };
@@ -557,6 +642,9 @@ export class ExecutionEngine {
   getActiveOrders() { return this.getAllOrders().filter((o) => !isTerminal(o)); }
   hasPendingOrder(sym) { return this._pendingSymbols.has(sym); }
 
+  /** Bug Fix 3: Expose open position count derived from _filledPositions Map */
+  getOpenPositionCount() { return this._filledPositions.size; }
+
   getStatus() {
     const orders = this.getAllOrders();
     return {
@@ -565,6 +653,7 @@ export class ExecutionEngine {
       pipelineEnabled: !!this.pipeline,
       totalOrders: orders.length,
       pendingSymbols: Array.from(this._pendingSymbols),
+      openPositions: this._filledPositions.size,
       ordersByState: {
         pending: orders.filter((o) => o.state === ORDER_STATE.PENDING).length,
         placed: orders.filter((o) => o.state === ORDER_STATE.PLACED).length,
@@ -581,6 +670,7 @@ export class ExecutionEngine {
     this._orders.clear();
     this._pendingSymbols.clear();
     this._lastSignalStrategies.clear();
+    this._pendingSignalIds.clear();
     log.info('Execution engine daily state reset');
   }
 
@@ -606,8 +696,17 @@ export class ExecutionEngine {
     }
   }
 
-  /** @private */
+  /**
+   * Bug Fix 1: Now AWAITED in processSignal (not fire-and-forget).
+   * Returns the DB row ID of the CONSENSUS signal row so _markSignalActedOn
+   * can update by ID instead of by timestamp (eliminates the race condition).
+   *
+   * @private
+   * @returns {Promise<number|null>} CONSENSUS signal row ID, or null on failure
+   */
   async _persistSignals(symbol, consensus, currentPrice = null) {
+    let consensusSignalId = null;
+
     try {
       for (const detail of (consensus.details || [])) {
         await query(
@@ -620,13 +719,16 @@ export class ExecutionEngine {
             detail.confidence || 0,
             false,
             (detail.reason || '').slice(0, 500),
-            currentPrice || null,  // Task 4B: populate price column
+            currentPrice || null,
           ]
         );
       }
-      await query(
+
+      // Insert CONSENSUS row and capture its ID
+      const consensusRow = await query(
         `INSERT INTO signals (symbol, strategy, signal, confidence, acted_on, reason, price, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+         RETURNING id`,
         [
           symbol,
           'CONSENSUS',
@@ -634,28 +736,59 @@ export class ExecutionEngine {
           consensus.confidence || 0,
           false,
           (consensus.reason || '').slice(0, 500),
-          currentPrice || null,  // Task 4B: populate price column
+          currentPrice || null,
         ]
       );
+
+      consensusSignalId = consensusRow.rows?.[0]?.id ?? null;
     } catch (err) {
       log.error({ symbol, err: err.message }, 'Failed to persist signals to DB');
     }
+
+    return consensusSignalId;
   }
 
-  /** @private */
-  async _markSignalActedOn(symbol, signal) {
+  /**
+   * Bug Fix 1: Uses signal row ID directly — no timestamp-based lookup race.
+   * Falls back to timestamp query if ID is unavailable (e.g. persist failed).
+   *
+   * @private
+   * @param {number|null} signalId - DB row ID from _persistSignals
+   * @param {string} symbol - For fallback query and error logging
+   * @param {string} signal - 'BUY' or 'SELL' — for fallback query only
+   */
+  async _markSignalActedOn(signalId, symbol, signal) {
     try {
-      await query(
-        `UPDATE signals SET acted_on = true
-         WHERE symbol = $1 AND strategy = 'CONSENSUS' AND signal = $2
-           AND created_at = (
-             SELECT MAX(created_at) FROM signals
-             WHERE symbol = $1 AND strategy = 'CONSENSUS' AND signal = $2
-           )`,
-        [symbol, signal]
-      );
+      if (signalId) {
+        // Fast path: use the ID we captured at insert time — no race condition
+        const result = await query(
+          `UPDATE signals SET acted_on = true WHERE id = $1`,
+          [signalId]
+        );
+        if (result.rowCount === 0) {
+          log.error({ signalId, symbol }, 'Failed to mark signal acted_on — row not found by ID');
+        } else {
+          log.debug({ signalId, symbol }, 'Signal marked acted_on by ID');
+        }
+      } else {
+        // Fallback: timestamp-based lookup (less reliable, kept for safety)
+        log.warn({ symbol, signal }, 'No signal ID available — falling back to timestamp lookup');
+        const result = await query(
+          `UPDATE signals SET acted_on = true
+           WHERE symbol = $1 AND strategy = 'CONSENSUS' AND signal = $2
+             AND created_at = (
+               SELECT MAX(created_at) FROM signals
+               WHERE symbol = $1 AND strategy = 'CONSENSUS' AND signal = $2
+             )`,
+          [symbol, signal]
+        );
+        if (result.rowCount === 0) {
+          log.error({ symbol, signal }, 'Fallback: failed to mark signal acted_on — no matching row found');
+        }
+      }
     } catch (err) {
-      log.error({ symbol, err: err.message }, 'Failed to mark signal as acted on');
+      log.error({ signalId, symbol, err: err.message },
+        `CRITICAL: Failed to mark signal as acted_on — manual reconciliation needed (signalId=${signalId})`);
     }
   }
 }

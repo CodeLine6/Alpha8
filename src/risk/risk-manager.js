@@ -14,6 +14,13 @@ const log = createLogger('risk-manager');
  *   4. Kill switch check happens first, before any other check
  *   5. State is updated via explicit methods, not inferred
  *
+ * BUG FIX (Bug 3):
+ *   - Added loadTradeCountFromDB(queryFn) — queries today's FILLED trades from
+ *     the DB on startup instead of starting tradeCount at 0 after a restart.
+ *   - Added syncPositionCount(count) — called after engine.hydratePositions()
+ *     to override the Redis-restored openPositionCount with the real Map size,
+ *     ensuring both are in sync. Redis state alone can drift from actual positions.
+ *
  * @module risk-manager
  */
 
@@ -69,6 +76,11 @@ export class RiskManager {
   /**
    * C2: Load persisted daily state from Redis on startup.
    * Call during app init to survive restarts mid-day.
+   *
+   * NOTE: After calling this, always call syncPositionCount(engine._filledPositions.size)
+   * to override the Redis-restored openPositionCount with the authoritative DB-hydrated value.
+   * Redis can drift from reality (e.g. SELL executed without position, Redis incremented anyway).
+   *
    * @returns {Promise<void>}
    */
   async loadFromRedis() {
@@ -92,6 +104,74 @@ export class RiskManager {
       }
     } catch (err) {
       log.error({ err: err.message }, 'Failed to load risk state from Redis');
+    }
+  }
+
+  /**
+   * Bug Fix 3: Sync open position count from the engine's authoritative _filledPositions Map.
+   *
+   * Call this AFTER engine.hydratePositions() completes. This overrides whatever
+   * openPositionCount was stored in Redis, which may have drifted (e.g. if a SELL
+   * executed on a phantom position, incrementing Redis incorrectly).
+   *
+   * @param {number} count - engine._filledPositions.size after hydration
+   */
+  syncPositionCount(count) {
+    const previous = this._openPositionCount;
+    this._openPositionCount = count;
+    if (previous !== count) {
+      log.warn({
+        previous,
+        synced: count,
+      }, `Position count synced from engine hydration: ${previous} → ${count}`);
+    } else {
+      log.info({ count }, 'Position count confirmed in sync with engine');
+    }
+    this._persistToRedis().catch(() => { });
+  }
+
+  /**
+   * Bug Fix 3: Load today's trade count from the database.
+   *
+   * Replaces the in-memory _tradeCount=0 that occurs on every restart.
+   * Must be called after DB is verified healthy, before scheduler.start().
+   * Uses IST (Asia/Kolkata) for date comparison — never raw UTC.
+   *
+   * @param {Function} queryFn - The query() function from src/lib/db.js
+   * @returns {Promise<void>}
+   */
+  async loadTradeCountFromDB(queryFn) {
+    if (!queryFn) {
+      log.warn('loadTradeCountFromDB: no queryFn provided — tradeCount stays at current value');
+      return;
+    }
+
+    try {
+      const result = await queryFn(`
+        SELECT COUNT(*) AS count
+        FROM trades
+        WHERE status = 'FILLED'
+          AND (created_at AT TIME ZONE 'Asia/Kolkata')::date =
+              (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+      `);
+
+      const dbCount = parseInt(result.rows?.[0]?.count ?? '0', 10);
+      const previous = this._tradeCount;
+      this._tradeCount = dbCount;
+
+      if (previous !== dbCount) {
+        log.warn({
+          previous,
+          synced: dbCount,
+        }, `Trade count synced from DB: ${previous} → ${dbCount}`);
+      } else {
+        log.info({ tradeCount: dbCount }, 'Trade count confirmed in sync with DB');
+      }
+
+      this._persistToRedis().catch(() => { });
+    } catch (err) {
+      log.error({ err: err.message },
+        'Failed to load trade count from DB — tradeCount remains at current value');
     }
   }
 
@@ -197,7 +277,6 @@ export class RiskManager {
   /**
    * Record a trade's PnL. Call after every trade closes.
    * Automatically checks drawdown against kill switch threshold.
-   * Async because kill switch engagement now awaits Redis write.
    *
    * @param {number} pnl - Realized PnL for this trade (negative = loss)
    * @param {string} [symbol] - For logging context
@@ -219,10 +298,8 @@ export class RiskManager {
       tradeCount: this._tradeCount,
     }, 'Trade PnL recorded');
 
-    // C2: Persist to Redis
-    this._persistToRedis().catch(() => {});
+    this._persistToRedis().catch(() => { });
 
-    // ─── Kill switch auto-engagement (AWAITED) ───────────
     if (this._dailyPnL <= -this._killSwitchAmount) {
       await this.killSwitch.engage(
         `Drawdown ${drawdownPct.toFixed(2)}% hit kill switch threshold ` +
@@ -233,7 +310,7 @@ export class RiskManager {
   }
 
   /**
-   * Update the current open position count.
+   * Set position count explicitly (e.g. after reconciliation).
    * @param {number} count
    */
   setOpenPositionCount(count) {
@@ -241,19 +318,20 @@ export class RiskManager {
   }
 
   /**
-   * Increment open position count (on new position entry).
+   * Increment open position count (on new BUY fill).
    */
   addPosition() {
     this._openPositionCount++;
-    this._persistToRedis().catch(() => {});
+    this._persistToRedis().catch(() => { });
   }
 
   /**
-   * Decrement open position count (on position exit).
+   * Decrement open position count (on SELL fill).
+   * Bug Fix 3: Now correctly called from _placeWithRetry on SELL fills.
    */
   removePosition() {
     this._openPositionCount = Math.max(0, this._openPositionCount - 1);
-    this._persistToRedis().catch(() => {});
+    this._persistToRedis().catch(() => { });
   }
 
   /**
@@ -263,7 +341,7 @@ export class RiskManager {
     this._dailyPnL = 0;
     this._openPositionCount = 0;
     this._tradeCount = 0;
-    this._persistToRedis().catch(() => {});
+    this._persistToRedis().catch(() => { });
     log.info({ capital: this.capital }, 'Risk manager daily state reset');
   }
 

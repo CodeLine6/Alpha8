@@ -23,6 +23,7 @@ import {
 import { createApiHandler } from './api/backend-api.js';
 import { EnhancedSignalPipeline } from './intelligence/enhanced-pipeline.js';
 import { SymbolScout } from './intelligence/symbol-scout.js';
+import { ShadowRecorder } from './intelligence/shadow-recorder.js';
 
 const log = createLogger('main');
 const APP_VERSION = '1.0.0';
@@ -256,11 +257,52 @@ async function main() {
     pipeline,
     broker,
     paperMode: !config.LIVE_TRADING || !broker,
+    shadowRecorder,   // ← add this line
   });
 
   const engineInit = await engine.initialize();
   log.info({ ready: engineInit.ready, paperMode: !config.LIVE_TRADING || !broker },
     '✅ Execution engine initialized');
+
+  // ─── Bug Fix 2 & 3: Hydrate position state from DB ───────────────────────
+  // Must complete before scheduler.start() so the engine knows what it owns
+  // after a Render redeploy or mid-day restart.
+  //
+  // Throws if DB is unreachable — we do NOT proceed with empty position state
+  // because that would allow phantom SELLs on symbols we actually hold.
+  if (dbHealthy) {
+    try {
+      const hydratedCount = await engine.hydratePositions();
+
+      // Bug Fix 3: Override Redis-restored openPositionCount with the
+      // authoritative count from _filledPositions (DB-backed, not Redis).
+      riskManager.syncPositionCount(hydratedCount);
+
+      // Bug Fix 3: Override tradeCount=0 with the real count from today's trades.
+      await riskManager.loadTradeCountFromDB(query);
+
+      log.info({ positions: hydratedCount }, '✅ Position state hydrated and risk manager synced');
+    } catch (err) {
+      // DB unreachable during hydration — this is fatal. Do NOT start the scheduler
+      // with empty position state as phantom SELLs would execute.
+      log.fatal({ err: err.message },
+        '❌ FATAL: Position hydration failed — scheduler will NOT start. Fix DB connectivity and restart.');
+      process.exit(1);
+    }
+  } else {
+    log.warn(
+      '⚠️  DB unavailable — position hydration skipped. ' +
+      'SELL guard is disabled for this session. Restart with DB connectivity to re-enable.'
+    );
+  }
+
+  let shadowRecorder = null;
+  if (dbHealthy) {
+    shadowRecorder = new ShadowRecorder({ broker });
+    log.info('✅ Shadow recorder initialized');
+  } else {
+    log.warn('⚠️  Shadow recorder disabled — DB not available');
+  }
 
   // ─── Initialize Telegram Bot ───────────────────────────
   const telegram = new TelegramBot({
@@ -505,6 +547,7 @@ async function main() {
     engine,
     pipeline,
     scout,             // ← NEW: passes scout for nightly job
+    shadowRecorder,
     broker,
     dataFeed: tickFeed,
     getWatchlist,
@@ -668,6 +711,7 @@ async function main() {
       `📌 Pinned: ${pinnedSymbols.join(', ')}\n` +
       `📋 Active watchlist (${activeWatchlist.length}): ${activeWatchlist.join(', ')}\n` +
       `💰 Capital: ₹${config.TRADING_CAPITAL.toLocaleString('en-IN')}\n` +
+      `🔬 Shadow: ${shadowRecorder ? '✅ Active' : '❌ Disabled'}\n` +
       `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
     ).catch(err => log.error({ err: err.message }, 'Failed to send Telegram startup message'));
   }
@@ -690,6 +734,7 @@ async function main() {
   log.info(`  📌 Pinned: ${pinnedSymbols.join(', ')}`);
   log.info(`  📋 Active watchlist (${activeWatchlist.length}): ${activeWatchlist.join(', ')}`);
   log.info(`  ⏰ Scheduler: 8 jobs (8:55 Sun + 9:00–15:35 IST Mon-Fri + 20:00 Mon-Fri scout)`);
+  log.info(`  🔬 Shadow: ${shadowRecorder ? '✅ Active' : '❌ Disabled'}`);
   log.info(`  🔐 Auto-login: 8:00 AM IST daily`);
   log.info('═══════════════════════════════════════════════════');
 }

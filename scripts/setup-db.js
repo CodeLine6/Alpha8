@@ -170,6 +170,55 @@ const MIGRATIONS = [
 
   `CREATE INDEX IF NOT EXISTS idx_watchlist_log_symbol    ON watchlist_log(symbol, logged_at DESC);`,
   `CREATE INDEX IF NOT EXISTS idx_watchlist_log_logged_at ON watchlist_log(logged_at DESC);`,
+  // ─── 9. SHADOW SIGNALS ───────────────────────────────────────────────────────
+  // Writers : shadow-recorder.js  — INSERT on every scan cycle (fire-and-forget)
+  //           shadow-recorder.js  — UPDATE price_after_* columns every 30min background job
+  // Readers : shadow-recorder.js  — getStrategyAccuracy() for unbiased weight calculation
+  //           adaptive-weights.js — future: replace signal_outcomes read with this
+  //
+  // PURPOSE: Records ALL individual strategy signals (not just consensus trades) so
+  //          adaptive weights can be calculated without selection bias. A strategy that
+  //          fires solo at 93% confidence is evaluated here even if no trade executed.
+  //
+  // KEY DESIGN:
+  //   - price_at_signal REQUIRED (NOT NULL) — zero-price rows are not inserted
+  //   - price_after_* filled asynchronously by background job via broker LTP
+  //   - was_correct_* computed at fill time: BUY→ price_after > price_at_signal
+  //   - consensus_reached: did this scan produce ANY consensus signal?
+  //   - acted_on: did a trade actually FILL (passed all 6 gates)?
+  //   - regime: market state at signal time (TRENDING/SIDEWAYS/VOLATILE/UNKNOWN)
+  `CREATE TABLE IF NOT EXISTS shadow_signals (
+    id                  SERIAL PRIMARY KEY,
+    symbol              VARCHAR(20)   NOT NULL,
+    strategy            VARCHAR(50)   NOT NULL,
+    direction           VARCHAR(10)   NOT NULL CHECK (direction IN ('BUY', 'SELL')),
+    confidence          DECIMAL(5,2)  NOT NULL,
+    price_at_signal     DECIMAL(10,2) NOT NULL,
+    price_after_15min   DECIMAL(10,2) DEFAULT NULL,
+    price_after_30min   DECIMAL(10,2) DEFAULT NULL,
+    price_after_60min   DECIMAL(10,2) DEFAULT NULL,
+    price_eod           DECIMAL(10,2) DEFAULT NULL,
+    was_correct_15min   BOOLEAN       DEFAULT NULL,
+    was_correct_30min   BOOLEAN       DEFAULT NULL,
+    was_correct_60min   BOOLEAN       DEFAULT NULL,
+    consensus_reached   BOOLEAN       NOT NULL DEFAULT FALSE,
+    acted_on            BOOLEAN       NOT NULL DEFAULT FALSE,
+    regime              VARCHAR(20)   DEFAULT NULL,
+    created_at          TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+  );`,
+
+  `CREATE INDEX IF NOT EXISTS idx_shadow_symbol_strategy
+     ON shadow_signals(symbol, strategy, created_at DESC);`,
+
+  `CREATE INDEX IF NOT EXISTS idx_shadow_created_at
+     ON shadow_signals(created_at DESC);`,
+
+  `CREATE INDEX IF NOT EXISTS idx_shadow_needs_fill
+     ON shadow_signals(created_at)
+     WHERE price_after_30min IS NULL;`,
+
+  `CREATE INDEX IF NOT EXISTS idx_shadow_strategy_accuracy
+     ON shadow_signals(strategy, was_correct_30min, created_at DESC);`,
 ];
 
 // ─── Seed data ──────────────────────────────────────────────────────────────

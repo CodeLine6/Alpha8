@@ -36,6 +36,7 @@ export class MarketScheduler {
    * @param {import('../engine/execution-engine.js').ExecutionEngine}                 deps.engine
    * @param {import('../intelligence/enhanced-pipeline.js').EnhancedSignalPipeline}  [deps.pipeline]
    * @param {import('../intelligence/symbol-scout.js').SymbolScout}                  [deps.scout]
+   * @param {import('../intelligence/shadow-recorder.js').ShadowRecorder} [deps.shadowRecorder]
    * @param {Object}   [deps.broker]
    * @param {Object}   [deps.dataFeed]
    * @param {Function} [deps.getWatchlist]      - Returns [{ symbol, candles, price, quantity }]
@@ -50,6 +51,7 @@ export class MarketScheduler {
     this.engine = deps.engine;
     this.pipeline = deps.pipeline || null;
     this.scout = deps.scout || null;   // ← NEW
+    this.shadowRecorder = deps.shadowRecorder || null;
     this.broker = deps.broker || null;
     this.dataFeed = deps.dataFeed || null;
     this.getWatchlist = deps.getWatchlist || (async () => []);
@@ -124,15 +126,30 @@ export class MarketScheduler {
       cron.schedule('0 20 * * 1-5', () => this._runJob('symbol-scout', () => this._nightlyScout()), opts)
     );
 
-    log.info({ jobs: this._cronJobs.length, timezone: TIMEZONE },
-      '🕐 MarketScheduler started — all jobs scheduled');
-
     // 8. Catch-up: Check if app was started mid-day during market hours
     const status = getMarketStatus();
     if (status.isOpen) {
       log.info('App started mid-day during market runs. Trigerring market open routines now.');
       this._runJob('market-open', () => this._marketOpen());
     }
+
+    // 9. Shadow signal price fill — every 30min during market hours
+    //    Fills in price_after_15min / price_after_30min / price_after_60min
+    //    for shadow signals recorded in the last 60 minutes.
+    this._cronJobs.push(
+      cron.schedule('*/30 9-15 * * 1-5', () =>
+        this._runJob('shadow-fill', () => this._shadowFill()), opts)
+    );
+
+    // 10. Shadow signal EOD fill — 4:00 PM IST
+    //    One final pass to capture end-of-day prices for all today's signals.
+    this._cronJobs.push(
+      cron.schedule('0 16 * * 1-5', () =>
+        this._runJob('shadow-fill-eod', () => this._shadowFill()), opts)
+    );
+
+    log.info({ jobs: this._cronJobs.length, timezone: TIMEZONE },
+      '🕐 MarketScheduler started — all jobs scheduled (shadow fill @ every 30min + 16:00 IST)');
   }
 
   stop() {
@@ -504,6 +521,38 @@ export class MarketScheduler {
     }
   }
 
+  /**
+   * Job 9/10: Shadow Signal Price Fill
+   *
+   * Runs every 30 minutes during market hours, and once at 4:00 PM IST.
+   * Fetches current LTP for all shadow signals that still have NULL price-after
+   * columns and are old enough for the reading to be meaningful.
+   *
+   * This is what makes ShadowRecorder useful — without this job, signals are
+   * recorded but never evaluated for directional correctness.
+   *
+   * @private
+   */
+  async _shadowFill() {
+    if (!this.shadowRecorder) {
+      log.debug('Shadow fill skipped — shadowRecorder not configured');
+      return { skipped: true };
+    }
+
+    try {
+      const result = await this.shadowRecorder.fillPriceOutcomes();
+      log.info({
+        updated: result.updated,
+        symbols: result.symbols,
+      }, `✅ Shadow fill complete — ${result.updated} rows updated`);
+      return result;
+    } catch (err) {
+      log.error({ err: err.message }, '❌ Shadow fill failed');
+      throw err;
+    }
+  }
+
+
   // ═══════════════════════════════════════════════════════
   // STATUS
   // ═══════════════════════════════════════════════════════
@@ -516,6 +565,7 @@ export class MarketScheduler {
       killSwitchEngaged: this.killSwitch.isEngaged(),
       pipelineEnabled: !!this.pipeline,
       scoutEnabled: !!this.scout,
+      shadowRecorderEnabled: !!this.shadowRecorder,
     };
   }
 }
