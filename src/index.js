@@ -573,7 +573,7 @@ async function main() {
       if (positions.length > 0) {
         log.warn({ count: positions.length }, '⚠️ Emergency square-off: closing open positions before shutdown');
         const { executeSquareOff } = await import('./risk/square-off-job.js');
-        const result = await executeSquareOff({ broker, riskManager, getOpenPositions, force: true });
+        const result = await executeSquareOff({ broker, riskManager, engine, getOpenPositions, force: true });
         log.warn({ squaredOff: result.squaredOff, errors: result.errors.length }, 'Emergency square-off result');
         if (telegram.enabled) {
           telegram.sendRaw(

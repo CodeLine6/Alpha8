@@ -149,21 +149,17 @@ export class ExecutionEngine {
     // Query BUY trades from today (IST) that have no SELL counterpart today.
     // Using AT TIME ZONE 'Asia/Kolkata' for all date comparisons — never raw UTC.
     const result = await query(`
-      SELECT DISTINCT ON (symbol)
-        symbol, price, quantity, strategy, created_at
-      FROM trades
+      SELECT symbol, price, quantity, strategy, created_at
+      FROM (
+        SELECT DISTINCT ON (symbol)
+          symbol, side, price, quantity, strategy, created_at, id
+        FROM trades
+        WHERE status = 'FILLED'
+          AND (created_at AT TIME ZONE 'Asia/Kolkata')::date =
+              (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+        ORDER BY symbol, created_at DESC, id DESC
+      ) AS latest_trades
       WHERE side = 'BUY'
-        AND status = 'FILLED'
-        AND (created_at AT TIME ZONE 'Asia/Kolkata')::date =
-            (NOW() AT TIME ZONE 'Asia/Kolkata')::date
-        AND symbol NOT IN (
-          SELECT symbol FROM trades
-          WHERE side = 'SELL'
-            AND status = 'FILLED'
-            AND (created_at AT TIME ZONE 'Asia/Kolkata')::date =
-                (NOW() AT TIME ZONE 'Asia/Kolkata')::date
-        )
-      ORDER BY symbol, created_at DESC
     `);
 
     this._filledPositions.clear();
@@ -663,6 +659,52 @@ export class ExecutionEngine {
       },
       riskStatus: this.riskManager.getStatus(),
     };
+  }
+
+  async reconcilePositions(broker) {
+    if (!broker) {
+      return { reconciled: [], stillOpen: [...this._filledPositions.keys()] };
+    }
+
+    try {
+      const rawPositions = await broker.getPositions();
+      const brokerPositions = (rawPositions?.net || rawPositions || []).filter(
+        (p) => (p.quantity || p.netQuantity || 0) !== 0
+      );
+      const brokerSymbols = new Set(brokerPositions.map(p => p.tradingsymbol || p.tradingSymbol || p.symbol));
+
+      const reconciled = [];
+      const stillOpen = [];
+
+      // Format as YYYY-MM-DD in IST
+      const formatter = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' });
+      const todayIST = formatter.format(new Date());
+
+      for (const [symbol, posCtx] of this._filledPositions.entries()) {
+        const posDateIST = formatter.format(new Date(posCtx.timestamp));
+        if (posDateIST === todayIST && !brokerSymbols.has(symbol)) {
+          log.warn(`Position reconciliation: ${symbol} closed externally — removing from engine state`);
+          this.markPositionClosed(symbol);
+          if (this.riskManager) {
+            this.riskManager.removePosition();
+          }
+          reconciled.push(symbol);
+        } else {
+          stillOpen.push(symbol);
+        }
+      }
+
+      log.info({
+        checked: this._filledPositions.size + reconciled.length,
+        reconciled: reconciled.length,
+        stillOpen: stillOpen.length
+      }, 'Position reconciliation complete');
+
+      return { reconciled, stillOpen };
+    } catch (err) {
+      log.error({ err: err.message }, 'Reconciliation failed to fetch positions from broker');
+      return { reconciled: [], stillOpen: [...this._filledPositions.keys()] };
+    }
   }
 
   resetDaily() {

@@ -289,6 +289,10 @@ export class MarketScheduler {
     this._scanning = true;
     log.info('Strategy scanning ACTIVATED');
 
+    if (this.engine.reconcilePositions) {
+      this.engine.reconcilePositions(this.broker).catch(err => log.warn({ err: err.message }, 'Reconciliation failed at market open'));
+    }
+
     return { scanning: true };
   }
 
@@ -305,6 +309,13 @@ export class MarketScheduler {
     if (this._scanInProgress) {
       log.warn('Strategy scan skipped — previous scan still in progress');
       return { scanned: 0, reason: 'overlap' };
+    }
+
+    this._scanCount = (this._scanCount || 0) + 1;
+    if (this._scanCount % 6 === 0) {
+      if (this.engine.reconcilePositions) {
+        this.engine.reconcilePositions(this.broker).catch(err => log.warn({ err: err.message }, 'Reconciliation failed during scan'));
+      }
     }
 
     this._scanInProgress = true;
@@ -415,6 +426,7 @@ export class MarketScheduler {
     const squareOffResult = await executeSquareOff({
       broker: this.broker,
       riskManager: this.riskManager,
+      engine: this.engine,
       getOpenPositions: this.getOpenPositions,
     });
 
