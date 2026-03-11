@@ -27,6 +27,7 @@ import { ShadowRecorder } from './intelligence/shadow-recorder.js';
 import { PositionStats } from './risk/position-stats.js';
 import { HoldingsManager } from './data/holdings.js';
 import { IntradayDecayManager } from './intelligence/intraday-decay.js';
+import { PositionManager } from './risk/position-manager.js';
 
 const log = createLogger('main');
 const APP_VERSION = '1.0.0';
@@ -300,6 +301,7 @@ async function main() {
     holdingsManager,  // Feature 5: proactive exposure check
     telegram: telegramRef,  // Feature 9: conflict detection alerts
     redis: redisHealthy ? getRedis() : null,  // Feature 9: conflict rate limit
+    config,           // Position manager: STOP_LOSS_PCT, TRAILING_STOP_PCT
   });
 
   if (telegramRef?.enabled && redisHealthy) {
@@ -342,6 +344,28 @@ async function main() {
       '⚠️  DB unavailable — position hydration skipped. ' +
       'SELL guard is disabled for this session. Restart with DB connectivity to re-enable.'
     );
+  }
+
+  // ─── Initialize Position Manager ───────────────────────
+  // Must be initialized AFTER engine.hydratePositions() because it references
+  // engine._filledPositions directly. Requires broker for LTP price fetching.
+  const positionManager = config.POSITION_MGMT_ENABLED
+    ? new PositionManager({ engine, broker, config })
+    : null;
+
+  if (positionManager) {
+    log.info({
+      stopLossPct: config.STOP_LOSS_PCT,
+      trailingStopPct: config.TRAILING_STOP_PCT,
+      maxHoldMinutes: config.MAX_HOLD_MINUTES,
+    },
+      `✅ Position manager: Active\n` +
+      `   Stop loss:      ${config.STOP_LOSS_PCT}% below entry\n` +
+      `   Trailing stop:  ${config.TRAILING_STOP_PCT}% below peak\n` +
+      `   Max hold:       ${config.MAX_HOLD_MINUTES} minutes (flat/losing positions only)`
+    );
+  } else {
+    log.warn('⚠️  Position manager: DISABLED (POSITION_MGMT_ENABLED=false)');
   }
 
   // ─── Initialize Telegram Bot ───────────────────────────
@@ -605,6 +629,7 @@ async function main() {
     scout,             // ← NEW: passes scout for nightly job
     shadowRecorder,
     intradayDecay,     // Feature 7: resetDay() at market open
+    positionManager,   // Position management: stop/trail/time exits before each scan
     broker,
     dataFeed: tickFeed,
     getWatchlist,

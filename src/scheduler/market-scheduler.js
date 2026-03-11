@@ -53,6 +53,7 @@ export class MarketScheduler {
     this.scout = deps.scout || null;   // ← NEW
     this.shadowRecorder = deps.shadowRecorder || null;
     this.intradayDecay = deps.intradayDecay || null;
+    this.positionManager = deps.positionManager || null;  // Position management (stop/trail/time exits)
     this.broker = deps.broker || null;
     this.dataFeed = deps.dataFeed || null;
     this.getWatchlist = deps.getWatchlist || (async () => []);
@@ -330,6 +331,24 @@ export class MarketScheduler {
     this._scanInProgress = true;
 
     try {
+      // ── Position Manager — runs BEFORE strategy scan, AWAITED ──────────────────────
+      // Checks stop loss, trailing stop, and time exit for all open positions.
+      // Must complete before the strategy scan so force-exited symbols are
+      // removed from _filledPositions before new signals are evaluated.
+      if (this.positionManager) {
+        const pmResult = await this.positionManager.checkAll().catch(err => {
+          log.error({ err: err.message }, 'Position manager check failed — continuing to strategy scan');
+          return { checked: 0, exits: [] };
+        });
+
+        if (pmResult.exits.length > 0) {
+          log.info({
+            exits: pmResult.exits.length,
+            symbols: pmResult.exits.map(e => `${e.symbol}(${e.reason})`),
+          }, '🚨 Position manager exits completed before strategy scan');
+        }
+      }
+
       const watchlist = await this.getWatchlist();
 
       if (!watchlist || watchlist.length === 0) {
@@ -340,6 +359,16 @@ export class MarketScheduler {
       const results = [];
 
       for (const item of watchlist) {
+        // ── Held-symbol skip guard ──────────────────────────────────────────
+        // Skip processSignal() for symbols the position manager is monitoring.
+        // Prevents BUY signal persistence, pipeline processing, and shadow_signal
+        // noise for symbols we already hold. The position manager's exit conditions
+        // (stop/trail/time) are the only valid exit path for held positions.
+        if (this.engine._filledPositions.has(item.symbol)) {
+          log.debug({ symbol: item.symbol }, 'Skipping strategy scan — position held (monitored by position manager)');
+          continue;
+        }
+
         try {
           const result = await this.engine.processSignal(
             item.symbol,
@@ -377,6 +406,7 @@ export class MarketScheduler {
 
       log.info({
         scanned: watchlist.length,
+        held: watchlist.filter(w => this.engine._filledPositions.has(w.symbol)).length,
         executed: results.filter(r => r.action === 'EXECUTED').length,
         blocked: results.filter(r => r.action?.startsWith('BLOCKED:')).length,
       }, 'Strategy scan complete');
@@ -496,6 +526,7 @@ export class MarketScheduler {
 
     this._scanning = false;
 
+    log.info({ positionManagerEnabled: !!this.positionManager }, 'Position manager status at market close');
     log.info('═══ POST-MARKET COMPLETE ═══');
     return summary;
   }

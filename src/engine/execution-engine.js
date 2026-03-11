@@ -53,6 +53,7 @@ export class ExecutionEngine {
    * @param {import('../data/holdings.js').HoldingsManager} [deps.holdingsManager]
    * @param {import('../notifications/telegram-bot.js').TelegramBot} [deps.telegram]
    * @param {import('ioredis').Redis} [deps.redis] - For conflict alert rate limiting
+   * @param {Object} [deps.config] - Validated env config (for position management parameters)
    */
   constructor(deps) {
     this.riskManager = deps.riskManager;
@@ -64,6 +65,7 @@ export class ExecutionEngine {
     this.holdingsManager = deps.holdingsManager || null;
     this.telegram = deps.telegram || null;
     this.redis = deps.redis || null;
+    this._config = deps.config || null;
     this.paperMode = deps.paperMode ?? true;
     this.maxRetries = deps.maxRetries ?? MAX_ORDER_RETRIES;
     this.retryDelayMs = deps.retryDelayMs ?? RETRY_DELAY_MS;
@@ -152,8 +154,6 @@ export class ExecutionEngine {
   async hydratePositions() {
     log.info('Hydrating open positions from DB...');
 
-    // Query BUY trades from today (IST) that have no SELL counterpart today.
-    // Using AT TIME ZONE 'Asia/Kolkata' for all date comparisons — never raw UTC.
     const result = await query(`
       SELECT symbol, price, quantity, strategy, created_at
       FROM (
@@ -170,12 +170,24 @@ export class ExecutionEngine {
 
     this._filledPositions.clear();
 
+    // Re-use the same stopPct/trailPct we'd use at fill time.
+    // Hydrated positions are fully protected from the first scan after restart.
+    const stopPct = this._config?.STOP_LOSS_PCT ?? 1.0;
+    const trailPct = this._config?.TRAILING_STOP_PCT ?? 1.5;
+
     for (const row of result.rows) {
+      const entryPrice = parseFloat(row.price);
       this._filledPositions.set(row.symbol, {
-        strategies: [],  // Strategy names not stored in trades table — leave empty
-        price: parseFloat(row.price),
+        strategies: [],                                         // not stored in trades table
+        entryPrice,
+        price: entryPrice,                                 // backward compat for SELL path
         quantity: parseInt(row.quantity, 10),
         timestamp: new Date(row.created_at).getTime(),
+        stopPrice: entryPrice * (1 - stopPct / 100),
+        highWaterMark: entryPrice,                                 // conservative — assume no gain yet
+        trailStopPrice: entryPrice * (1 - trailPct / 100),
+        trailPct,
+        stopPct,
       });
     }
 
@@ -387,8 +399,108 @@ export class ExecutionEngine {
   }
 
   // ═══════════════════════════════════════════════════════
+  // FORCE EXIT — Position manager bypass path
+  // ═══════════════════════════════════════════════════════
+
+  /**
+   * Force-exit an open position, bypassing consensus and pipeline gates.
+   * Used exclusively by PositionManager for stop loss, trailing stop, and time exits.
+   *
+   * Does NOT go through executeOrder() risk gate — it is an exit, not an entry,
+   * and must never be blocked by position count or daily loss checks.
+   *
+   * Full state update still happens: _filledPositions, riskManager, DB trades table,
+   * adaptive weight recording, signal acted_on mark.
+   *
+   * @param {string} symbol
+   * @param {number} currentPrice - current market price for the exit
+   * @param {string} reason - 'STOP_LOSS' | 'TRAILING_STOP' | 'TIME_EXIT'
+   * @returns {Promise<{ success: boolean, pnl: number, order: Object | null }>}
+   */
+  async forceExit(symbol, currentPrice, reason) {
+    const posCtx = this._filledPositions.get(symbol);
+    if (!posCtx) {
+      log.warn({ symbol, reason }, 'forceExit called but no position found — already closed?');
+      return { success: false, pnl: 0, order: null };
+    }
+
+    const unrealisedPnL = (currentPrice - posCtx.entryPrice) * posCtx.quantity;
+
+    log.warn({
+      symbol,
+      reason,
+      entryPrice: posCtx.entryPrice,
+      currentPrice,
+      quantity: posCtx.quantity,
+      unrealisedPnL: unrealisedPnL.toFixed(2),
+    }, `🚨 Position manager forcing exit: ${symbol} — ${reason}`);
+
+    // Place SELL order directly — bypass executeOrder() risk gate
+    // but still go through the broker/paper path and state machine.
+    const order = createOrder({
+      symbol,
+      side: 'SELL',
+      quantity: posCtx.quantity,
+      price: currentPrice,
+      strategy: reason,  // recorded in trades table as the exit reason
+    });
+
+    this._orders.set(order.id, order);
+
+    try {
+      const result = this.paperMode
+        ? await this._paperPlaceOrder(order)
+        : await this._livePlaceOrder(order);
+
+      transitionOrder(order, ORDER_STATE.PLACED, { brokerId: result.orderId });
+      transitionOrder(order, ORDER_STATE.FILLED);
+
+      const pnl = (currentPrice - posCtx.entryPrice) * posCtx.quantity;
+
+      // Update all state — mirror what _placeWithRetry does on SELL fill
+      this._filledPositions.delete(symbol);
+      this.riskManager.removePosition();
+      await this.riskManager.recordTradePnL(pnl, symbol);
+
+      // Record outcome for adaptive weights — fire-and-forget
+      this.recordPositionOutcome(symbol, pnl).catch(err =>
+        log.warn({ symbol, err: err.message }, 'Outcome recording failed after force exit')
+      );
+
+      // Persist to trades table — fire-and-forget
+      this._persistTrade(order).catch(err =>
+        log.error({ symbol, err: err.message }, 'Trade persist failed after force exit')
+      );
+
+      // Mark signal acted on using stored ID (if present)
+      const signalId = this._pendingSignalIds.get(symbol);
+      if (signalId) {
+        this._markSignalActedOn(signalId, symbol, 'SELL').catch(() => { });
+        this._pendingSignalIds.delete(symbol);
+      }
+
+      log.info({
+        symbol,
+        reason,
+        pnl: pnl.toFixed(2),
+        entryPrice: posCtx.entryPrice,
+        exitPrice: currentPrice,
+        quantity: posCtx.quantity,
+      }, `✅ Force exit complete: ${symbol} | PnL: ₹${pnl.toFixed(2)}`);
+
+      return { success: true, pnl, order };
+
+    } catch (err) {
+      log.error({ symbol, reason, err: err.message }, 'Force exit FAILED — position may still be open');
+      transitionOrder(order, ORDER_STATE.REJECTED, { rejectionReason: err.message });
+      return { success: false, pnl: 0, order };
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════
   // ORDER EXECUTION — The core loop
   // ═══════════════════════════════════════════════════════
+
 
   /**
    * Execute an order through the full pipeline:
@@ -513,14 +625,35 @@ export class ExecutionEngine {
         transitionOrder(order, ORDER_STATE.FILLED);
 
         if (order.side === 'BUY') {
-          // Track BUY context for P&L calculation on SELL
+          // Track BUY context for P&L calculation on SELL and for position manager.
+          // entryPrice is the canonical field for position manager calculations.
+          // price is retained for backward compat — existing SELL path uses posCtx.price.
           const strategies = this._lastSignalStrategies.get(order.symbol) || [];
+          const stopPct = this._config?.STOP_LOSS_PCT ?? 1.0;
+          const trailPct = this._config?.TRAILING_STOP_PCT ?? 1.5;
+
           this._filledPositions.set(order.symbol, {
             strategies,
-            price: order.price,
+            entryPrice: order.price,
+            price: order.price,                                  // backward compat
             quantity: order.quantity,
             timestamp: Date.now(),
+            stopPrice: order.price * (1 - stopPct / 100),
+            highWaterMark: order.price,
+            trailStopPrice: order.price * (1 - trailPct / 100),
+            trailPct,
+            stopPct,
           });
+
+          log.debug({
+            symbol: order.symbol,
+            entryPrice: order.price,
+            stopPrice: +(order.price * (1 - stopPct / 100)).toFixed(2),
+            trailStop: +(order.price * (1 - trailPct / 100)).toFixed(2),
+            stopPct,
+            trailPct,
+          }, 'Position opened — stop/trail levels set');
+
           // Bug Fix 3: Sync position count to risk manager after map change
           this.riskManager.addPosition();
 

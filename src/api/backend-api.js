@@ -139,7 +139,65 @@ export function createApiHandler(deps) {
 
   async function handlePositions(req, res) {
     try {
-      // First try DB, then fall back to engine's active orders
+      const enginePositions = engine._filledPositions;
+
+      // ── Path A: engine has held positions (position manager active) ─────────
+      // Return enriched PM context for each held symbol.
+      if (enginePositions && enginePositions.size > 0) {
+        const symbols = Array.from(enginePositions.keys());
+
+        // Batch-fetch LTP for all held symbols
+        let priceMap = {};
+        if (broker) {
+          try {
+            const keys = symbols.map(s => `NSE:${s}`);
+            const ltp = await broker.getLTP(keys);
+            for (const sym of symbols) {
+              const price = ltp?.[`NSE:${sym}`]?.last_price;
+              if (price && price > 0) priceMap[sym] = price;
+            }
+          } catch { /* fail gracefully — currentPrice returns null */ }
+        }
+
+        const positions = symbols.map(symbol => {
+          const ctx = enginePositions.get(symbol);
+          const currentPrice = priceMap[symbol] ?? null;
+          const entryPrice = ctx.entryPrice ?? ctx.price; // backward compat
+          const unrealisedPnL = currentPrice != null
+            ? (currentPrice - entryPrice) * ctx.quantity
+            : null;
+          const unrealisedPnLPct = currentPrice != null
+            ? ((currentPrice - entryPrice) / entryPrice) * 100
+            : null;
+          const holdMinutes = (Date.now() - ctx.timestamp) / 60000;
+          const stopDistancePct = currentPrice != null && ctx.stopPrice
+            ? ((currentPrice - ctx.stopPrice) / currentPrice) * 100
+            : null;
+          const trailDistancePct = currentPrice != null && ctx.trailStopPrice
+            ? ((currentPrice - ctx.trailStopPrice) / currentPrice) * 100
+            : null;
+
+          return {
+            symbol,
+            entryPrice,
+            currentPrice,
+            quantity: ctx.quantity,
+            stopPrice: ctx.stopPrice ?? null,
+            trailStopPrice: ctx.trailStopPrice ?? null,
+            highWaterMark: ctx.highWaterMark ?? null,
+            unrealisedPnL: unrealisedPnL != null ? +unrealisedPnL.toFixed(2) : null,
+            unrealisedPnLPct: unrealisedPnLPct != null ? +unrealisedPnLPct.toFixed(2) : null,
+            holdMinutes: +holdMinutes.toFixed(1),
+            stopDistancePct: stopDistancePct != null ? +stopDistancePct.toFixed(2) : null,
+            trailDistancePct: trailDistancePct != null ? +trailDistancePct.toFixed(2) : null,
+            strategies: ctx.strategies || [],
+          };
+        });
+
+        return json(res, { positions, source: 'engine' });
+      }
+
+      // ── Path B: fallback — read from DB positions table ─────────────────
       let positions = [];
       try {
         const result = await query('SELECT * FROM positions ORDER BY opened_at DESC');
@@ -147,28 +205,28 @@ export function createApiHandler(deps) {
           symbol: p.symbol,
           side: p.side,
           quantity: p.quantity,
-          avgPrice: parseFloat(p.avg_price),
+          entryPrice: parseFloat(p.avg_price),
           currentPrice: parseFloat(p.current_price || p.avg_price),
-          stopLoss: p.stop_loss ? parseFloat(p.stop_loss) : null,
+          stopPrice: p.stop_loss ? parseFloat(p.stop_loss) : null,
           product: p.product,
           strategy: p.strategy,
         }));
       } catch {
-        // Fall back to engine active orders
+        // Final fallback — engine active orders
         const active = engine.getActiveOrders();
         positions = active.map((o) => ({
           symbol: o.symbol,
           side: o.side,
           quantity: o.quantity,
-          avgPrice: o.price,
+          entryPrice: o.price,
           currentPrice: o.filledPrice || o.price,
-          stopLoss: null,
+          stopPrice: null,
           product: o.product || 'MIS',
           strategy: o.strategy,
         }));
       }
 
-      json(res, { positions });
+      json(res, { positions, source: 'db' });
     } catch (err) {
       log.error({ err }, 'Error in /api/positions');
       json(res, { error: err.message }, 500);

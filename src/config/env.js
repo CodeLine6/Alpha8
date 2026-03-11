@@ -53,6 +53,15 @@ const envSchema = z.object({
   PER_TRADE_STOP_LOSS_PCT: z.coerce.number().positive().max(100).default(1),
   KILL_SWITCH_DRAWDOWN_PCT: z.coerce.number().positive().max(100).default(5),
 
+  // ─── Position Management ─────────────────────────────
+  STOP_LOSS_PCT: z.coerce.number().positive().max(100).default(1),
+  TRAILING_STOP_PCT: z.coerce.number().positive().max(100).default(1.5),
+  MAX_HOLD_MINUTES: z.coerce.number().int().positive().default(90),
+  POSITION_MGMT_ENABLED: z
+    .string()
+    .transform((v) => v !== 'false')
+    .default('true'),
+
   // ─── Watchlist ────────────────────────────────────────
   WATCHLIST: z.string().optional().default('RELIANCE,TCS,INFY,HDFCBANK,ICICIBANK'),
 
