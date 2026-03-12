@@ -827,7 +827,12 @@ export class ExecutionEngine {
   }
 
   async reconcilePositions(broker) {
-    if (!broker) {
+    if (this.paperMode || !broker) {
+      log.debug('Skipping position reconciliation (Paper Mode or No Broker)');
+      return { checked: 0, reconciled: 0, stillOpen: 0 };
+    }
+
+    if (this._filledPositions.size === 0) {
       return { reconciled: [], stillOpen: [...this._filledPositions.keys()] };
     }
 
