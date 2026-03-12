@@ -569,6 +569,24 @@ async function main() {
 
   // ─── Open Positions Provider ───────────────────────────
   async function getOpenPositions() {
+    if (!config.LIVE_TRADING) {
+      // In PAPER mode, the broker doesn't know about our trades.
+      // We must get them from the Execution Engine's memory.
+      if (!engine || !engine._filledPositions) return [];
+
+      const positions = [];
+      for (const [symbol, posCtx] of engine._filledPositions.entries()) {
+        positions.push({
+          symbol: symbol,
+          tradingsymbol: symbol,
+          quantity: posCtx.quantity,
+          average_price: posCtx.entryPrice,
+        });
+      }
+      return positions;
+    }
+
+    // In LIVE mode, ALWAYS ask the broker for the absolute ground truth.
     if (!broker) return [];
     try {
       const positions = await broker.getPositions();
