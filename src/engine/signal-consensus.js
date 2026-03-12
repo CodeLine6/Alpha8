@@ -74,8 +74,8 @@ const OPEN_WINDOW_END_MINUTES = 15; // suppress for first 15 minutes after 09:15
  * @type {{ REVERSAL: string[], MOMENTUM: string[] }}
  */
 export const STRATEGY_GROUPS = {
-  REVERSAL: ['ema-crossover', 'rsi-reversion'],
-  MOMENTUM: ['vwap-momentum', 'breakout-volume'],
+  REVERSAL: ['EMA_CROSSOVER', 'RSI_MEAN_REVERSION'],
+  MOMENTUM: ['VWAP_MOMENTUM', 'BREAKOUT_VOLUME'],
 };
 
 /**
