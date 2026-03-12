@@ -420,9 +420,55 @@ async function main() {
       pinned: pinnedSymbols.length,
       maxDynamic: config.SCOUT_MAX_DYNAMIC ?? 10,
     }, '✅ Symbol scout initialized');
+
+    // Register Telegram command to trigger scouting on demand
+    if (telegram.enabled) {
+      telegram.onCommand('/scout', async () => {
+        log.info('Manual scout triggered via Telegram');
+
+        if (!scout) {
+          telegram.sendRaw('⚠️ <b>Scout not available</b>\nDB is offline — symbol scout requires database connectivity.');
+          return;
+        }
+
+        telegram.sendRaw(
+          `🔍 <b>Symbol Scout Starting</b>\n` +
+          `Scanning ${pinnedSymbols.length > 0 ? `~85 symbols` : 'NSE universe'}...\n` +
+          `<i>This takes ~30–60 seconds. Results will follow automatically.</i>`
+        );
+
+        scout.runNightly().catch(err => {
+          log.error({ err: err.message }, 'Manual scout run failed');
+          telegram.sendRaw(`❌ <b>Scout failed</b>\n${err.message}`);
+        });
+      });
+
+      telegram.onCommand('/watchlist', async () => {
+        try {
+          const active = scout
+            ? await scout.getActiveWatchlist()
+            : [...pinnedSymbols];
+
+          const pinned = active.filter(s => pinnedSymbols.includes(s));
+          const dynamic = active.filter(s => !pinnedSymbols.includes(s));
+
+          let msg = `📋 <b>Active Watchlist (${active.length} symbols)</b>\n\n`;
+          msg += `📌 <b>Pinned (${pinned.length}):</b> ${pinned.join(', ') || '—'}\n`;
+          msg += `🤖 <b>Dynamic (${dynamic.length}):</b> ${dynamic.join(', ') || '—'}\n`;
+          msg += `\n<i>Run /scout to refresh the dynamic list.</i>`;
+
+          telegram.sendRaw(msg);
+        } catch (err) {
+          telegram.sendRaw(`❌ <b>Watchlist error</b>\n${err.message}`);
+        }
+      });
+
+      log.info('✅ Telegram /scout and /watchlist commands registered');
+    }
   } else {
     log.warn('⚠️  Symbol scout disabled — DB not available (falling back to pinned watchlist only)');
   }
+
 
   // ─── Resolve Instrument Tokens ─────────────────────────
   // Pre-resolve for pinned symbols. Dynamic symbols are resolved lazily
