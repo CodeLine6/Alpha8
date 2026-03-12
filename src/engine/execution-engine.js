@@ -161,6 +161,7 @@ export class ExecutionEngine {
           symbol, side, price, quantity, strategy, created_at, id
         FROM trades
         WHERE status = 'FILLED'
+          AND paper_mode = ${!this._config?.LIVE_TRADING}
           AND (created_at AT TIME ZONE 'Asia/Kolkata')::date =
               (NOW() AT TIME ZONE 'Asia/Kolkata')::date
         ORDER BY symbol, created_at DESC, id DESC

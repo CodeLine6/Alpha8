@@ -39,7 +39,7 @@ const WARMUP_CANDLES = {
 };
 
 /** Square-off time in IST "HH:MM" */
-const SQUARE_OFF_TIME = '15:15';
+const SQUARE_OFF_TIME = '15:45';
 
 /** Stop-loss: 1% below entry (matching risk-manager.js) */
 const STOP_LOSS_PCT = 0.01;
