@@ -77,11 +77,25 @@ export class PositionManager {
                 // Mutates posCtx in place — does NOT replace the map entry.
                 if (currentPrice > posCtx.highWaterMark) {
                     posCtx.highWaterMark = currentPrice;
-                    posCtx.trailStopPrice = currentPrice * (1 - posCtx.trailPct / 100);
+
+                    // Calculate raw trailing stop
+                    let newTrailStop = currentPrice * (1 - posCtx.trailPct / 100);
+
+                    // Break-Even Protection: 
+                    // If the High Water Mark is > 0.5% above Entry, 
+                    // the Trailing Stop can NEVER fall below the Entry Price.
+                    const isSignificantlyProfitable = posCtx.highWaterMark >= posCtx.entryPrice * 1.005;
+                    if (isSignificantlyProfitable && newTrailStop < posCtx.entryPrice) {
+                        newTrailStop = posCtx.entryPrice;
+                    }
+
+                    posCtx.trailStopPrice = newTrailStop;
+
                     log.debug({
                         symbol,
                         newHighWaterMark: currentPrice,
                         newTrailStop: posCtx.trailStopPrice.toFixed(2),
+                        breakEvenLocked: isSignificantlyProfitable && newTrailStop === posCtx.entryPrice
                     }, 'High water mark updated');
                 }
 

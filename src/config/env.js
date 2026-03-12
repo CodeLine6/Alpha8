@@ -55,7 +55,7 @@ const envSchema = z.object({
 
   // ─── Position Management ─────────────────────────────
   STOP_LOSS_PCT: z.coerce.number().positive().max(100).default(1),
-  TRAILING_STOP_PCT: z.coerce.number().positive().max(100).default(1.5),
+  TRAILING_STOP_PCT: z.coerce.number().positive().max(100).default(1.0),
   MAX_HOLD_MINUTES: z.coerce.number().int().positive().default(90),
   POSITION_MGMT_ENABLED: z
     .string()
