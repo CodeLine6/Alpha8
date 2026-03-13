@@ -250,12 +250,22 @@ async function main() {
   log.info('✅ Risk manager initialized');
 
   // ─── Initialize Strategies + Consensus ─────────────────
-  const consensus = new SignalConsensus({ minAgreement: 2 });
+  let superConvictionEnabled = false;
+  if (redisHealthy) {
+    try {
+      const val = await getRedis().get('super_conviction_enabled');
+      superConvictionEnabled = (val === 'true');
+    } catch (err) {
+      log.warn({ err: err.message }, 'Failed to read super_conviction_enabled from Redis');
+    }
+  }
+
+  const consensus = new SignalConsensus({ minAgreement: 2, superConvictionEnabled });
   consensus.addStrategy(new EMACrossoverStrategy());
   consensus.addStrategy(new RSIMeanReversionStrategy());
   consensus.addStrategy(new VWAPMomentumStrategy());
   consensus.addStrategy(new BreakoutVolumeStrategy());
-  log.info(`✅ Signal consensus: ${consensus.strategies.length} strategies loaded`);
+  log.info(`✅ Signal consensus: ${consensus.strategies.length} strategies loaded (Super Conviction: ${superConvictionEnabled ? 'ON' : 'OFF'})`);
 
   // ─── Initialize Enhanced Signal Pipeline ───────────────
   let pipeline = null;
@@ -439,10 +449,17 @@ async function main() {
           `<i>This takes ~30–60 seconds. Results will follow automatically.</i>`
         );
 
-        scout.runNightly().catch(err => {
-          log.error({ err: err.message }, 'Manual scout run failed');
-          telegram.sendRaw(`❌ <b>Scout failed</b>\n${err.message}`);
-        });
+        scout.runNightly()
+          .then(async () => {
+            telegram.sendRaw('✅ <b>Scout Complete</b>\nReconciling active symbols with data feed...');
+            const active = await scout.getActiveWatchlist();
+            await resubscribeTickFeed(active);
+            telegram.sendRaw(`✅ <b>Reconciliation Complete</b>\nNow tracking ${active.length} active symbols.`);
+          })
+          .catch(err => {
+            log.error({ err: err.message }, 'Manual scout run failed');
+            telegram.sendRaw(`❌ <b>Scout failed</b>\n${err.message}`);
+          });
       });
 
       telegram.onCommand('/watchlist', async () => {
@@ -465,7 +482,30 @@ async function main() {
         }
       });
 
-      log.info('✅ Telegram /scout and /watchlist commands registered');
+      telegram.onCommand('/conviction', async (text) => {
+        const args = text.toLowerCase().replace('/conviction', '').trim();
+        const turnOn = args === 'on';
+        const turnOff = args === 'off';
+
+        if (!turnOn && !turnOff) {
+          telegram.sendRaw(`ℹ️ <b>Super Conviction Bypass is currently ${consensus.superConvictionEnabled ? 'ON' : 'OFF'}</b>\n\nUse <code>/conviction on</code> or <code>/conviction off</code> to toggle.`);
+          return;
+        }
+
+        consensus.superConvictionEnabled = turnOn;
+        if (redisHealthy) {
+          try {
+            await getRedis().set('super_conviction_enabled', turnOn ? 'true' : 'false');
+          } catch (e) {
+            log.warn('Could not save super conviction flag to Redis');
+          }
+        }
+
+        log.info({ superConvictionEnabled: turnOn }, 'Super Conviction Bypass toggled via Telegram');
+        telegram.sendRaw(`⚡ <b>Super Conviction Bypass is now ${turnOn ? 'ON' : 'OFF'}</b>\n\n${turnOn ? 'Signals with 80+ confidence will bypass cross-group consensus checks.' : 'Strict cross-group consensus logic is fully enforced.'}`);
+      });
+
+      log.info('✅ Telegram /scout, /watchlist, and /conviction commands registered');
     }
   } else {
     log.warn('⚠️  Symbol scout disabled — DB not available (falling back to pinned watchlist only)');
