@@ -33,7 +33,7 @@ const CACHE_PREFIX = 'trend:';
 const CACHE_TTL_SEC = 6 * 60 * 60; // 6 hours — refreshed at pre-market
 const SMA_SHORT_DAYS = 20;
 const SMA_LONG_DAYS = 50;
-const HISTORY_DAYS = 70; // fetch 70 days → enough for 50-day SMA with buffer
+const HISTORY_DAYS = 100; // fetch 70 days → enough for 50-day SMA with buffer
 
 /**
  * @typedef {object} TrendState

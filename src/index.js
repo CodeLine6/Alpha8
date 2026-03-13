@@ -289,6 +289,13 @@ async function main() {
     log.warn('⚠️  Shadow recorder disabled — DB not available');
   }
 
+  // ─── Initialize Telegram Bot ───────────────────────────
+  const telegram = new TelegramBot({
+    token: config.TELEGRAM_BOT_TOKEN,
+    chatId: config.TELEGRAM_CHAT_ID,
+  });
+  telegramRef = telegram;
+
   // ─── Initialize Execution Engine ───────────────────────
   const engine = new ExecutionEngine({
     riskManager,
@@ -368,12 +375,6 @@ async function main() {
     log.warn('⚠️  Position manager: DISABLED (POSITION_MGMT_ENABLED=false)');
   }
 
-  // ─── Initialize Telegram Bot ───────────────────────────
-  const telegram = new TelegramBot({
-    token: config.TELEGRAM_BOT_TOKEN,
-    chatId: config.TELEGRAM_CHAT_ID,
-  });
-  telegramRef = telegram;
 
   if (telegram.enabled) {
     log.info('✅ Telegram bot initialized');
@@ -545,7 +546,7 @@ async function main() {
           try {
             candles = await fetchRecentCandles({
               broker, instrumentToken, symbol,
-              interval: '5minute', count: 50,
+              interval: '5minute', count: 100,
             });
           } catch { /* skip */ }
         }
