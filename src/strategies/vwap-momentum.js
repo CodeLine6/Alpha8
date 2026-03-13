@@ -186,12 +186,12 @@ export class VWAPMomentumStrategy extends BaseStrategy {
       // ─── Momentum continuation (no crossover but trending) ──
       if (absDeviation > bandThreshold * 2 && hasVolumeConfirmation) {
         if (deviation > 0 && currentPrice > previousPrice) {
-          const confidence = 35 + Math.min(absDeviation * 5, 20);
+          const confidence = 40 + Math.min(absDeviation * 10, 20);
           return this.buildSignal(SIGNAL.BUY, confidence,
             `Momentum continuation above VWAP (+${deviation.toFixed(2)}%). Volume confirmed.`);
         }
         if (deviation < 0 && currentPrice < previousPrice) {
-          const confidence = 35 + Math.min(absDeviation * 5, 20);
+          const confidence = 40 + Math.min(absDeviation * 10, 20);
           return this.buildSignal(SIGNAL.SELL, confidence,
             `Momentum continuation below VWAP (${deviation.toFixed(2)}%). Volume confirmed.`);
         }
