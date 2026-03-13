@@ -47,11 +47,14 @@ export class VWAPMomentumStrategy extends BaseStrategy {
 
     if (anchorToday && candles.length > 0) {
       // Find today's date in IST from the latest candle
-      const latestDate = new Date(Math.max(...candles.map(c => new Date(c.date).getTime())));
+      const validCandles = candles.filter(c => c.date && !isNaN(new Date(c.date).getTime()));
+      if (validCandles.length === 0) return [];
+
+      const latestDate = new Date(Math.max(...validCandles.map(c => new Date(c.date).getTime())));
       latestDate.setMinutes(latestDate.getMinutes() + 330); // UTC to IST
       const todayDateStr = latestDate.toISOString().split('T')[0];
 
-      filteredCandles = candles.filter(c => {
+      filteredCandles = validCandles.filter(c => {
         const cDate = new Date(c.date);
         const istDate = new Date(cDate.getTime() + 19800000); // +330 * 60 * 1000
         const isToday = istDate.toISOString().split('T')[0] === todayDateStr;
