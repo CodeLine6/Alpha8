@@ -659,6 +659,17 @@ export class ExecutionEngine {
           // Bug Fix 3: Sync position count to risk manager after map change
           this.riskManager.addPosition();
 
+          if (this.telegram?.enabled) {
+            this.telegram.sendRaw(
+              `📦 <b>Position ENTRY — ${order.symbol}</b>\n\n` +
+              `📥 Entry: ₹${order.price.toFixed(2)}\n` +
+              `📦 Qty:   ${order.quantity}\n` +
+              `🛑 Stop:  ₹${+(order.price * (1 - stopPct / 100)).toFixed(2)}\n` +
+              `🧠 Strats: ${strategies.join(', ')}\n` +
+              `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+            ).catch(() => { });
+          }
+
         } else if (order.side === 'SELL') {
           const posCtx = this._filledPositions.get(order.symbol);
           if (posCtx) {
@@ -681,6 +692,21 @@ export class ExecutionEngine {
             this._filledPositions.delete(order.symbol);
             // Bug Fix 3: Decrement position count on SELL fill
             this.riskManager.removePosition();
+
+            if (this.telegram?.enabled) {
+              const emoji = pnl >= 0 ? '✅' : '🛑';
+              const pnlStr = pnl >= 0 ? `+₹${pnl.toFixed(2)}` : `-₹${Math.abs(pnl).toFixed(2)}`;
+
+              this.telegram.sendRaw(
+                `${emoji} <b>Position EXIT — ${order.symbol}</b>\n\n` +
+                `📌 Reason: SIGNAL_EXIT\n` +
+                `📥 Entry: ₹${posCtx.price.toFixed(2)}\n` +
+                `📤 Exit:  ₹${sellPrice.toFixed(2)}\n` +
+                `💰 P&L:   ${pnlStr}\n` +
+                `📦 Qty:   ${posCtx.quantity}\n` +
+                `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+              ).catch(() => { });
+            }
           }
         }
 
