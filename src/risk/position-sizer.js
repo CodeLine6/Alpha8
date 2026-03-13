@@ -21,8 +21,8 @@ const log = createLogger('position-sizer');
  * @param {Object} params
  * @param {number} params.capital - Total available capital
  * @param {number} params.winRate - Historical win rate (0.0–1.0)
- * @param {number} params.avgWin - Average winning trade amount (₹)
- * @param {number} params.avgLoss - Average losing trade amount (₹)
+ * @param {number} params.avgWin - Average winning trade P&L in absolute rupees
+ * @param {number} params.avgLoss - Average losing trade P&L in absolute rupees (positive number)
  * @param {number} params.entryPrice - Expected entry price per share
  * @param {number} [params.maxRiskPct] - Max capital % to risk per trade (default from RISK_DEFAULTS)
  * @param {number} [params.kellyFraction=0.5] - Fractional Kelly (0.5 = half Kelly for safety)
@@ -56,7 +56,11 @@ export function calculatePositionSize({
   const reasons = [];
 
   if (winRate > 0 && winRate < 1 && avgWin > 0 && avgLoss > 0) {
-    const b = avgWin / avgLoss; // Odds ratio (risk-reward)
+    // Kelly requires dimensionless return fractions, not absolute rupee amounts
+    const avgWinFrac = avgWin / capital;
+    const avgLossFrac = avgLoss / capital;
+
+    const b = avgWinFrac / avgLossFrac; // Odds ratio (risk-reward)
     const p = winRate;
     const q = 1 - p;
 

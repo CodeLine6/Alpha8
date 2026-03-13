@@ -1,6 +1,7 @@
 import Redis from 'ioredis';
 import { createLogger } from './logger.js';
 import { registerShutdown } from './shutdown.js';
+import { normalizeRedisUrl } from './redis-utils.js';
 
 const log = createLogger('redis');
 
@@ -14,9 +15,7 @@ let redisClient = null;
  */
 export function initRedis(url) {
   // Auto-upgrade Upstash connections to use TLS (rediss://)
-  if (url.includes('upstash.io') && url.startsWith('redis://')) {
-    url = url.replace('redis://', 'rediss://');
-  }
+  url = normalizeRedisUrl(url);
 
   const options = {
     keyPrefix: 'alpha8:',

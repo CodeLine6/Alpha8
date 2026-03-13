@@ -4,6 +4,7 @@ import { createLogger } from './lib/logger.js';
 import { initShutdownHandlers, registerShutdown } from './lib/shutdown.js';
 import { initDatabase, checkDatabaseHealth, query } from './lib/db.js';
 import { initRedis, checkRedisHealth, cacheGet, cacheSet, getRedis } from './lib/redis.js';
+import axios from 'axios';
 import { KillSwitch } from './risk/kill-switch.js';
 import { RiskManager } from './risk/risk-manager.js';
 import { calculatePositionSize } from './risk/position-sizer.js';
@@ -514,6 +515,10 @@ async function main() {
 
     const items = [];
 
+    // Bug Fix 6: Batch query for all position stats outside the loop 
+    // to avoid N sequential queries and heavily reduce DB latency on scans
+    const statsMap = positionStats ? await positionStats.getStatsBatch(activeSymbols) : null;
+
     for (const symbol of activeSymbols) {
       try {
         const instrumentToken = instrumentManager?.getToken(symbol)
@@ -530,7 +535,9 @@ async function main() {
           try {
             const ltp = await broker.getLTP([`NSE:${symbol}`]);
             currentPrice = ltp?.[`NSE:${symbol}`]?.last_price || 0;
-          } catch { /* skip */ }
+          } catch (ltpErr) {
+            log.warn({ symbol, err: ltpErr.message }, 'LTP fetch failed — price unresolvable this cycle');
+          }
         }
 
         // Task 4: Skip symbol if price cannot be determined.
@@ -548,14 +555,14 @@ async function main() {
               broker, instrumentToken, symbol,
               interval: '5minute', count: 100,
             });
-          } catch { /* skip */ }
+          } catch (candleErr) {
+            log.warn({ symbol, err: candleErr.message }, 'Candle fetch failed — strategy will receive empty candles');
+          }
         }
 
         // Feature 4: Use real historical win-rate / avg P&L from signal_outcomes
         // instead of fixed defaults. Falls back to defaults if sample size < 10.
-        const stats = positionStats
-          ? await positionStats.getStats(symbol)
-          : { winRate: 0.5, avgWin: 1000, avgLoss: 500 };
+        const stats = statsMap?.get(symbol) ?? { winRate: 0.5, avgWin: 1000, avgLoss: 500 };
 
         const sizing = calculatePositionSize({
           capital: config.TRADING_CAPITAL,
@@ -759,7 +766,6 @@ async function main() {
       const pingUrl = url.endsWith('/') ? `${url}health` : `${url}/health`;
       log.info(`🔌 Pinging service to keep awake: ${pingUrl}`);
       try {
-        const { default: axios } = await import('axios');
         await axios.get(pingUrl);
       } catch (err) {
         log.warn({ err: err.message }, '⚠️  Keep-awake ping failed');
@@ -769,36 +775,33 @@ async function main() {
     cron.schedule('0 8 * * 1-5', async () => {
       log.info('🔐 Running scheduled auto-login...');
       try {
-        const { exec } = await import('node:child_process');
-        const { promisify } = await import('node:util');
-        const execAsync = promisify(exec);
+        const { runAutoLogin } = await import('../scripts/auto-login.js');
+        const loginResult = await runAutoLogin({ silent: false });
 
-        const { stdout, stderr } = await execAsync('node scripts/auto-login.js', {
-          cwd: process.cwd(), timeout: 120000, env: process.env,
-        });
-        if (stdout) log.info({ stdout: stdout.slice(-500) }, 'Auto-login output');
-        if (stderr) log.warn({ stderr: stderr.slice(-500) }, 'Auto-login stderr');
-
-        const newToken = await getRedis().get('kite:access_token');
-        if (newToken && broker) {
-          broker.primary.setAccessToken(newToken);
-          log.info('✅ Broker access token refreshed');
-        } else if (newToken && !broker) {
-          try {
-            kiteClient = new KiteClient({
-              apiKey: config.KITE_API_KEY,
-              apiSecret: config.KITE_API_SECRET,
-              accessToken: newToken,
-            });
-            broker = new BrokerManager(kiteClient);
-            engine.broker = broker;
-            engine.paperMode = !config.LIVE_TRADING;
-            scheduler.broker = broker;
-            if (scout) scout.broker = broker;   // ← give scout live broker too
-            log.info('✅ Broker initialized from scheduled auto-login');
-          } catch (initErr) {
-            log.error({ err: initErr.message }, 'Failed to init broker after login');
+        if (loginResult.success && loginResult.accessToken) {
+          const newToken = loginResult.accessToken;
+          if (broker) {
+            broker.primary.setAccessToken(newToken);
+            log.info('✅ Broker access token refreshed');
+          } else {
+            try {
+              kiteClient = new KiteClient({
+                apiKey: config.KITE_API_KEY,
+                apiSecret: config.KITE_API_SECRET,
+                accessToken: newToken,
+              });
+              broker = new BrokerManager(kiteClient);
+              engine.broker = broker;
+              engine.paperMode = !config.LIVE_TRADING;
+              scheduler.broker = broker;
+              if (scout) scout.broker = broker;   // ← give scout live broker too
+              log.info('✅ Broker initialized from scheduled auto-login');
+            } catch (initErr) {
+              log.error({ err: initErr.message }, 'Failed to init broker after login');
+            }
           }
+        } else {
+          throw new Error(loginResult.error || 'Token not returned');
         }
       } catch (err) {
         log.error({ err: err.message }, '❌ Scheduled auto-login failed');

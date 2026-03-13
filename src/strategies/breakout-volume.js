@@ -41,8 +41,14 @@ export class BreakoutVolumeStrategy extends BaseStrategy {
    * @returns {{ signal: 'BUY'|'SELL'|'HOLD', confidence: number, reason: string }}
    */
   analyze(candles) {
-    if (!candles || candles.length < this.minCandles) {
+    if (!candles) {
       return this.hold(`Insufficient data: need ${this.minCandles} candles, got ${candles?.length || 0}`);
+    }
+
+    candles = this.validateCandles(candles);
+
+    if (candles.length < this.minCandles) {
+      return this.hold(`Insufficient data: need ${this.minCandles} candles, got ${candles.length}`);
     }
 
     const closes = candles.map((c) => c.close);

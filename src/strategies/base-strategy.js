@@ -1,4 +1,7 @@
 import { SIGNAL } from '../config/constants.js';
+import { createLogger } from '../lib/logger.js';
+
+const log = createLogger('base-strategy');
 
 /**
  * Base Strategy class — all trading strategies extend this.
@@ -41,13 +44,58 @@ export class BaseStrategy {
    * @returns {{ signal: string, confidence: number, reason: string, strategy: string, timestamp: string }}
    */
   buildSignal(signal, confidence, reason) {
+    const clampedConfidence = Math.min(Math.max(confidence, 0), 100);
+
+    if (clampedConfidence !== confidence) {
+      log.debug({ strategy: this.name, rawConfidence: confidence, clampedTo: clampedConfidence }, 'Confidence value clamped');
+    }
+
     return {
       signal,
-      confidence: Math.max(0, Math.min(100, Math.round(confidence))),
+      confidence: Math.round(clampedConfidence),
       reason,
       strategy: this.name,
       timestamp: new Date().toISOString(),
     };
+  }
+
+  /**
+   * Filter out malformed candles before analysis.
+   * Runs sequentially on OHLC arrays to ensure clean indicators.
+   * @param {import('../data/historical-data.js').Candle[]} candles
+   * @returns {import('../data/historical-data.js').Candle[]}
+   */
+  validateCandles(candles) {
+    const valid = [];
+    let skipped = 0;
+
+    for (const c of candles) {
+      const isValid =
+        typeof c.close === 'number' && c.close > 0 && !isNaN(c.close) &&
+        typeof c.high === 'number' && c.high > 0 && !isNaN(c.high) &&
+        typeof c.low === 'number' && c.low > 0 && !isNaN(c.low) &&
+        typeof c.open === 'number' && c.open > 0 && !isNaN(c.open) &&
+        c.high >= c.low &&
+        c.high >= c.close &&
+        c.low <= c.close;
+
+      if (isValid) {
+        valid.push(c);
+      } else {
+        skipped++;
+      }
+    }
+
+    if (skipped > 0) {
+      log.warn({
+        strategy: this.name,
+        totalCandles: candles.length,
+        validCandles: valid.length,
+        skipped,
+      }, 'Malformed candles detected and removed before analysis');
+    }
+
+    return valid;
   }
 
   /**
@@ -57,6 +105,7 @@ export class BaseStrategy {
    * @returns {Object}
    */
   hold(reason) {
+    // Pass exactly 0 for HOLD signals, ensuring it's bounded
     return this.buildSignal(SIGNAL.HOLD, 0, reason);
   }
 }

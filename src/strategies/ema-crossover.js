@@ -37,8 +37,14 @@ export class EMACrossoverStrategy extends BaseStrategy {
    * @returns {{ signal: 'BUY'|'SELL'|'HOLD', confidence: number, reason: string }}
    */
   analyze(candles) {
-    if (!candles || candles.length < this.minCandles) {
+    if (!candles) {
       return this.hold(`Insufficient data: need ${this.minCandles} candles, got ${candles?.length || 0}`);
+    }
+
+    candles = this.validateCandles(candles);
+
+    if (candles.length < this.minCandles) {
+      return this.hold(`Insufficient data: need ${this.minCandles} candles, got ${candles.length}`);
     }
 
     const closes = candles.map((c) => c.close);
@@ -51,8 +57,7 @@ export class EMACrossoverStrategy extends BaseStrategy {
       return this.hold('Not enough EMA data points for crossover detection');
     }
 
-    // Align arrays — slow EMA is shorter, so offset fast to match
-    const offset = fastEMA.length - slowEMA.length;
+    // EMA library outputs same-length arrays; tail indexing is safe without offset
     const currentFast = fastEMA[fastEMA.length - 1];
     const previousFast = fastEMA[fastEMA.length - 2];
     const currentSlow = slowEMA[slowEMA.length - 1];

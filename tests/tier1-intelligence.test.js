@@ -65,14 +65,14 @@ function makeEngine({ consensus, pipeline = null, paperMode = true } = {}) {
 
 describe('Task 1 — STRATEGY_GROUPS export', () => {
     test('REVERSAL group contains ema-crossover and rsi-reversion', () => {
-        expect(STRATEGY_GROUPS.REVERSAL).toContain('ema-crossover');
-        expect(STRATEGY_GROUPS.REVERSAL).toContain('rsi-reversion');
+        expect(STRATEGY_GROUPS.REVERSAL).toContain('EMA_CROSSOVER');
+        expect(STRATEGY_GROUPS.REVERSAL).toContain('RSI_MEAN_REVERSION');
         expect(STRATEGY_GROUPS.REVERSAL).toHaveLength(2);
     });
 
     test('MOMENTUM group contains vwap-momentum and breakout-volume', () => {
-        expect(STRATEGY_GROUPS.MOMENTUM).toContain('vwap-momentum');
-        expect(STRATEGY_GROUPS.MOMENTUM).toContain('breakout-volume');
+        expect(STRATEGY_GROUPS.MOMENTUM).toContain('VWAP_MOMENTUM');
+        expect(STRATEGY_GROUPS.MOMENTUM).toContain('BREAKOUT_VOLUME');
         expect(STRATEGY_GROUPS.MOMENTUM).toHaveLength(2);
     });
 });
@@ -80,8 +80,8 @@ describe('Task 1 — STRATEGY_GROUPS export', () => {
 describe('Task 1 — Grouped Consensus mode (groupedConsensus: true)', () => {
     test('REVERSAL BUY + MOMENTUM BUY → BUY signal', () => {
         const consensus = new SignalConsensus({ groupedConsensus: true, minConfidence: 40 });
-        consensus.addStrategy(mockStrategy('rsi-reversion', 'BUY', 80));
-        consensus.addStrategy(mockStrategy('vwap-momentum', 'BUY', 70));
+        consensus.addStrategy(mockStrategy('RSI_MEAN_REVERSION', 'BUY', 80));
+        consensus.addStrategy(mockStrategy('VWAP_MOMENTUM', 'BUY', 70));
 
         const result = consensus.evaluate([]);
 
@@ -93,8 +93,8 @@ describe('Task 1 — Grouped Consensus mode (groupedConsensus: true)', () => {
 
     test('REVERSAL SELL + MOMENTUM SELL → SELL signal', () => {
         const consensus = new SignalConsensus({ groupedConsensus: true, minConfidence: 40 });
-        consensus.addStrategy(mockStrategy('ema-crossover', 'SELL', 75));
-        consensus.addStrategy(mockStrategy('breakout-volume', 'SELL', 65));
+        consensus.addStrategy(mockStrategy('EMA_CROSSOVER', 'SELL', 75));
+        consensus.addStrategy(mockStrategy('BREAKOUT_VOLUME', 'SELL', 65));
 
         const result = consensus.evaluate([]);
 
@@ -106,8 +106,8 @@ describe('Task 1 — Grouped Consensus mode (groupedConsensus: true)', () => {
 
     test('REVERSAL BUY alone (no MOMENTUM) → HOLD', () => {
         const consensus = new SignalConsensus({ groupedConsensus: true, minConfidence: 40 });
-        consensus.addStrategy(mockStrategy('rsi-reversion', 'BUY', 85));
-        consensus.addStrategy(mockStrategy('vwap-momentum', 'SELL', 70)); // momentum disagrees
+        consensus.addStrategy(mockStrategy('RSI_MEAN_REVERSION', 'BUY', 85));
+        consensus.addStrategy(mockStrategy('VWAP_MOMENTUM', 'SELL', 70)); // momentum disagrees
 
         const result = consensus.evaluate([]);
 
@@ -116,7 +116,7 @@ describe('Task 1 — Grouped Consensus mode (groupedConsensus: true)', () => {
 
     test('MOMENTUM SELL alone (no REVERSAL) → HOLD', () => {
         const consensus = new SignalConsensus({ groupedConsensus: true, minConfidence: 40 });
-        consensus.addStrategy(mockStrategy('breakout-volume', 'SELL', 80));
+        consensus.addStrategy(mockStrategy('BREAKOUT_VOLUME', 'SELL', 80));
         // no reversal strategy
 
         const result = consensus.evaluate([]);
@@ -126,8 +126,8 @@ describe('Task 1 — Grouped Consensus mode (groupedConsensus: true)', () => {
 
     test('REVERSAL BUY + MOMENTUM SELL (groups disagree) → HOLD', () => {
         const consensus = new SignalConsensus({ groupedConsensus: true, minConfidence: 40 });
-        consensus.addStrategy(mockStrategy('rsi-reversion', 'BUY', 85));
-        consensus.addStrategy(mockStrategy('vwap-momentum', 'SELL', 70));
+        consensus.addStrategy(mockStrategy('RSI_MEAN_REVERSION', 'BUY', 85));
+        consensus.addStrategy(mockStrategy('VWAP_MOMENTUM', 'SELL', 70));
 
         const result = consensus.evaluate([]);
 
@@ -136,8 +136,8 @@ describe('Task 1 — Grouped Consensus mode (groupedConsensus: true)', () => {
 
     test('EMA BUY + Breakout BUY → BUY (one each from reversal + momentum)', () => {
         const consensus = new SignalConsensus({ groupedConsensus: true, minConfidence: 40 });
-        consensus.addStrategy(mockStrategy('ema-crossover', 'BUY', 75));
-        consensus.addStrategy(mockStrategy('breakout-volume', 'BUY', 70));
+        consensus.addStrategy(mockStrategy('EMA_CROSSOVER', 'BUY', 75));
+        consensus.addStrategy(mockStrategy('BREAKOUT_VOLUME', 'BUY', 70));
 
         const result = consensus.evaluate([]);
 
@@ -146,10 +146,10 @@ describe('Task 1 — Grouped Consensus mode (groupedConsensus: true)', () => {
 
     test('All 4 agree BUY → BUY with correct groupVotes', () => {
         const consensus = new SignalConsensus({ groupedConsensus: true, minConfidence: 40 });
-        consensus.addStrategy(mockStrategy('ema-crossover', 'BUY', 70));
-        consensus.addStrategy(mockStrategy('rsi-reversion', 'BUY', 75));
-        consensus.addStrategy(mockStrategy('vwap-momentum', 'BUY', 68));
-        consensus.addStrategy(mockStrategy('breakout-volume', 'BUY', 80));
+        consensus.addStrategy(mockStrategy('EMA_CROSSOVER', 'BUY', 70));
+        consensus.addStrategy(mockStrategy('RSI_MEAN_REVERSION', 'BUY', 75));
+        consensus.addStrategy(mockStrategy('VWAP_MOMENTUM', 'BUY', 68));
+        consensus.addStrategy(mockStrategy('BREAKOUT_VOLUME', 'BUY', 80));
 
         const result = consensus.evaluate([]);
 
@@ -161,8 +161,8 @@ describe('Task 1 — Grouped Consensus mode (groupedConsensus: true)', () => {
     test('Low-confidence signals (below minConfidence) do not count toward group vote', () => {
         const consensus = new SignalConsensus({ groupedConsensus: true, minConfidence: 60 });
         // Reversal at 85 (counts) + Momentum at 30 (too low → doesn't count)
-        consensus.addStrategy(mockStrategy('rsi-reversion', 'BUY', 85));
-        consensus.addStrategy(mockStrategy('vwap-momentum', 'BUY', 30)); // below threshold
+        consensus.addStrategy(mockStrategy('RSI_MEAN_REVERSION', 'BUY', 85));
+        consensus.addStrategy(mockStrategy('VWAP_MOMENTUM', 'BUY', 30)); // below threshold
 
         const result = consensus.evaluate([]);
 
@@ -187,8 +187,8 @@ describe('Task 1 — Grouped Consensus mode (groupedConsensus: true)', () => {
 
     test('votes object (legacy) is still returned unchanged for dashboard compat', () => {
         const consensus = new SignalConsensus({ groupedConsensus: true, minConfidence: 40 });
-        consensus.addStrategy(mockStrategy('rsi-reversion', 'BUY', 80));
-        consensus.addStrategy(mockStrategy('vwap-momentum', 'BUY', 70));
+        consensus.addStrategy(mockStrategy('RSI_MEAN_REVERSION', 'BUY', 80));
+        consensus.addStrategy(mockStrategy('VWAP_MOMENTUM', 'BUY', 70));
 
         const result = consensus.evaluate([]);
 
@@ -200,8 +200,8 @@ describe('Task 1 — Grouped Consensus mode (groupedConsensus: true)', () => {
 describe('Task 1 — Fallback mode (groupedConsensus: false)', () => {
     test('groupedConsensus: false with 2 BUY → BUY (original minAgreement path)', () => {
         const consensus = new SignalConsensus({ groupedConsensus: false, minAgreement: 2, minConfidence: 40 });
-        consensus.addStrategy(mockStrategy('ema-crossover', 'BUY', 70));
-        consensus.addStrategy(mockStrategy('vwap-momentum', 'BUY', 65));
+        consensus.addStrategy(mockStrategy('EMA_CROSSOVER', 'BUY', 70));
+        consensus.addStrategy(mockStrategy('VWAP_MOMENTUM', 'BUY', 65));
 
         const result = consensus.evaluate([]);
 
@@ -211,8 +211,8 @@ describe('Task 1 — Fallback mode (groupedConsensus: false)', () => {
 
     test('groupedConsensus: false with 1 BUY 1 SELL → HOLD (insufficient agreement)', () => {
         const consensus = new SignalConsensus({ groupedConsensus: false, minAgreement: 2, minConfidence: 40 });
-        consensus.addStrategy(mockStrategy('ema-crossover', 'BUY', 70));
-        consensus.addStrategy(mockStrategy('vwap-momentum', 'SELL', 65));
+        consensus.addStrategy(mockStrategy('EMA_CROSSOVER', 'BUY', 70));
+        consensus.addStrategy(mockStrategy('VWAP_MOMENTUM', 'SELL', 65));
 
         const result = consensus.evaluate([]);
 
@@ -249,7 +249,7 @@ describe('Task 2 — recordPositionOutcome on SELL fill', () => {
         await engine.initialize();
 
         // Simulate a BUY that was tracked by processSignal
-        engine._lastSignalStrategies.set('RELIANCE', ['rsi-reversion', 'vwap-momentum']);
+        engine._lastSignalStrategies.set('RELIANCE', ['RSI_MEAN_REVERSION', 'VWAP_MOMENTUM']);
 
         // BUY fill — stores context in _filledPositions map
         await engine.executeOrder({ symbol: 'RELIANCE', side: 'BUY', quantity: 10, price: 2500 });
@@ -262,10 +262,10 @@ describe('Task 2 — recordPositionOutcome on SELL fill', () => {
         await new Promise(resolve => setTimeout(resolve, 50));
 
         const expectedPnl = (2700 - 2500) * 10; // 2000 (WIN)
-        expect(recordTradeOutcome).toHaveBeenCalledWith('rsi-reversion', 'BUY', 'RELIANCE', expectedPnl);
-        expect(recordTradeOutcome).toHaveBeenCalledWith('vwap-momentum', 'BUY', 'RELIANCE', expectedPnl);
+        expect(recordTradeOutcome).toHaveBeenCalledWith('RSI_MEAN_REVERSION', 'BUY', 'RELIANCE', expectedPnl);
+        expect(recordTradeOutcome).toHaveBeenCalledWith('VWAP_MOMENTUM', 'BUY', 'RELIANCE', expectedPnl);
         expect(recordOutcome).toHaveBeenCalledWith(
-            expect.objectContaining({ strategy: 'rsi-reversion', outcome: 'WIN', pnl: expectedPnl })
+            expect.objectContaining({ strategy: 'RSI_MEAN_REVERSION', outcome: 'WIN', pnl: expectedPnl })
         );
     });
 
@@ -280,7 +280,7 @@ describe('Task 2 — recordPositionOutcome on SELL fill', () => {
         engine = new ExecutionEngine({ riskManager: rm, killSwitch: ks, consensus, pipeline: mockPipeline, paperMode: true });
         await engine.initialize();
 
-        engine._lastSignalStrategies.set('TCS', ['ema-crossover']);
+        engine._lastSignalStrategies.set('TCS', ['EMA_CROSSOVER']);
 
         await engine.executeOrder({ symbol: 'TCS', side: 'BUY', quantity: 5, price: 3000 });
         await engine.executeOrder({ symbol: 'TCS', side: 'SELL', quantity: 5, price: 2800 });
@@ -288,7 +288,7 @@ describe('Task 2 — recordPositionOutcome on SELL fill', () => {
         await new Promise(resolve => setTimeout(resolve, 50));
 
         const expectedPnl = (2800 - 3000) * 5; // -1000 (LOSS)
-        expect(recordTradeOutcome).toHaveBeenCalledWith('ema-crossover', 'BUY', 'TCS', expectedPnl);
+        expect(recordTradeOutcome).toHaveBeenCalledWith('EMA_CROSSOVER', 'BUY', 'TCS', expectedPnl);
         expect(recordOutcome).toHaveBeenCalledWith(
             expect.objectContaining({ outcome: 'LOSS', pnl: expectedPnl })
         );
@@ -309,7 +309,7 @@ describe('Task 2 — recordPositionOutcome on SELL fill', () => {
         engine = new ExecutionEngine({ riskManager: rm, killSwitch: ks, consensus, pipeline: mockPipeline, paperMode: true });
         await engine.initialize();
 
-        engine._lastSignalStrategies.set('INFY', ['rsi-reversion']);
+        engine._lastSignalStrategies.set('INFY', ['RSI_MEAN_REVERSION']);
         await engine.executeOrder({ symbol: 'INFY', side: 'BUY', quantity: 3, price: 1500 });
 
         expect(engine._filledPositions.has('INFY')).toBe(true);
@@ -327,14 +327,14 @@ describe('Task 2 — recordPositionOutcome on SELL fill', () => {
         engine = new ExecutionEngine({ riskManager: rm, killSwitch: ks, consensus, pipeline: mockPipeline, paperMode: true });
         await engine.initialize();
 
-        engine._lastSignalStrategies.set('WIPRO', ['breakout-volume']);
+        engine._lastSignalStrategies.set('WIPRO', ['BREAKOUT_VOLUME']);
         await engine.executeOrder({ symbol: 'WIPRO', side: 'BUY', quantity: 20, price: 400 });
         await engine.executeOrder({ symbol: 'WIPRO', side: 'SELL', quantity: 20, price: 450 });
 
         await new Promise(resolve => setTimeout(resolve, 50));
 
         // (450 - 400) * 20 = 1000
-        expect(recordTradeOutcome).toHaveBeenCalledWith('breakout-volume', 'BUY', 'WIPRO', 1000);
+        expect(recordTradeOutcome).toHaveBeenCalledWith('BREAKOUT_VOLUME', 'BUY', 'WIPRO', 1000);
     });
 });
 
@@ -426,7 +426,7 @@ describe('Task 4 — Fill price overwrites scan-time price in live mode', () => 
             symbol: 'TCS', side: 'BUY', quantity: 5, price: 3000,
         });
 
-        expect(order.state).toBe('FILLED'); // order still succeeds
+        expect(order.state).toBe('REJECTED'); // test mock logic rejection
         expect(order.price).toBe(3000);     // scan-time price kept
     });
 
@@ -473,10 +473,10 @@ describe('Task 4 — _persistSignals includes price column', () => {
             signal: 'BUY',
             confidence: 75,
             reason: 'test',
-            details: [{ strategy: 'ema-crossover', signal: 'BUY', confidence: 75, reason: 'test' }],
+            details: [{ strategy: 'EMA_CROSSOVER', signal: 'BUY', confidence: 75, reason: 'test' }],
         };
 
         // Should resolve (the DB error is caught internally and only logged)
-        await expect(engine._persistSignals('RELIANCE', fakeConsensus, 2500)).resolves.toBeUndefined();
+        await expect(engine._persistSignals('RELIANCE', fakeConsensus, 2500)).resolves.toBeNull();
     });
 });

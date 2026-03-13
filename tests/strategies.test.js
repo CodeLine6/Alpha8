@@ -292,7 +292,7 @@ describe('RSIMeanReversionStrategy', () => {
 // ─── VWAP Momentum ──────────────────────────────────────
 
 describe('VWAPMomentumStrategy', () => {
-  const strategy = new VWAPMomentumStrategy();
+  const strategy = new VWAPMomentumStrategy({ anchorToday: false });
 
   test('should return HOLD with insufficient data', () => {
     const signal = strategy.analyze([]);
@@ -304,7 +304,7 @@ describe('VWAPMomentumStrategy', () => {
       { high: 110, low: 90, close: 100, volume: 1000 },
       { high: 115, low: 95, close: 105, volume: 2000 },
     ];
-    const vwap = strategy.calculateVWAP(candles);
+    const vwap = strategy.calculateVWAP(candles, { anchorToday: false });
 
     expect(vwap).toHaveLength(2);
     expect(vwap[0]).toBeCloseTo(100, 0); // TP1 = (110+90+100)/3 = 100
@@ -409,7 +409,7 @@ describe('Strategy Signal Consistency', () => {
   const strategies = [
     new EMACrossoverStrategy(),
     new RSIMeanReversionStrategy(),
-    new VWAPMomentumStrategy(),
+    new VWAPMomentumStrategy({ anchorToday: false }),
     new BreakoutVolumeStrategy(),
   ];
 

@@ -30,6 +30,7 @@ export class VWAPMomentumStrategy extends BaseStrategy {
     this.priceBandPct = params.priceBandPct ?? 0.2;
     this.volumeAvgPeriod = params.volumeAvgPeriod ?? 20;
     this.minCandles = params.minCandles ?? 15;
+    this.anchorToday = params.anchorToday ?? true;
   }
 
   /**
@@ -37,14 +38,36 @@ export class VWAPMomentumStrategy extends BaseStrategy {
    * VWAP = Σ(Typical Price × Volume) / Σ(Volume)
    *
    * @param {import('../data/historical-data.js').Candle[]} candles
+   * @param {Object} [options]
+   * @param {boolean} [options.anchorToday=true] - When true, filters to current IST session (09:15 onwards). Set false for backtesting with pre-sliced daily candles.
    * @returns {number[]} Running VWAP values
    */
-  calculateVWAP(candles) {
+  calculateVWAP(candles, { anchorToday = true } = {}) {
+    let filteredCandles = candles;
+
+    if (anchorToday && candles.length > 0) {
+      // Find today's date in IST from the latest candle
+      const latestDate = new Date(Math.max(...candles.map(c => c.date.getTime())));
+      latestDate.setMinutes(latestDate.getMinutes() + 330); // UTC to IST
+      const todayDateStr = latestDate.toISOString().split('T')[0];
+
+      filteredCandles = candles.filter(c => {
+        const istDate = new Date(c.date.getTime() + 19800000); // +330 * 60 * 1000
+        const isToday = istDate.toISOString().split('T')[0] === todayDateStr;
+        const utcMinutes = c.date.getUTCHours() * 60 + c.date.getUTCMinutes();
+        return isToday && utcMinutes >= 225;
+      });
+
+      if (filteredCandles.length < this.minCandles) {
+        return [];
+      }
+    }
+
     const vwapValues = [];
     let cumulativeTPV = 0; // Typical Price × Volume
     let cumulativeVolume = 0;
 
-    for (const c of candles) {
+    for (const c of filteredCandles) {
       const typicalPrice = (c.high + c.low + c.close) / 3;
       cumulativeTPV += typicalPrice * c.volume;
       cumulativeVolume += c.volume;
@@ -61,15 +84,26 @@ export class VWAPMomentumStrategy extends BaseStrategy {
    * @returns {{ signal: 'BUY'|'SELL'|'HOLD', confidence: number, reason: string }}
    */
   analyze(candles) {
-    if (!candles || candles.length < this.minCandles) {
+    if (!candles) {
       return this.hold(`Insufficient data: need ${this.minCandles} candles, got ${candles?.length || 0}`);
+    }
+
+    candles = this.validateCandles(candles);
+
+    if (candles.length < this.minCandles) {
+      return this.hold(`Insufficient data: need ${this.minCandles} candles, got ${candles.length}`);
+    }
+
+    // Calculate VWAP
+    const vwapValues = this.calculateVWAP(candles, { anchorToday: this.anchorToday });
+
+    if (vwapValues.length === 0) {
+      return this.hold('Insufficient intraday candles for VWAP');
     }
 
     const closes = candles.map((c) => c.close);
     const volumes = candles.map((c) => c.volume);
 
-    // Calculate VWAP
-    const vwapValues = this.calculateVWAP(candles);
     const currentVWAP = vwapValues[vwapValues.length - 1];
     const previousVWAP = vwapValues[vwapValues.length - 2];
 
