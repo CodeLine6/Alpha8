@@ -69,12 +69,19 @@ export class BaseStrategy {
     const valid = [];
     let skipped = 0;
 
-    for (const c of candles) {
+    for (let c of candles) {
+      // Feature 10: Strict Volume Casting Base Patch
+      // Explicitly convert string volumes to numbers to prevent .reduce() concatenation bugs
+      if (c.volume !== undefined && c.volume !== null) {
+        c.volume = Number(c.volume);
+      }
+
       const isValid =
         typeof c.close === 'number' && c.close > 0 && !isNaN(c.close) &&
         typeof c.high === 'number' && c.high > 0 && !isNaN(c.high) &&
         typeof c.low === 'number' && c.low > 0 && !isNaN(c.low) &&
         typeof c.open === 'number' && c.open > 0 && !isNaN(c.open) &&
+        typeof c.volume === 'number' && c.volume >= 0 && !isNaN(c.volume) &&
         c.high >= c.low &&
         c.high >= c.close &&
         c.low <= c.close;
