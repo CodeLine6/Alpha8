@@ -761,7 +761,7 @@ async function main() {
     const { default: cron } = await import('node-cron');
 
     // ─── Keep-Awake Cron (Every 10 mins) ───────────────────
-    cron.schedule('*/10 * * * *', async () => {
+    cron.schedule('*/5 * * * *', async () => {
       const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${config.PORT}`;
       const pingUrl = url.endsWith('/') ? `${url}health` : `${url}/health`;
       log.info(`🔌 Pinging service to keep awake: ${pingUrl}`);
