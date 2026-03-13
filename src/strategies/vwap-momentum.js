@@ -46,19 +46,37 @@ export class VWAPMomentumStrategy extends BaseStrategy {
     let filteredCandles = candles;
 
     if (anchorToday && candles.length > 0) {
-      // Find today's date in IST from the latest candle
-      const validCandles = candles.filter(c => c.date && !isNaN(new Date(c.date).getTime()));
+      // Find today's date in IST from the latest candle safely
+      const validCandles = candles.filter(c => {
+        if (!c || !c.date) return false;
+        const t = new Date(c.date).getTime();
+        return !isNaN(t) && t > 0;
+      });
+
       if (validCandles.length === 0) return [];
 
-      const latestDate = new Date(Math.max(...validCandles.map(c => new Date(c.date).getTime())));
-      latestDate.setMinutes(latestDate.getMinutes() + 330); // UTC to IST
-      const todayDateStr = latestDate.toISOString().split('T')[0];
+      let maxTime = -Infinity;
+      for (const c of validCandles) {
+        const t = new Date(c.date).getTime();
+        if (t > maxTime) maxTime = t;
+      }
+
+      // 19800000 = 330 minutes * 60 * 1000 = +5:30 IST
+      const latestIstDate = new Date(maxTime + 19800000);
+      if (isNaN(latestIstDate.getTime())) return [];
+
+      const todayDateStr = latestIstDate.toISOString().split('T')[0];
 
       filteredCandles = validCandles.filter(c => {
-        const cDate = new Date(c.date);
-        const istDate = new Date(cDate.getTime() + 19800000); // +330 * 60 * 1000
+        const cTime = new Date(c.date).getTime();
+        const istDate = new Date(cTime + 19800000);
+
+        if (isNaN(istDate.getTime())) return false;
+
         const isToday = istDate.toISOString().split('T')[0] === todayDateStr;
-        const utcMinutes = cDate.getUTCHours() * 60 + cDate.getUTCMinutes();
+
+        const uDate = new Date(cTime);
+        const utcMinutes = uDate.getUTCHours() * 60 + uDate.getUTCMinutes();
         return isToday && utcMinutes >= 225;
       });
 
@@ -88,101 +106,107 @@ export class VWAPMomentumStrategy extends BaseStrategy {
    * @returns {{ signal: 'BUY'|'SELL'|'HOLD', confidence: number, reason: string }}
    */
   analyze(candles) {
-    if (!candles) {
-      return this.hold(`Insufficient data: need ${this.minCandles} candles, got ${candles?.length || 0}`);
-    }
-
-    candles = this.validateCandles(candles);
-
-    if (candles.length < this.minCandles) {
-      return this.hold(`Insufficient data: need ${this.minCandles} candles, got ${candles.length}`);
-    }
-
-    // Calculate VWAP
-    const vwapValues = this.calculateVWAP(candles, { anchorToday: this.anchorToday });
-
-    if (vwapValues.length === 0) {
-      return this.hold('Insufficient intraday candles for VWAP');
-    }
-
-    const closes = candles.map((c) => c.close);
-    const volumes = candles.map((c) => c.volume);
-
-    const currentVWAP = vwapValues[vwapValues.length - 1];
-    const previousVWAP = vwapValues[vwapValues.length - 2];
-
-    const currentPrice = closes[closes.length - 1];
-    const previousPrice = closes[closes.length - 2];
-    const currentVolume = volumes[volumes.length - 1];
-
-    // Average volume
-    const recentVolumes = volumes.slice(-this.volumeAvgPeriod);
-    const avgVolume = recentVolumes.reduce((a, b) => a + b, 0) / recentVolumes.length;
-
-    // Price deviation from VWAP
-    const deviation = ((currentPrice - currentVWAP) / currentVWAP) * 100;
-    const absDeviation = Math.abs(deviation);
-    const bandThreshold = this.priceBandPct;
-
-    // Volume confirmation
-    const volumeRatio = avgVolume > 0 ? currentVolume / avgVolume : 0;
-    const hasVolumeConfirmation = volumeRatio >= this.volumeMultiplier;
-
-    // Detect VWAP crossover
-    const bullishCross = previousPrice <= previousVWAP && currentPrice > currentVWAP;
-    const bearishCross = previousPrice >= previousVWAP && currentPrice < currentVWAP;
-
-    // ─── Bullish: Price crosses above VWAP ───────────────
-    if (bullishCross && absDeviation > bandThreshold) {
-      let confidence = 45;
-      confidence += Math.min(absDeviation * 10, 25); // deviation bonus
-      if (hasVolumeConfirmation) confidence += 20; // volume bonus
-      confidence += Math.min(volumeRatio * 5, 10); // extra volume strength
-
-      const reason =
-        `Price crossed above VWAP. ` +
-        `Price: ${currentPrice.toFixed(2)}, VWAP: ${currentVWAP.toFixed(2)} (+${deviation.toFixed(2)}%). ` +
-        `Volume: ${volumeRatio.toFixed(1)}x avg${hasVolumeConfirmation ? ' ✓' : ''}`;
-
-      log.info({ signal: SIGNAL.BUY, confidence, deviation, volumeRatio }, reason);
-      return this.buildSignal(SIGNAL.BUY, confidence, reason);
-    }
-
-    // ─── Bearish: Price crosses below VWAP ───────────────
-    if (bearishCross && absDeviation > bandThreshold) {
-      let confidence = 45;
-      confidence += Math.min(absDeviation * 10, 25);
-      if (hasVolumeConfirmation) confidence += 20;
-      confidence += Math.min(volumeRatio * 5, 10);
-
-      const reason =
-        `Price crossed below VWAP. ` +
-        `Price: ${currentPrice.toFixed(2)}, VWAP: ${currentVWAP.toFixed(2)} (${deviation.toFixed(2)}%). ` +
-        `Volume: ${volumeRatio.toFixed(1)}x avg${hasVolumeConfirmation ? ' ✓' : ''}`;
-
-      log.info({ signal: SIGNAL.SELL, confidence, deviation, volumeRatio }, reason);
-      return this.buildSignal(SIGNAL.SELL, confidence, reason);
-    }
-
-    // ─── Momentum continuation (no crossover but trending) ──
-    if (absDeviation > bandThreshold * 2 && hasVolumeConfirmation) {
-      if (deviation > 0 && currentPrice > previousPrice) {
-        const confidence = 35 + Math.min(absDeviation * 5, 20);
-        return this.buildSignal(SIGNAL.BUY, confidence,
-          `Momentum continuation above VWAP (+${deviation.toFixed(2)}%). Volume confirmed.`);
+    try {
+      if (!candles) {
+        return this.hold(`Insufficient data: need ${this.minCandles} candles, got ${candles?.length || 0}`);
       }
-      if (deviation < 0 && currentPrice < previousPrice) {
-        const confidence = 35 + Math.min(absDeviation * 5, 20);
-        return this.buildSignal(SIGNAL.SELL, confidence,
-          `Momentum continuation below VWAP (${deviation.toFixed(2)}%). Volume confirmed.`);
-      }
-    }
 
-    // ─── Neutral ─────────────────────────────────────────
-    const side = deviation > 0 ? 'above' : 'below';
-    return this.hold(
-      `Price ${side} VWAP (${deviation.toFixed(2)}%). ` +
-      `VWAP=${currentVWAP.toFixed(2)}. Volume: ${volumeRatio.toFixed(1)}x avg`
-    );
+      candles = this.validateCandles(candles);
+
+      if (candles.length < this.minCandles) {
+        return this.hold(`Insufficient data: need ${this.minCandles} candles, got ${candles.length}`);
+      }
+
+      // Calculate VWAP
+      const vwapValues = this.calculateVWAP(candles, { anchorToday: this.anchorToday });
+
+      if (vwapValues.length === 0) {
+        return this.hold('Insufficient intraday candles for VWAP');
+      }
+
+      const closes = candles.map((c) => c.close);
+      const volumes = candles.map((c) => c.volume);
+
+      const currentVWAP = vwapValues[vwapValues.length - 1];
+      const previousVWAP = vwapValues[vwapValues.length - 2];
+
+      const currentPrice = closes[closes.length - 1];
+      const previousPrice = closes[closes.length - 2];
+      const currentVolume = volumes[volumes.length - 1];
+
+      // Average volume
+      const recentVolumes = volumes.slice(-this.volumeAvgPeriod);
+      const avgVolume = recentVolumes.reduce((a, b) => a + b, 0) / recentVolumes.length;
+
+      // Price deviation from VWAP
+      const deviation = ((currentPrice - currentVWAP) / currentVWAP) * 100;
+      const absDeviation = Math.abs(deviation);
+      const bandThreshold = this.priceBandPct;
+
+      // Volume confirmation
+      const volumeRatio = avgVolume > 0 ? currentVolume / avgVolume : 0;
+      const hasVolumeConfirmation = volumeRatio >= this.volumeMultiplier;
+
+      // Detect VWAP crossover
+      const bullishCross = previousPrice <= previousVWAP && currentPrice > currentVWAP;
+      const bearishCross = previousPrice >= previousVWAP && currentPrice < currentVWAP;
+
+      // ─── Bullish: Price crosses above VWAP ───────────────
+      if (bullishCross && absDeviation > bandThreshold) {
+        let confidence = 45;
+        confidence += Math.min(absDeviation * 10, 25); // deviation bonus
+        if (hasVolumeConfirmation) confidence += 20; // volume bonus
+        confidence += Math.min(volumeRatio * 5, 10); // extra volume strength
+
+        const reason =
+          `Price crossed above VWAP. ` +
+          `Price: ${currentPrice.toFixed(2)}, VWAP: ${currentVWAP.toFixed(2)} (+${deviation.toFixed(2)}%). ` +
+          `Volume: ${volumeRatio.toFixed(1)}x avg${hasVolumeConfirmation ? ' ✓' : ''}`;
+
+        log.info({ signal: SIGNAL.BUY, confidence, deviation, volumeRatio }, reason);
+        return this.buildSignal(SIGNAL.BUY, confidence, reason);
+      }
+
+      // ─── Bearish: Price crosses below VWAP ───────────────
+      if (bearishCross && absDeviation > bandThreshold) {
+        let confidence = 45;
+        confidence += Math.min(absDeviation * 10, 25);
+        if (hasVolumeConfirmation) confidence += 20;
+        confidence += Math.min(volumeRatio * 5, 10);
+
+        const reason =
+          `Price crossed below VWAP. ` +
+          `Price: ${currentPrice.toFixed(2)}, VWAP: ${currentVWAP.toFixed(2)} (${deviation.toFixed(2)}%). ` +
+          `Volume: ${volumeRatio.toFixed(1)}x avg${hasVolumeConfirmation ? ' ✓' : ''}`;
+
+        log.info({ signal: SIGNAL.SELL, confidence, deviation, volumeRatio }, reason);
+        return this.buildSignal(SIGNAL.SELL, confidence, reason);
+      }
+
+      // ─── Momentum continuation (no crossover but trending) ──
+      if (absDeviation > bandThreshold * 2 && hasVolumeConfirmation) {
+        if (deviation > 0 && currentPrice > previousPrice) {
+          const confidence = 35 + Math.min(absDeviation * 5, 20);
+          return this.buildSignal(SIGNAL.BUY, confidence,
+            `Momentum continuation above VWAP (+${deviation.toFixed(2)}%). Volume confirmed.`);
+        }
+        if (deviation < 0 && currentPrice < previousPrice) {
+          const confidence = 35 + Math.min(absDeviation * 5, 20);
+          return this.buildSignal(SIGNAL.SELL, confidence,
+            `Momentum continuation below VWAP (${deviation.toFixed(2)}%). Volume confirmed.`);
+        }
+      }
+
+      // ─── Neutral ─────────────────────────────────────────
+      const side = deviation > 0 ? 'above' : 'below';
+      return this.hold(
+        `Price ${side} VWAP (${deviation.toFixed(2)}%). ` +
+        `VWAP=${currentVWAP.toFixed(2)}. Volume: ${volumeRatio.toFixed(1)}x avg`
+      );
+    } catch (err) {
+      // We append a specialized tag so if this bubbles up, we know EXACTLY where it came from.
+      err.message = '[VWAP_CRITICAL] ' + err.message + '\nStack: ' + err.stack;
+      throw err;
+    }
   }
 }
