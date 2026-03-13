@@ -390,7 +390,7 @@ export class SymbolScout {
 
         // What's being added (new entries)
         const added = shouldAdd
-            .filter(s => !currentDynamic.includes(s))
+            .filter(s => !currentDynamic.map(d => d.toUpperCase()).includes(s.toUpperCase()))
             .map(sym => {
                 const s = sortedScored.find(x => x.symbol === sym);
                 return { symbol: sym, score: s.score, reason: this._addReason(s) };
@@ -399,11 +399,12 @@ export class SymbolScout {
         // What's being removed
         const removed = currentDynamic
             .filter(sym => {
-                const s = sortedScored.find(x => x.symbol === sym);
+                const upperSym = sym.toUpperCase();
+                const s = sortedScored.find(x => x.symbol === upperSym);
                 if (!s) return true; // wasn't even scanned / no data → remove
                 if (s.hardFail) return true;
                 if (s.score < REMOVE_THRESHOLD) return true;
-                if (!shouldAdd.includes(sym) && currentDynamic.length > this.maxDynamic) return true;
+                if (!shouldAdd.map(a => a.toUpperCase()).includes(upperSym) && currentDynamic.length > this.maxDynamic) return true;
                 return false;
             })
             .map(sym => {
@@ -416,7 +417,7 @@ export class SymbolScout {
 
     async _applyChanges(changes, currentDynamic) {
         const newDynamic = [
-            ...currentDynamic.filter(s => !changes.removed.map(r => r.symbol).includes(s)),
+            ...currentDynamic.filter(s => !changes.removed.map(r => r.symbol.toUpperCase()).includes(s.toUpperCase())),
             ...changes.added.map(a => a.symbol),
         ].slice(0, this.maxDynamic);
 
@@ -595,7 +596,13 @@ export class SymbolScout {
         try {
             await query(
                 `INSERT INTO watchlist_log (symbol, action, reason, score, logged_at)
-         VALUES ($1, $2, $3, $4, NOW())`,
+                 SELECT $1, $2, $3, $4, NOW()
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM watchlist_log 
+                     WHERE symbol = $1 
+                       AND action = $2 
+                       AND logged_at >= CURRENT_DATE
+                 )`,
                 [symbol, action, reason, score]
             );
         } catch { /* non-critical */ }
