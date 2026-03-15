@@ -7,24 +7,35 @@ const log = createLogger('backend-api');
 /**
  * Create the API request handler for the backend HTTP server.
  *
- * NEW ENDPOINTS (Live Settings):
- *   GET  /api/live-settings          — all active Redis overrides
- *   POST /api/live-settings          — set or reset a single param
- *   GET  /api/live-settings/schema   — all settable keys with defaults + descriptions
+ * ENDPOINTS:
+ *   GET  /health | /api/health               — infrastructure health + broker token validity
+ *   GET  /api/summary                        — daily P&L, trade counts, kill switch state
+ *   GET  /api/positions                      — open positions with unrealised P&L
+ *   GET  /api/trades                         — trade history with filters
+ *   GET  /api/strategies/performance         — per-strategy metrics
+ *   GET  /api/strategies/signals             — recent signal log
+ *   GET  /api/settings                       — app configuration
+ *   GET  /api/holdings                       — broker holdings + positions
+ *   GET  /api/live-settings                  — all active Redis param overrides
+ *   GET  /api/live-settings/schema           — full schema for all settable params
+ *   POST /api/killswitch                     — engage / reset kill switch
+ *   POST /api/settings/mode                  — toggle paper/live mode
+ *   POST /api/settings/watchlist             — add/remove watchlist symbols
+ *   POST /api/live-settings                  — set / reset / resetAll param override
  *
- * @param {Object} deps - Injected module instances
- * @param {import('../risk/kill-switch.js').KillSwitch} deps.killSwitch
- * @param {import('../risk/risk-manager.js').RiskManager} deps.riskManager
+ * @param {Object} deps
+ * @param {import('../risk/kill-switch.js').KillSwitch}             deps.killSwitch
+ * @param {import('../risk/risk-manager.js').RiskManager}           deps.riskManager
  * @param {import('../engine/execution-engine.js').ExecutionEngine} deps.engine
- * @param {Object} deps.config - Validated env config
- * @param {Object} [deps.broker] - BrokerManager (null in paper mode)
- * @param {Object} [deps.telegram]
- * @param {Object} [deps.scout]
- * @param {Object} [deps.holdingsManager]
- * @param {Function} [deps.getLiveSetting]  - from settings-store.js
- * @param {Function} [deps.setLiveSetting]  - from settings-store.js
- * @param {Function} [deps.getAllLiveSettings] - from settings-store.js
- * @param {Function} [deps.resetLiveSetting]  - from settings-store.js
+ * @param {Object}   deps.config
+ * @param {Object}   [deps.broker]
+ * @param {Object}   [deps.telegram]
+ * @param {Object}   [deps.scout]
+ * @param {Object}   [deps.holdingsManager]
+ * @param {Function} [deps.getLiveSetting]
+ * @param {Function} [deps.setLiveSetting]
+ * @param {Function} [deps.getAllLiveSettings]
+ * @param {Function} [deps.resetLiveSetting]
  * @returns {Function} HTTP request handler
  */
 export function createApiHandler(deps) {
@@ -35,210 +46,199 @@ export function createApiHandler(deps) {
 
   const API_KEY = process.env.API_SECRET_KEY || '';
 
-  // ─── Live Settings Schema ────────────────────────────────────────────────────
-  // Single source of truth for all overridable params.
-  // Used by GET /api/live-settings/schema and input validation on POST.
+  // ═══════════════════════════════════════════════════════
+  // LIVE SETTINGS SCHEMA
+  // Single source of truth for all overridable parameters.
+  // Used by GET /api/live-settings/schema and POST validation.
+  // ═══════════════════════════════════════════════════════
+
   const LIVE_SETTINGS_SCHEMA = {
-    // ── Risk ──────────────────────────────────────────────────────────────────
+    // ── Risk Management ──────────────────────────────────────────────────────
     MAX_DAILY_LOSS_PCT: {
       label: 'Max Daily Loss %',
       description: 'Maximum % of capital that can be lost before trading halts',
-      type: 'number',
-      min: 0.1,
-      max: 10,
-      step: 0.1,
+      type: 'number', min: 0.1, max: 10, step: 0.1,
       default: config.MAX_DAILY_LOSS_PCT,
       category: 'risk',
     },
     PER_TRADE_STOP_LOSS_PCT: {
       label: 'Per-Trade Stop Loss %',
       description: 'Max % of capital at risk on a single trade',
-      type: 'number',
-      min: 0.1,
-      max: 5,
-      step: 0.1,
+      type: 'number', min: 0.1, max: 5, step: 0.1,
       default: config.PER_TRADE_STOP_LOSS_PCT,
       category: 'risk',
     },
     MAX_POSITION_COUNT: {
       label: 'Max Open Positions',
       description: 'Maximum number of concurrent open positions',
-      type: 'number',
-      min: 1,
-      max: 20,
-      step: 1,
+      type: 'number', min: 1, max: 20, step: 1,
       default: config.MAX_POSITION_COUNT,
       category: 'risk',
     },
     KILL_SWITCH_DRAWDOWN_PCT: {
       label: 'Kill Switch Drawdown %',
       description: 'Drawdown % that auto-engages the kill switch',
-      type: 'number',
-      min: 1,
-      max: 20,
-      step: 0.5,
+      type: 'number', min: 1, max: 20, step: 0.5,
       default: config.KILL_SWITCH_DRAWDOWN_PCT,
       category: 'risk',
     },
     TRADING_CAPITAL: {
       label: 'Trading Capital (₹)',
       description: 'Active capital used for position sizing',
-      type: 'number',
-      min: 10000,
-      max: 10000000,
-      step: 10000,
+      type: 'number', min: 10000, max: 10000000, step: 10000,
       default: config.TRADING_CAPITAL,
       category: 'risk',
     },
-    // ── EMA Crossover ─────────────────────────────────────────────────────────
+    STOP_LOSS_PCT: {
+      label: 'Stop Loss %',
+      description: 'Hard stop loss % below entry price — triggers immediate exit',
+      type: 'number', min: 0.1, max: 5, step: 0.1,
+      default: config.STOP_LOSS_PCT ?? 1.0,
+      category: 'risk',
+    },
+    TRAILING_STOP_PCT: {
+      label: 'Trailing Stop %',
+      description: 'Trailing stop % below session high water mark — locks in profit',
+      type: 'number', min: 0.1, max: 5, step: 0.1,
+      default: config.TRAILING_STOP_PCT ?? 1.5,
+      category: 'risk',
+    },
+    PROFIT_TARGET_PCT: {
+      label: 'Profit Target %',
+      description: 'Fixed % profit target for mean reversion strategies (RSI). Momentum strategies use Risk/Reward ratio instead.',
+      type: 'number', min: 0.5, max: 10, step: 0.1,
+      default: config.PROFIT_TARGET_PCT ?? 1.8,
+      category: 'exits',
+    },
+    RISK_REWARD_RATIO: {
+      label: 'Risk/Reward Ratio',
+      description: 'Profit target = stop loss distance × this ratio. Used by EMA, VWAP, Breakout strategies.',
+      type: 'number', min: 1, max: 5, step: 0.5,
+      default: config.RISK_REWARD_RATIO ?? 2.0,
+      category: 'exits',
+    },
+    PARTIAL_EXIT_ENABLED: {
+      label: 'Partial Exit',
+      description: 'Sell partial position at profit target, let remainder trail',
+      type: 'boolean',
+      default: config.PARTIAL_EXIT_ENABLED ?? true,
+      category: 'exits',
+    },
+    PARTIAL_EXIT_PCT: {
+      label: 'Partial Exit %',
+      description: '% of position to sell at profit target (remainder continues trailing)',
+      type: 'number', min: 10, max: 90, step: 10,
+      default: config.PARTIAL_EXIT_PCT ?? 50,
+      category: 'exits',
+    },
+    SIGNAL_REVERSAL_ENABLED: {
+      label: 'Signal Reversal Exit',
+      description: 'Exit when the strategy that opened the position fires the opposite signal',
+      type: 'boolean',
+      default: config.SIGNAL_REVERSAL_ENABLED ?? true,
+      category: 'exits',
+    },
+    MAX_HOLD_MINUTES: {
+      label: 'Max Hold Time (min)',
+      description: 'Exit flat/losing positions after this many minutes regardless of signals',
+      type: 'number', min: 15, max: 240, step: 15,
+      default: config.MAX_HOLD_MINUTES ?? 90,
+      category: 'exits',
+    },
+    // ── EMA Crossover ────────────────────────────────────────────────────────
     EMA_FAST_PERIOD: {
       label: 'EMA Fast Period',
       description: 'Fast EMA period for crossover detection',
-      type: 'number',
-      min: 3,
-      max: 20,
-      step: 1,
-      default: 9,
-      category: 'ema',
+      type: 'number', min: 3, max: 20, step: 1,
+      default: 9, category: 'ema',
     },
     EMA_SLOW_PERIOD: {
       label: 'EMA Slow Period',
       description: 'Slow EMA period for crossover detection',
-      type: 'number',
-      min: 10,
-      max: 50,
-      step: 1,
-      default: 21,
-      category: 'ema',
+      type: 'number', min: 10, max: 50, step: 1,
+      default: 21, category: 'ema',
     },
-    // ── RSI Mean Reversion ────────────────────────────────────────────────────
+    // ── RSI Mean Reversion ───────────────────────────────────────────────────
     RSI_PERIOD: {
       label: 'RSI Period',
       description: 'RSI calculation period',
-      type: 'number',
-      min: 5,
-      max: 30,
-      step: 1,
-      default: 14,
-      category: 'rsi',
+      type: 'number', min: 5, max: 30, step: 1,
+      default: 14, category: 'rsi',
     },
     RSI_OVERSOLD: {
       label: 'RSI Oversold Threshold',
       description: 'RSI below this triggers a BUY signal',
-      type: 'number',
-      min: 10,
-      max: 40,
-      step: 1,
-      default: 30,
-      category: 'rsi',
+      type: 'number', min: 10, max: 40, step: 1,
+      default: 30, category: 'rsi',
     },
     RSI_OVERBOUGHT: {
       label: 'RSI Overbought Threshold',
       description: 'RSI above this triggers a SELL signal',
-      type: 'number',
-      min: 60,
-      max: 90,
-      step: 1,
-      default: 70,
-      category: 'rsi',
+      type: 'number', min: 60, max: 90, step: 1,
+      default: 70, category: 'rsi',
     },
     RSI_EXTREME_OVERSOLD: {
       label: 'RSI Extreme Oversold',
       description: 'Extreme oversold level for confidence bonus',
-      type: 'number',
-      min: 5,
-      max: 25,
-      step: 1,
-      default: 20,
-      category: 'rsi',
+      type: 'number', min: 5, max: 25, step: 1,
+      default: 20, category: 'rsi',
     },
     RSI_EXTREME_OVERBOUGHT: {
       label: 'RSI Extreme Overbought',
       description: 'Extreme overbought level for confidence bonus',
-      type: 'number',
-      min: 75,
-      max: 95,
-      step: 1,
-      default: 80,
-      category: 'rsi',
+      type: 'number', min: 75, max: 95, step: 1,
+      default: 80, category: 'rsi',
     },
-    // ── VWAP Momentum ─────────────────────────────────────────────────────────
+    // ── VWAP Momentum ────────────────────────────────────────────────────────
     VWAP_VOLUME_MULTIPLIER: {
       label: 'VWAP Volume Multiplier',
       description: 'Volume must be this × average to confirm signal',
-      type: 'number',
-      min: 0.5,
-      max: 5,
-      step: 0.1,
-      default: 1.2,
-      category: 'vwap',
+      type: 'number', min: 0.5, max: 5, step: 0.1,
+      default: 1.2, category: 'vwap',
     },
     VWAP_PRICE_BAND_PCT: {
       label: 'VWAP Price Band %',
       description: '% band around VWAP to filter noise crossovers',
-      type: 'number',
-      min: 0.05,
-      max: 2,
-      step: 0.05,
-      default: 0.2,
-      category: 'vwap',
+      type: 'number', min: 0.05, max: 2, step: 0.05,
+      default: 0.2, category: 'vwap',
     },
     VWAP_VOLUME_AVG_PERIOD: {
       label: 'VWAP Volume Avg Period',
       description: 'Candle period for average volume calculation',
-      type: 'number',
-      min: 5,
-      max: 50,
-      step: 1,
-      default: 20,
-      category: 'vwap',
+      type: 'number', min: 5, max: 50, step: 1,
+      default: 20, category: 'vwap',
     },
-    // ── Breakout Volume ───────────────────────────────────────────────────────
+    // ── Breakout Volume ──────────────────────────────────────────────────────
     BREAKOUT_LOOKBACK: {
       label: 'Breakout Lookback Period',
       description: 'Candles to look back for resistance/support levels',
-      type: 'number',
-      min: 5,
-      max: 50,
-      step: 1,
-      default: 20,
-      category: 'breakout',
+      type: 'number', min: 5, max: 50, step: 1,
+      default: 20, category: 'breakout',
     },
     BREAKOUT_VOLUME_MULTIPLIER: {
       label: 'Breakout Volume Multiplier',
       description: 'Volume must be this × average to confirm breakout',
-      type: 'number',
-      min: 0.5,
-      max: 5,
-      step: 0.1,
-      default: 1.5,
-      category: 'breakout',
+      type: 'number', min: 0.5, max: 5, step: 0.1,
+      default: 1.5, category: 'breakout',
     },
     BREAKOUT_BB_PERIOD: {
       label: 'Bollinger Band Period',
       description: 'Period for Bollinger Band calculation',
-      type: 'number',
-      min: 5,
-      max: 50,
-      step: 1,
-      default: 20,
-      category: 'breakout',
+      type: 'number', min: 5, max: 50, step: 1,
+      default: 20, category: 'breakout',
     },
     BREAKOUT_BB_STDDEV: {
       label: 'Bollinger Band Std Dev',
       description: 'Standard deviations for Bollinger Band width',
-      type: 'number',
-      min: 1,
-      max: 4,
-      step: 0.5,
-      default: 2,
-      category: 'breakout',
+      type: 'number', min: 1, max: 4, step: 0.5,
+      default: 2, category: 'breakout',
     },
   };
 
-  // ─── Helpers ─────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════
+  // HELPERS
+  // ═══════════════════════════════════════════════════════
 
-  /** Check API key for protected endpoints */
   function checkAuth(req, res) {
     if (!API_KEY) return true;
     const provided = req.headers['x-api-key'] || '';
@@ -249,23 +249,18 @@ export function createApiHandler(deps) {
     return true;
   }
 
-  /** Parse JSON body from request */
   function parseBody(req) {
     return new Promise((resolve, reject) => {
       let data = '';
       req.on('data', (chunk) => { data += chunk; });
       req.on('end', () => {
-        try {
-          resolve(data ? JSON.parse(data) : {});
-        } catch (e) {
-          reject(new Error('Invalid JSON body'));
-        }
+        try { resolve(data ? JSON.parse(data) : {}); }
+        catch (e) { reject(new Error('Invalid JSON body')); }
       });
       req.on('error', reject);
     });
   }
 
-  /** Send JSON response */
   function json(res, data, status = 200) {
     res.writeHead(status, {
       'Content-Type': 'application/json',
@@ -276,7 +271,6 @@ export function createApiHandler(deps) {
     res.end(JSON.stringify(data));
   }
 
-  /** Parse query params from URL */
   function parseQuery(url) {
     const idx = url.indexOf('?');
     if (idx === -1) return {};
@@ -284,13 +278,12 @@ export function createApiHandler(deps) {
   }
 
   // ═══════════════════════════════════════════════════════
-  // EXISTING ROUTE HANDLERS (unchanged)
+  // ROUTE HANDLERS
   // ═══════════════════════════════════════════════════════
 
   async function handleSummary(req, res) {
     try {
       const riskStatus = riskManager.getStatus();
-      const engineStatus = engine.getStatus();
       const ksStatus = killSwitch.getStatus();
 
       let dbSummary = null;
@@ -300,17 +293,17 @@ export function createApiHandler(deps) {
         dbSummary = result.rows[0] || null;
       } catch { /* DB may not have today's entry yet */ }
 
-      let tradeStats = { count: 0, wins: 0, losses: 0, filled: 0, rejected: 0 };
+      let tradeStats = { count: 0, wins: 0, losses: 0, filled: 0, rejected: 0, totalPnl: 0 };
       try {
         const today = new Date().toISOString().split('T')[0];
         const result = await query(`
           SELECT
             COUNT(*) as count,
-            COUNT(*) FILTER (WHERE pnl > 0) as wins,
-            COUNT(*) FILTER (WHERE pnl < 0) as losses,
-            COUNT(*) FILTER (WHERE status = 'FILLED') as filled,
+            COUNT(*) FILTER (WHERE pnl > 0)             as wins,
+            COUNT(*) FILTER (WHERE pnl < 0)             as losses,
+            COUNT(*) FILTER (WHERE status = 'FILLED')   as filled,
             COUNT(*) FILTER (WHERE status = 'REJECTED') as rejected,
-            COALESCE(SUM(pnl), 0) as total_pnl
+            COALESCE(SUM(pnl), 0)                       as total_pnl
           FROM trades
           WHERE created_at::date = $1
         `, [today]);
@@ -325,7 +318,7 @@ export function createApiHandler(deps) {
         };
       } catch { /* OK — no trades yet */ }
 
-      const summary = {
+      json(res, {
         pnl: dbSummary ? parseFloat(dbSummary.pnl) : tradeStats.totalPnl || 0,
         pnlPct: dbSummary ? parseFloat(dbSummary.pnl_pct) : (tradeStats.totalPnl / config.TRADING_CAPITAL * 100) || 0,
         tradeCount: dbSummary ? dbSummary.trade_count : tradeStats.count,
@@ -341,9 +334,7 @@ export function createApiHandler(deps) {
         killSwitchReason: ksStatus.reason,
         bestTrade: dbSummary?.best_trade || null,
         worstTrade: dbSummary?.worst_trade || null,
-      };
-
-      json(res, summary);
+      });
     } catch (err) {
       log.error({ err }, 'Error in /api/summary');
       json(res, { error: err.message }, 500);
@@ -356,8 +347,8 @@ export function createApiHandler(deps) {
 
       if (enginePositions && enginePositions.size > 0) {
         const symbols = Array.from(enginePositions.keys());
-
         let priceMap = {};
+
         if (broker) {
           try {
             const keys = symbols.map(s => `NSE:${s}`);
@@ -374,18 +365,14 @@ export function createApiHandler(deps) {
           const currentPrice = priceMap[symbol] ?? null;
           const entryPrice = ctx.entryPrice ?? ctx.price;
           const unrealisedPnL = currentPrice != null
-            ? (currentPrice - entryPrice) * ctx.quantity
-            : null;
+            ? (currentPrice - entryPrice) * ctx.quantity : null;
           const unrealisedPnLPct = currentPrice != null
-            ? ((currentPrice - entryPrice) / entryPrice) * 100
-            : null;
+            ? ((currentPrice - entryPrice) / entryPrice) * 100 : null;
           const holdMinutes = (Date.now() - ctx.timestamp) / 60000;
           const stopDistancePct = currentPrice != null && ctx.stopPrice
-            ? ((currentPrice - ctx.stopPrice) / currentPrice) * 100
-            : null;
+            ? ((currentPrice - ctx.stopPrice) / currentPrice) * 100 : null;
           const trailDistancePct = currentPrice != null && ctx.trailStopPrice
-            ? ((currentPrice - ctx.trailStopPrice) / currentPrice) * 100
-            : null;
+            ? ((currentPrice - ctx.trailStopPrice) / currentPrice) * 100 : null;
 
           return {
             symbol,
@@ -443,9 +430,10 @@ export function createApiHandler(deps) {
 
   async function handleHealth(req, res) {
     try {
-      let dbOk = false, redisOk = false;
+      let dbOk = false;
+      let redisOk = false;
       let brokerOk = false;
-      let tokenValid = null; // null = not checked (no broker configured)
+      let tokenValid = null; // null = no broker configured
 
       try { dbOk = await checkDatabaseHealth(); } catch { /* */ }
       try { redisOk = await checkRedisHealth(); } catch { /* */ }
@@ -453,10 +441,14 @@ export function createApiHandler(deps) {
       if (broker) {
         try {
           brokerOk = await broker.isConnected();
-          if (brokerOk) {
+          // Only check token validity if API is reachable
+          if (brokerOk && typeof broker.isTokenValid === 'function') {
             tokenValid = await broker.isTokenValid();
           }
-        } catch { brokerOk = false; }
+        } catch {
+          brokerOk = false;
+          tokenValid = null;
+        }
       }
 
       json(res, {
@@ -547,7 +539,7 @@ export function createApiHandler(deps) {
         SELECT
           strategy,
           COUNT(*) as trade_count,
-          COUNT(*) FILTER (WHERE pnl > 0) as wins,
+          COUNT(*) FILTER (WHERE pnl > 0)  as wins,
           COUNT(*) FILTER (WHERE pnl <= 0) as losses,
           ROUND(AVG(pnl / NULLIF(price * quantity, 0) * 100)::numeric, 2) as avg_return,
           COALESCE(SUM(pnl), 0) as total_pnl,
@@ -581,7 +573,6 @@ export function createApiHandler(deps) {
     try {
       const params = parseQuery(req.url);
       const limit = Math.min(parseInt(params.limit) || 50, 200);
-
       const result = await query(
         'SELECT * FROM signals ORDER BY created_at DESC LIMIT $1',
         [limit]
@@ -645,7 +636,6 @@ export function createApiHandler(deps) {
     if (!checkAuth(req, res)) return;
     try {
       const body = await parseBody(req);
-
       if (body.action === 'engage') {
         await killSwitch.engage(body.reason || 'Manual dashboard trigger');
         log.warn({ reason: body.reason }, '🛑 Kill switch ENGAGED from dashboard');
@@ -706,26 +696,26 @@ export function createApiHandler(deps) {
   }
 
   // ═══════════════════════════════════════════════════════
-  // NEW: LIVE SETTINGS ROUTE HANDLERS
+  // LIVE SETTINGS HANDLERS
   // ═══════════════════════════════════════════════════════
 
-  /**
-   * GET /api/live-settings
-   * Returns all active Redis overrides merged with schema defaults.
-   * Dashboard uses this to show which params are overridden vs using .env.
-   */
   async function handleLiveSettingsGet(req, res) {
     try {
       if (!getAllLiveSettings) {
-        return json(res, { settings: {}, available: false, reason: 'Live settings not configured' });
+        return json(res, {
+          settings: {}, activeRiskParams: {}, baseRiskParams: {},
+          available: false, reason: 'Live settings not configured',
+        });
       }
 
       const overrides = await getAllLiveSettings();
-
-      // Merge overrides with schema to give dashboard full picture
       const settings = {};
+
       for (const [key, schema] of Object.entries(LIVE_SETTINGS_SCHEMA)) {
-        const hasOverride = key in overrides && overrides[key] !== null && overrides[key] !== undefined;
+        const hasOverride = key in overrides &&
+          overrides[key] !== null &&
+          overrides[key] !== undefined;
+
         settings[key] = {
           ...schema,
           currentValue: hasOverride ? Number(overrides[key]) : schema.default,
@@ -734,7 +724,6 @@ export function createApiHandler(deps) {
         };
       }
 
-      // Also include active risk manager params for real-time accuracy
       const riskStatus = riskManager.getStatus();
 
       json(res, {
@@ -749,14 +738,6 @@ export function createApiHandler(deps) {
     }
   }
 
-  /**
-   * POST /api/live-settings
-   * Set or reset a single live parameter.
-   *
-   * Body: { key: string, value: number }         — set override
-   *       { key: string, reset: true }           — clear override, revert to .env
-   *       { resetAll: true }                     — clear all overrides
-   */
   async function handleLiveSettingsSet(req, res) {
     if (!checkAuth(req, res)) return;
 
@@ -779,7 +760,6 @@ export function createApiHandler(deps) {
 
       const { key, value, reset } = body;
 
-      // Validate key exists in schema
       if (!key || !(key in LIVE_SETTINGS_SCHEMA)) {
         return json(res, {
           error: `Unknown setting key: "${key}"`,
@@ -808,78 +788,110 @@ export function createApiHandler(deps) {
         }, 400);
       }
 
-      // ── RSI sanity guard ───────────────────────────────────────────────────
-      // Prevent oversold >= overbought being set via API
+      // ── Cross-param guards ─────────────────────────────────────────────────
+
+      // RSI: oversold < overbought
       if (key === 'RSI_OVERSOLD') {
-        const currentOverbought = await (getLiveSetting?.('RSI_OVERBOUGHT', 70) ?? 70);
-        if (numValue >= currentOverbought) {
+        const ob = getLiveSetting ? await getLiveSetting('RSI_OVERBOUGHT', 70) : 70;
+        if (numValue >= ob) {
           return json(res, {
-            error: `RSI_OVERSOLD (${numValue}) must be less than RSI_OVERBOUGHT (${currentOverbought})`,
+            error: `RSI_OVERSOLD (${numValue}) must be less than RSI_OVERBOUGHT (${ob})`,
           }, 400);
         }
       }
       if (key === 'RSI_OVERBOUGHT') {
-        const currentOversold = await (getLiveSetting?.('RSI_OVERSOLD', 30) ?? 30);
-        if (numValue <= currentOversold) {
+        const os = getLiveSetting ? await getLiveSetting('RSI_OVERSOLD', 30) : 30;
+        if (numValue <= os) {
           return json(res, {
-            error: `RSI_OVERBOUGHT (${numValue}) must be greater than RSI_OVERSOLD (${currentOversold})`,
+            error: `RSI_OVERBOUGHT (${numValue}) must be greater than RSI_OVERSOLD (${os})`,
           }, 400);
         }
       }
 
-      // ── Kill switch drawdown >= daily loss guard ───────────────────────────
+      // Kill switch drawdown >= max daily loss
       if (key === 'KILL_SWITCH_DRAWDOWN_PCT') {
-        const currentMaxLoss = await (getLiveSetting?.('MAX_DAILY_LOSS_PCT', config.MAX_DAILY_LOSS_PCT) ?? config.MAX_DAILY_LOSS_PCT);
-        if (numValue < currentMaxLoss) {
+        const maxLoss = getLiveSetting
+          ? await getLiveSetting('MAX_DAILY_LOSS_PCT', config.MAX_DAILY_LOSS_PCT)
+          : config.MAX_DAILY_LOSS_PCT;
+        if (numValue < maxLoss) {
           return json(res, {
-            error: `KILL_SWITCH_DRAWDOWN_PCT (${numValue}) must be >= MAX_DAILY_LOSS_PCT (${currentMaxLoss})`,
+            error: `KILL_SWITCH_DRAWDOWN_PCT (${numValue}) must be >= MAX_DAILY_LOSS_PCT (${maxLoss})`,
           }, 400);
         }
       }
       if (key === 'MAX_DAILY_LOSS_PCT') {
-        const currentKillSwitch = await (getLiveSetting?.('KILL_SWITCH_DRAWDOWN_PCT', config.KILL_SWITCH_DRAWDOWN_PCT) ?? config.KILL_SWITCH_DRAWDOWN_PCT);
-        if (numValue > currentKillSwitch) {
+        const ks = getLiveSetting
+          ? await getLiveSetting('KILL_SWITCH_DRAWDOWN_PCT', config.KILL_SWITCH_DRAWDOWN_PCT)
+          : config.KILL_SWITCH_DRAWDOWN_PCT;
+        if (numValue > ks) {
           return json(res, {
-            error: `MAX_DAILY_LOSS_PCT (${numValue}) must be <= KILL_SWITCH_DRAWDOWN_PCT (${currentKillSwitch})`,
+            error: `MAX_DAILY_LOSS_PCT (${numValue}) must be <= KILL_SWITCH_DRAWDOWN_PCT (${ks})`,
+          }, 400);
+        }
+      }
+
+      // Stop loss < trailing stop (otherwise trailing never triggers before hard stop)
+      if (key === 'STOP_LOSS_PCT') {
+        const trail = getLiveSetting
+          ? await getLiveSetting('TRAILING_STOP_PCT', config.TRAILING_STOP_PCT ?? 1.5)
+          : (config.TRAILING_STOP_PCT ?? 1.5);
+        if (numValue >= trail) {
+          return json(res, {
+            error: `STOP_LOSS_PCT (${numValue}) must be less than TRAILING_STOP_PCT (${trail})`,
+          }, 400);
+        }
+      }
+      if (key === 'TRAILING_STOP_PCT') {
+        const stop = getLiveSetting
+          ? await getLiveSetting('STOP_LOSS_PCT', config.STOP_LOSS_PCT ?? 1.0)
+          : (config.STOP_LOSS_PCT ?? 1.0);
+        if (numValue <= stop) {
+          return json(res, {
+            error: `TRAILING_STOP_PCT (${numValue}) must be greater than STOP_LOSS_PCT (${stop})`,
+          }, 400);
+        }
+      }
+
+      if (key === 'PARTIAL_EXIT_PCT') {
+        if (numValue >= 100) {
+          return json(res, {
+            error: `PARTIAL_EXIT_PCT (${numValue}) must be less than 100 — use PROFIT_TARGET for full exits`,
+          }, 400);
+        }
+      }
+
+      if (key === 'RISK_REWARD_RATIO') {
+        const stopPct = getLiveSetting
+          ? await getLiveSetting('STOP_LOSS_PCT', config.STOP_LOSS_PCT ?? 1.0)
+          : (config.STOP_LOSS_PCT ?? 1.0);
+        if (numValue < 1) {
+          return json(res, {
+            error: `RISK_REWARD_RATIO (${numValue}) must be >= 1 (target must be at least as large as the stop)`,
           }, 400);
         }
       }
 
       // ── Apply ──────────────────────────────────────────────────────────────
       await setLiveSetting(key, numValue);
-
       log.info({ key, value: numValue, label: schema.label }, '⚙️  Live setting updated');
 
-      // Notify via Telegram if available
       if (telegram?.enabled) {
         telegram.sendRaw(
           `⚙️ <b>Parameter Updated</b>\n\n` +
           `<b>${schema.label}</b>\n` +
-          `Old: <code>${schema.default}</code> → New: <code>${numValue}</code>\n` +
-          `<i>${schema.description}</i>\n` +
+          `New value: <code>${numValue}</code>  (default: <code>${schema.default}</code>)\n` +
+          `<i>${schema.description}</i>\n\n` +
           `Takes effect on next scan cycle.`
         ).catch(() => { });
       }
 
-      json(res, {
-        success: true,
-        action: 'set',
-        key,
-        value: numValue,
-        label: schema.label,
-      });
+      json(res, { success: true, action: 'set', key, value: numValue, label: schema.label });
     } catch (err) {
       log.error({ err }, 'Error in POST /api/live-settings');
       json(res, { error: err.message }, 500);
     }
   }
 
-  /**
-   * GET /api/live-settings/schema
-   * Returns the full schema of all settable params with defaults,
-   * ranges, descriptions and categories. Used by dashboard to build
-   * the settings UI dynamically without hardcoding anything client-side.
-   */
   async function handleLiveSettingsSchema(req, res) {
     try {
       json(res, {
@@ -890,6 +902,7 @@ export function createApiHandler(deps) {
           rsi: 'RSI Mean Reversion Strategy',
           vwap: 'VWAP Momentum Strategy',
           breakout: 'Breakout Volume Strategy',
+          exits: 'Exit Strategies',
         },
       });
     } catch (err) {
@@ -903,7 +916,6 @@ export function createApiHandler(deps) {
   // ═══════════════════════════════════════════════════════
 
   return async function handleRequest(req, res) {
-    // CORS preflight
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
@@ -916,48 +928,31 @@ export function createApiHandler(deps) {
     const url = req.url.split('?')[0];
 
     try {
-      // GET routes
       if (req.method === 'GET') {
         switch (url) {
           case '/health':
-          case '/api/health':
-            return handleHealth(req, res);
-          case '/api/summary':
-            return handleSummary(req, res);
-          case '/api/positions':
-            return handlePositions(req, res);
-          case '/api/trades':
-            return handleTrades(req, res);
-          case '/api/strategies/performance':
-            return handleStrategiesPerformance(req, res);
-          case '/api/strategies/signals':
-            return handleStrategiesSignals(req, res);
-          case '/api/settings':
-            return handleSettingsGet(req, res);
-          case '/api/holdings':
-            return handleHoldings(req, res);
-          case '/api/live-settings':
-            return handleLiveSettingsGet(req, res);
-          case '/api/live-settings/schema':
-            return handleLiveSettingsSchema(req, res);
+          case '/api/health': return handleHealth(req, res);
+          case '/api/summary': return handleSummary(req, res);
+          case '/api/positions': return handlePositions(req, res);
+          case '/api/trades': return handleTrades(req, res);
+          case '/api/strategies/performance': return handleStrategiesPerformance(req, res);
+          case '/api/strategies/signals': return handleStrategiesSignals(req, res);
+          case '/api/settings': return handleSettingsGet(req, res);
+          case '/api/holdings': return handleHoldings(req, res);
+          case '/api/live-settings': return handleLiveSettingsGet(req, res);
+          case '/api/live-settings/schema': return handleLiveSettingsSchema(req, res);
         }
       }
 
-      // POST routes
       if (req.method === 'POST') {
         switch (url) {
-          case '/api/killswitch':
-            return handleKillSwitch(req, res);
-          case '/api/settings/mode':
-            return handleSettingsMode(req, res);
-          case '/api/settings/watchlist':
-            return handleSettingsWatchlist(req, res);
-          case '/api/live-settings':
-            return handleLiveSettingsSet(req, res);
+          case '/api/killswitch': return handleKillSwitch(req, res);
+          case '/api/settings/mode': return handleSettingsMode(req, res);
+          case '/api/settings/watchlist': return handleSettingsWatchlist(req, res);
+          case '/api/live-settings': return handleLiveSettingsSet(req, res);
         }
       }
 
-      // 404
       json(res, { error: 'Not found' }, 404);
     } catch (err) {
       log.error({ err, url }, 'Unhandled API error');

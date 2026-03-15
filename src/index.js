@@ -29,7 +29,7 @@ import { PositionStats } from './risk/position-stats.js';
 import { HoldingsManager } from './data/holdings.js';
 import { IntradayDecayManager } from './intelligence/intraday-decay.js';
 import { PositionManager } from './risk/position-manager.js';
-import { getAllLiveSettings, resetLiveSetting, setLiveSetting } from './lib/settings-store.js';
+import { getAllLiveSettings, getLiveSetting, resetLiveSetting, setLiveSetting } from './lib/settings-store.js';
 import { decryptToken } from './lib/crypto-utils.js';
 
 const log = createLogger('main');
@@ -371,7 +371,12 @@ async function main() {
   // Must be initialized AFTER engine.hydratePositions() because it references
   // engine._filledPositions directly. Requires broker for LTP price fetching.
   const positionManager = config.POSITION_MGMT_ENABLED
-    ? new PositionManager({ engine, broker, config })
+    ? new PositionManager({
+      engine,
+      broker,
+      config,
+      getLiveSetting: redisHealthy ? getLiveSetting : null,  // ← add this
+    })
     : null;
 
   if (positionManager) {
@@ -385,6 +390,9 @@ async function main() {
       `   Trailing stop:  ${config.TRAILING_STOP_PCT}% below peak\n` +
       `   Max hold:       ${config.MAX_HOLD_MINUTES} minutes (flat/losing positions only)`
     );
+    engine.positionManager = positionManager;
+    engine._fetchCandles = (symbol, limit) => historicalData.fetchRecentCandles(symbol, '5minute', limit);
+
   } else {
     log.warn('⚠️  Position manager: DISABLED (POSITION_MGMT_ENABLED=false)');
   }
@@ -903,6 +911,10 @@ async function main() {
   const { createServer } = await import('node:http');
   const apiHandler = createApiHandler({
     killSwitch, riskManager, engine, config, broker, telegram, scout, holdingsManager,
+    getLiveSetting: redisHealthy ? getLiveSetting : null,
+    setLiveSetting: redisHealthy ? setLiveSetting : null,
+    getAllLiveSettings: redisHealthy ? getAllLiveSettings : null,
+    resetLiveSetting: redisHealthy ? resetLiveSetting : null,
   });
 
   const apiServer = createServer(apiHandler);

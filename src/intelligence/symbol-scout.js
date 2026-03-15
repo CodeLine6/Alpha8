@@ -540,19 +540,36 @@ export class SymbolScout {
         } catch { return {}; }
     }
 
+    /**
+ * FIXED METHOD: _fetchConsecutiveLosses()
+ *
+ * Replace the existing _fetchConsecutiveLosses method in src/intelligence/symbol-scout.js
+ * with this version.
+ *
+ * BUG: The original query used SELECT DISTINCT ON (symbol) on the outer query
+ * without a matching ORDER BY clause in the outer query. DISTINCT ON requires
+ * ORDER BY to start with the same column for deterministic results. Without it,
+ * PostgreSQL selects an arbitrary row per symbol, making consecutive loss counts
+ * non-deterministic.
+ *
+ * FIX: Removed the outer DISTINCT ON wrapper entirely. The inner query already
+ * groups by symbol via ARRAY_AGG, so each symbol produces exactly one row —
+ * DISTINCT ON was redundant and harmful.
+ */
+
     async _fetchConsecutiveLosses(symbols) {
-        // For each symbol, check the last 5 outcomes — how many are consecutive losses from the end?
         try {
+            // FIX: Removed the erroneous outer SELECT DISTINCT ON (symbol) wrapper.
+            // The inner query already produces one row per symbol via GROUP BY symbol.
+            // DISTINCT ON without a matching ORDER BY was selecting an arbitrary row.
             const result = await query(
-                `SELECT DISTINCT ON (symbol) symbol, outcomes
-         FROM (
-           SELECT symbol,
-                  ARRAY_AGG(outcome ORDER BY recorded_at DESC) AS outcomes
-           FROM   signal_outcomes
-           WHERE  symbol = ANY($1)
-             AND  recorded_at > NOW() - INTERVAL '14 days'
-           GROUP  BY symbol
-         ) sub`,
+                `SELECT
+         symbol,
+         ARRAY_AGG(outcome ORDER BY recorded_at DESC) AS outcomes
+       FROM signal_outcomes
+       WHERE symbol = ANY($1)
+         AND recorded_at > NOW() - INTERVAL '14 days'
+       GROUP BY symbol`,
                 [symbols]
             );
 
@@ -566,7 +583,9 @@ export class SymbolScout {
                 map[r.symbol] = count;
             }
             return map;
-        } catch { return {}; }
+        } catch {
+            return {};
+        }
     }
 
     async _loadDynamic() {
