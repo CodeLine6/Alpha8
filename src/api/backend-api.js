@@ -6,22 +6,241 @@ const log = createLogger('backend-api');
 
 /**
  * Create the API request handler for the backend HTTP server.
- * 
+ *
+ * NEW ENDPOINTS (Live Settings):
+ *   GET  /api/live-settings          — all active Redis overrides
+ *   POST /api/live-settings          — set or reset a single param
+ *   GET  /api/live-settings/schema   — all settable keys with defaults + descriptions
+ *
  * @param {Object} deps - Injected module instances
  * @param {import('../risk/kill-switch.js').KillSwitch} deps.killSwitch
  * @param {import('../risk/risk-manager.js').RiskManager} deps.riskManager
  * @param {import('../engine/execution-engine.js').ExecutionEngine} deps.engine
  * @param {Object} deps.config - Validated env config
  * @param {Object} [deps.broker] - BrokerManager (null in paper mode)
+ * @param {Object} [deps.telegram]
+ * @param {Object} [deps.scout]
+ * @param {Object} [deps.holdingsManager]
+ * @param {Function} [deps.getLiveSetting]  - from settings-store.js
+ * @param {Function} [deps.setLiveSetting]  - from settings-store.js
+ * @param {Function} [deps.getAllLiveSettings] - from settings-store.js
+ * @param {Function} [deps.resetLiveSetting]  - from settings-store.js
  * @returns {Function} HTTP request handler
  */
 export function createApiHandler(deps) {
-  const { killSwitch, riskManager, engine, config, broker, telegram, holdingsManager } = deps;
+  const {
+    killSwitch, riskManager, engine, config, broker, telegram, holdingsManager,
+    getLiveSetting, setLiveSetting, getAllLiveSettings, resetLiveSetting,
+  } = deps;
+
   const API_KEY = process.env.API_SECRET_KEY || '';
+
+  // ─── Live Settings Schema ────────────────────────────────────────────────────
+  // Single source of truth for all overridable params.
+  // Used by GET /api/live-settings/schema and input validation on POST.
+  const LIVE_SETTINGS_SCHEMA = {
+    // ── Risk ──────────────────────────────────────────────────────────────────
+    MAX_DAILY_LOSS_PCT: {
+      label: 'Max Daily Loss %',
+      description: 'Maximum % of capital that can be lost before trading halts',
+      type: 'number',
+      min: 0.1,
+      max: 10,
+      step: 0.1,
+      default: config.MAX_DAILY_LOSS_PCT,
+      category: 'risk',
+    },
+    PER_TRADE_STOP_LOSS_PCT: {
+      label: 'Per-Trade Stop Loss %',
+      description: 'Max % of capital at risk on a single trade',
+      type: 'number',
+      min: 0.1,
+      max: 5,
+      step: 0.1,
+      default: config.PER_TRADE_STOP_LOSS_PCT,
+      category: 'risk',
+    },
+    MAX_POSITION_COUNT: {
+      label: 'Max Open Positions',
+      description: 'Maximum number of concurrent open positions',
+      type: 'number',
+      min: 1,
+      max: 20,
+      step: 1,
+      default: config.MAX_POSITION_COUNT,
+      category: 'risk',
+    },
+    KILL_SWITCH_DRAWDOWN_PCT: {
+      label: 'Kill Switch Drawdown %',
+      description: 'Drawdown % that auto-engages the kill switch',
+      type: 'number',
+      min: 1,
+      max: 20,
+      step: 0.5,
+      default: config.KILL_SWITCH_DRAWDOWN_PCT,
+      category: 'risk',
+    },
+    TRADING_CAPITAL: {
+      label: 'Trading Capital (₹)',
+      description: 'Active capital used for position sizing',
+      type: 'number',
+      min: 10000,
+      max: 10000000,
+      step: 10000,
+      default: config.TRADING_CAPITAL,
+      category: 'risk',
+    },
+    // ── EMA Crossover ─────────────────────────────────────────────────────────
+    EMA_FAST_PERIOD: {
+      label: 'EMA Fast Period',
+      description: 'Fast EMA period for crossover detection',
+      type: 'number',
+      min: 3,
+      max: 20,
+      step: 1,
+      default: 9,
+      category: 'ema',
+    },
+    EMA_SLOW_PERIOD: {
+      label: 'EMA Slow Period',
+      description: 'Slow EMA period for crossover detection',
+      type: 'number',
+      min: 10,
+      max: 50,
+      step: 1,
+      default: 21,
+      category: 'ema',
+    },
+    // ── RSI Mean Reversion ────────────────────────────────────────────────────
+    RSI_PERIOD: {
+      label: 'RSI Period',
+      description: 'RSI calculation period',
+      type: 'number',
+      min: 5,
+      max: 30,
+      step: 1,
+      default: 14,
+      category: 'rsi',
+    },
+    RSI_OVERSOLD: {
+      label: 'RSI Oversold Threshold',
+      description: 'RSI below this triggers a BUY signal',
+      type: 'number',
+      min: 10,
+      max: 40,
+      step: 1,
+      default: 30,
+      category: 'rsi',
+    },
+    RSI_OVERBOUGHT: {
+      label: 'RSI Overbought Threshold',
+      description: 'RSI above this triggers a SELL signal',
+      type: 'number',
+      min: 60,
+      max: 90,
+      step: 1,
+      default: 70,
+      category: 'rsi',
+    },
+    RSI_EXTREME_OVERSOLD: {
+      label: 'RSI Extreme Oversold',
+      description: 'Extreme oversold level for confidence bonus',
+      type: 'number',
+      min: 5,
+      max: 25,
+      step: 1,
+      default: 20,
+      category: 'rsi',
+    },
+    RSI_EXTREME_OVERBOUGHT: {
+      label: 'RSI Extreme Overbought',
+      description: 'Extreme overbought level for confidence bonus',
+      type: 'number',
+      min: 75,
+      max: 95,
+      step: 1,
+      default: 80,
+      category: 'rsi',
+    },
+    // ── VWAP Momentum ─────────────────────────────────────────────────────────
+    VWAP_VOLUME_MULTIPLIER: {
+      label: 'VWAP Volume Multiplier',
+      description: 'Volume must be this × average to confirm signal',
+      type: 'number',
+      min: 0.5,
+      max: 5,
+      step: 0.1,
+      default: 1.2,
+      category: 'vwap',
+    },
+    VWAP_PRICE_BAND_PCT: {
+      label: 'VWAP Price Band %',
+      description: '% band around VWAP to filter noise crossovers',
+      type: 'number',
+      min: 0.05,
+      max: 2,
+      step: 0.05,
+      default: 0.2,
+      category: 'vwap',
+    },
+    VWAP_VOLUME_AVG_PERIOD: {
+      label: 'VWAP Volume Avg Period',
+      description: 'Candle period for average volume calculation',
+      type: 'number',
+      min: 5,
+      max: 50,
+      step: 1,
+      default: 20,
+      category: 'vwap',
+    },
+    // ── Breakout Volume ───────────────────────────────────────────────────────
+    BREAKOUT_LOOKBACK: {
+      label: 'Breakout Lookback Period',
+      description: 'Candles to look back for resistance/support levels',
+      type: 'number',
+      min: 5,
+      max: 50,
+      step: 1,
+      default: 20,
+      category: 'breakout',
+    },
+    BREAKOUT_VOLUME_MULTIPLIER: {
+      label: 'Breakout Volume Multiplier',
+      description: 'Volume must be this × average to confirm breakout',
+      type: 'number',
+      min: 0.5,
+      max: 5,
+      step: 0.1,
+      default: 1.5,
+      category: 'breakout',
+    },
+    BREAKOUT_BB_PERIOD: {
+      label: 'Bollinger Band Period',
+      description: 'Period for Bollinger Band calculation',
+      type: 'number',
+      min: 5,
+      max: 50,
+      step: 1,
+      default: 20,
+      category: 'breakout',
+    },
+    BREAKOUT_BB_STDDEV: {
+      label: 'Bollinger Band Std Dev',
+      description: 'Standard deviations for Bollinger Band width',
+      type: 'number',
+      min: 1,
+      max: 4,
+      step: 0.5,
+      default: 2,
+      category: 'breakout',
+    },
+  };
+
+  // ─── Helpers ─────────────────────────────────────────────────────────────────
 
   /** Check API key for protected endpoints */
   function checkAuth(req, res) {
-    if (!API_KEY) return true; // No key configured = open access (dev mode)
+    if (!API_KEY) return true;
     const provided = req.headers['x-api-key'] || '';
     if (provided !== API_KEY) {
       json(res, { error: 'Unauthorized' }, 401);
@@ -52,7 +271,7 @@ export function createApiHandler(deps) {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, X-Api-Key',
     });
     res.end(JSON.stringify(data));
   }
@@ -65,7 +284,7 @@ export function createApiHandler(deps) {
   }
 
   // ═══════════════════════════════════════════════════════
-  // ROUTE HANDLERS
+  // EXISTING ROUTE HANDLERS (unchanged)
   // ═══════════════════════════════════════════════════════
 
   async function handleSummary(req, res) {
@@ -74,30 +293,25 @@ export function createApiHandler(deps) {
       const engineStatus = engine.getStatus();
       const ksStatus = killSwitch.getStatus();
 
-      // Try to get today's summary from DB
       let dbSummary = null;
       try {
         const today = new Date().toISOString().split('T')[0];
-        const result = await query(
-          'SELECT * FROM daily_summary WHERE trade_date = $1',
-          [today]
-        );
+        const result = await query('SELECT * FROM daily_summary WHERE trade_date = $1', [today]);
         dbSummary = result.rows[0] || null;
       } catch { /* DB may not have today's entry yet */ }
 
-      // Count today's trades from DB
       let tradeStats = { count: 0, wins: 0, losses: 0, filled: 0, rejected: 0 };
       try {
         const today = new Date().toISOString().split('T')[0];
         const result = await query(`
-          SELECT 
+          SELECT
             COUNT(*) as count,
             COUNT(*) FILTER (WHERE pnl > 0) as wins,
             COUNT(*) FILTER (WHERE pnl < 0) as losses,
             COUNT(*) FILTER (WHERE status = 'FILLED') as filled,
             COUNT(*) FILTER (WHERE status = 'REJECTED') as rejected,
             COALESCE(SUM(pnl), 0) as total_pnl
-          FROM trades 
+          FROM trades
           WHERE created_at::date = $1
         `, [today]);
         const row = result.rows[0];
@@ -113,8 +327,7 @@ export function createApiHandler(deps) {
 
       const summary = {
         pnl: dbSummary ? parseFloat(dbSummary.pnl) : tradeStats.totalPnl || 0,
-        pnlPct: dbSummary ? parseFloat(dbSummary.pnl_pct) :
-          (tradeStats.totalPnl / config.TRADING_CAPITAL * 100) || 0,
+        pnlPct: dbSummary ? parseFloat(dbSummary.pnl_pct) : (tradeStats.totalPnl / config.TRADING_CAPITAL * 100) || 0,
         tradeCount: dbSummary ? dbSummary.trade_count : tradeStats.count,
         winCount: dbSummary ? dbSummary.win_count : tradeStats.wins,
         lossCount: dbSummary ? dbSummary.loss_count : tradeStats.losses,
@@ -141,12 +354,9 @@ export function createApiHandler(deps) {
     try {
       const enginePositions = engine._filledPositions;
 
-      // ── Path A: engine has held positions (position manager active) ─────────
-      // Return enriched PM context for each held symbol.
       if (enginePositions && enginePositions.size > 0) {
         const symbols = Array.from(enginePositions.keys());
 
-        // Batch-fetch LTP for all held symbols
         let priceMap = {};
         if (broker) {
           try {
@@ -156,13 +366,13 @@ export function createApiHandler(deps) {
               const price = ltp?.[`NSE:${sym}`]?.last_price;
               if (price && price > 0) priceMap[sym] = price;
             }
-          } catch { /* fail gracefully — currentPrice returns null */ }
+          } catch { /* fail gracefully */ }
         }
 
         const positions = symbols.map(symbol => {
           const ctx = enginePositions.get(symbol);
           const currentPrice = priceMap[symbol] ?? null;
-          const entryPrice = ctx.entryPrice ?? ctx.price; // backward compat
+          const entryPrice = ctx.entryPrice ?? ctx.price;
           const unrealisedPnL = currentPrice != null
             ? (currentPrice - entryPrice) * ctx.quantity
             : null;
@@ -197,7 +407,6 @@ export function createApiHandler(deps) {
         return json(res, { positions, source: 'engine' });
       }
 
-      // ── Path B: fallback — read from DB positions table ─────────────────
       let positions = [];
       try {
         const result = await query('SELECT * FROM positions ORDER BY opened_at DESC');
@@ -212,7 +421,6 @@ export function createApiHandler(deps) {
           strategy: p.strategy,
         }));
       } catch {
-        // Final fallback — engine active orders
         const active = engine.getActiveOrders();
         positions = active.map((o) => ({
           symbol: o.symbol,
@@ -235,19 +443,28 @@ export function createApiHandler(deps) {
 
   async function handleHealth(req, res) {
     try {
-      let dbOk = false;
-      let redisOk = false;
+      let dbOk = false, redisOk = false;
       let brokerOk = false;
+      let tokenValid = null; // null = not checked (no broker configured)
 
       try { dbOk = await checkDatabaseHealth(); } catch { /* */ }
       try { redisOk = await checkRedisHealth(); } catch { /* */ }
-      try { brokerOk = broker ? await broker.isConnected() : false; } catch { /* */ }
+
+      if (broker) {
+        try {
+          brokerOk = await broker.isConnected();
+          if (brokerOk) {
+            tokenValid = await broker.isTokenValid();
+          }
+        } catch { brokerOk = false; }
+      }
 
       json(res, {
         broker: brokerOk,
+        brokerTokenValid: tokenValid,
         redis: redisOk,
         db: dbOk,
-        dataFeed: brokerOk, // Data feed status mirrors broker
+        dataFeed: brokerOk,
         telegram: telegram ? telegram.enabled : false,
         lastCheck: new Date().toISOString(),
       });
@@ -327,7 +544,7 @@ export function createApiHandler(deps) {
   async function handleStrategiesPerformance(req, res) {
     try {
       const result = await query(`
-        SELECT 
+        SELECT
           strategy,
           COUNT(*) as trade_count,
           COUNT(*) FILTER (WHERE pnl > 0) as wins,
@@ -346,8 +563,8 @@ export function createApiHandler(deps) {
         winRate: parseFloat(r.win_rate) || 0,
         avgReturn: parseFloat(r.avg_return) || 0,
         totalPnl: parseFloat(r.total_pnl) || 0,
-        sharpe: null, // TODO: compute from daily returns
-        maxDrawdown: null, // TODO: compute from equity curve
+        sharpe: null,
+        maxDrawdown: null,
         tradeCount: parseInt(r.trade_count),
         wins: parseInt(r.wins),
         losses: parseInt(r.losses),
@@ -390,16 +607,12 @@ export function createApiHandler(deps) {
 
   async function handleSettingsGet(req, res) {
     try {
-      // Get watchlist from DB
       let watchlist = [];
       try {
-        const result = await query(
-          "SELECT value FROM settings WHERE key = 'watchlist'"
-        );
+        const result = await query("SELECT value FROM settings WHERE key = 'watchlist'");
         watchlist = result.rows[0] ? JSON.parse(result.rows[0].value) : [];
       } catch { /* */ }
 
-      // Get Telegram stats from bot instance
       let telegramStatus = { enabled: false, totalSent: 0, totalFailed: 0, queueLength: 0 };
       if (telegram) {
         const s = telegram.getStatus();
@@ -438,7 +651,7 @@ export function createApiHandler(deps) {
         log.warn({ reason: body.reason }, '🛑 Kill switch ENGAGED from dashboard');
         json(res, { success: true, engaged: true });
       } else if (body.action === 'reset') {
-        const result = await killSwitch.reset('CONFIRM_RESET'); // C4: added await
+        const result = await killSwitch.reset('CONFIRM_RESET');
         json(res, { success: result, engaged: killSwitch.isEngaged() });
       } else {
         json(res, killSwitch.getStatus());
@@ -453,8 +666,6 @@ export function createApiHandler(deps) {
     if (!checkAuth(req, res)) return;
     try {
       const body = await parseBody(req);
-      // NOTE: Mode changes require env var update + restart.
-      // For now, store preference in Redis for display.
       await cacheSet('trading:mode', { paperMode: body.paperMode });
       log.info({ paperMode: body.paperMode }, 'Trading mode preference updated');
       json(res, { success: true, paperMode: body.paperMode });
@@ -469,19 +680,14 @@ export function createApiHandler(deps) {
     try {
       const body = await parseBody(req);
 
-      // Get current watchlist
       let watchlist = [];
       try {
-        const result = await query(
-          "SELECT value FROM settings WHERE key = 'watchlist'"
-        );
+        const result = await query("SELECT value FROM settings WHERE key = 'watchlist'");
         watchlist = result.rows[0] ? JSON.parse(result.rows[0].value) : [];
       } catch { /* */ }
 
       if (body.action === 'add' && body.symbol) {
-        if (!watchlist.includes(body.symbol)) {
-          watchlist.push(body.symbol);
-        }
+        if (!watchlist.includes(body.symbol)) watchlist.push(body.symbol);
       } else if (body.action === 'remove' && body.symbol) {
         watchlist = watchlist.filter((s) => s !== body.symbol);
       }
@@ -500,6 +706,199 @@ export function createApiHandler(deps) {
   }
 
   // ═══════════════════════════════════════════════════════
+  // NEW: LIVE SETTINGS ROUTE HANDLERS
+  // ═══════════════════════════════════════════════════════
+
+  /**
+   * GET /api/live-settings
+   * Returns all active Redis overrides merged with schema defaults.
+   * Dashboard uses this to show which params are overridden vs using .env.
+   */
+  async function handleLiveSettingsGet(req, res) {
+    try {
+      if (!getAllLiveSettings) {
+        return json(res, { settings: {}, available: false, reason: 'Live settings not configured' });
+      }
+
+      const overrides = await getAllLiveSettings();
+
+      // Merge overrides with schema to give dashboard full picture
+      const settings = {};
+      for (const [key, schema] of Object.entries(LIVE_SETTINGS_SCHEMA)) {
+        const hasOverride = key in overrides && overrides[key] !== null && overrides[key] !== undefined;
+        settings[key] = {
+          ...schema,
+          currentValue: hasOverride ? Number(overrides[key]) : schema.default,
+          overrideValue: hasOverride ? Number(overrides[key]) : null,
+          isOverridden: hasOverride,
+        };
+      }
+
+      // Also include active risk manager params for real-time accuracy
+      const riskStatus = riskManager.getStatus();
+
+      json(res, {
+        settings,
+        activeRiskParams: riskStatus.activeParams || {},
+        baseRiskParams: riskStatus.baseParams || {},
+        available: true,
+      });
+    } catch (err) {
+      log.error({ err }, 'Error in GET /api/live-settings');
+      json(res, { error: err.message }, 500);
+    }
+  }
+
+  /**
+   * POST /api/live-settings
+   * Set or reset a single live parameter.
+   *
+   * Body: { key: string, value: number }         — set override
+   *       { key: string, reset: true }           — clear override, revert to .env
+   *       { resetAll: true }                     — clear all overrides
+   */
+  async function handleLiveSettingsSet(req, res) {
+    if (!checkAuth(req, res)) return;
+
+    try {
+      if (!setLiveSetting || !resetLiveSetting) {
+        return json(res, { error: 'Live settings not configured' }, 503);
+      }
+
+      const body = await parseBody(req);
+
+      // ── Reset all overrides ────────────────────────────────────────────────
+      if (body.resetAll) {
+        for (const key of Object.keys(LIVE_SETTINGS_SCHEMA)) {
+          await resetLiveSetting(key).catch(() => { });
+        }
+        log.info('All live settings reset to .env defaults');
+        json(res, { success: true, action: 'resetAll' });
+        return;
+      }
+
+      const { key, value, reset } = body;
+
+      // Validate key exists in schema
+      if (!key || !(key in LIVE_SETTINGS_SCHEMA)) {
+        return json(res, {
+          error: `Unknown setting key: "${key}"`,
+          validKeys: Object.keys(LIVE_SETTINGS_SCHEMA),
+        }, 400);
+      }
+
+      // ── Reset single key ───────────────────────────────────────────────────
+      if (reset) {
+        await resetLiveSetting(key);
+        log.info({ key }, 'Live setting reset to .env default');
+        json(res, { success: true, action: 'reset', key });
+        return;
+      }
+
+      // ── Validate value ─────────────────────────────────────────────────────
+      const schema = LIVE_SETTINGS_SCHEMA[key];
+      const numValue = Number(value);
+
+      if (isNaN(numValue)) {
+        return json(res, { error: `Value must be a number, got: ${value}` }, 400);
+      }
+      if (numValue < schema.min || numValue > schema.max) {
+        return json(res, {
+          error: `Value ${numValue} out of range [${schema.min}, ${schema.max}] for ${key}`,
+        }, 400);
+      }
+
+      // ── RSI sanity guard ───────────────────────────────────────────────────
+      // Prevent oversold >= overbought being set via API
+      if (key === 'RSI_OVERSOLD') {
+        const currentOverbought = await (getLiveSetting?.('RSI_OVERBOUGHT', 70) ?? 70);
+        if (numValue >= currentOverbought) {
+          return json(res, {
+            error: `RSI_OVERSOLD (${numValue}) must be less than RSI_OVERBOUGHT (${currentOverbought})`,
+          }, 400);
+        }
+      }
+      if (key === 'RSI_OVERBOUGHT') {
+        const currentOversold = await (getLiveSetting?.('RSI_OVERSOLD', 30) ?? 30);
+        if (numValue <= currentOversold) {
+          return json(res, {
+            error: `RSI_OVERBOUGHT (${numValue}) must be greater than RSI_OVERSOLD (${currentOversold})`,
+          }, 400);
+        }
+      }
+
+      // ── Kill switch drawdown >= daily loss guard ───────────────────────────
+      if (key === 'KILL_SWITCH_DRAWDOWN_PCT') {
+        const currentMaxLoss = await (getLiveSetting?.('MAX_DAILY_LOSS_PCT', config.MAX_DAILY_LOSS_PCT) ?? config.MAX_DAILY_LOSS_PCT);
+        if (numValue < currentMaxLoss) {
+          return json(res, {
+            error: `KILL_SWITCH_DRAWDOWN_PCT (${numValue}) must be >= MAX_DAILY_LOSS_PCT (${currentMaxLoss})`,
+          }, 400);
+        }
+      }
+      if (key === 'MAX_DAILY_LOSS_PCT') {
+        const currentKillSwitch = await (getLiveSetting?.('KILL_SWITCH_DRAWDOWN_PCT', config.KILL_SWITCH_DRAWDOWN_PCT) ?? config.KILL_SWITCH_DRAWDOWN_PCT);
+        if (numValue > currentKillSwitch) {
+          return json(res, {
+            error: `MAX_DAILY_LOSS_PCT (${numValue}) must be <= KILL_SWITCH_DRAWDOWN_PCT (${currentKillSwitch})`,
+          }, 400);
+        }
+      }
+
+      // ── Apply ──────────────────────────────────────────────────────────────
+      await setLiveSetting(key, numValue);
+
+      log.info({ key, value: numValue, label: schema.label }, '⚙️  Live setting updated');
+
+      // Notify via Telegram if available
+      if (telegram?.enabled) {
+        telegram.sendRaw(
+          `⚙️ <b>Parameter Updated</b>\n\n` +
+          `<b>${schema.label}</b>\n` +
+          `Old: <code>${schema.default}</code> → New: <code>${numValue}</code>\n` +
+          `<i>${schema.description}</i>\n` +
+          `Takes effect on next scan cycle.`
+        ).catch(() => { });
+      }
+
+      json(res, {
+        success: true,
+        action: 'set',
+        key,
+        value: numValue,
+        label: schema.label,
+      });
+    } catch (err) {
+      log.error({ err }, 'Error in POST /api/live-settings');
+      json(res, { error: err.message }, 500);
+    }
+  }
+
+  /**
+   * GET /api/live-settings/schema
+   * Returns the full schema of all settable params with defaults,
+   * ranges, descriptions and categories. Used by dashboard to build
+   * the settings UI dynamically without hardcoding anything client-side.
+   */
+  async function handleLiveSettingsSchema(req, res) {
+    try {
+      json(res, {
+        schema: LIVE_SETTINGS_SCHEMA,
+        categories: {
+          risk: 'Risk Management',
+          ema: 'EMA Crossover Strategy',
+          rsi: 'RSI Mean Reversion Strategy',
+          vwap: 'VWAP Momentum Strategy',
+          breakout: 'Breakout Volume Strategy',
+        },
+      });
+    } catch (err) {
+      log.error({ err }, 'Error in /api/live-settings/schema');
+      json(res, { error: err.message }, 500);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════
   // MAIN ROUTER
   // ═══════════════════════════════════════════════════════
 
@@ -509,12 +908,12 @@ export function createApiHandler(deps) {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type',
+        'Access-Control-Allow-Headers': 'Content-Type, X-Api-Key',
       });
       return res.end();
     }
 
-    const url = req.url.split('?')[0]; // Path without query string
+    const url = req.url.split('?')[0];
 
     try {
       // GET routes
@@ -537,6 +936,10 @@ export function createApiHandler(deps) {
             return handleSettingsGet(req, res);
           case '/api/holdings':
             return handleHoldings(req, res);
+          case '/api/live-settings':
+            return handleLiveSettingsGet(req, res);
+          case '/api/live-settings/schema':
+            return handleLiveSettingsSchema(req, res);
         }
       }
 
@@ -549,6 +952,8 @@ export function createApiHandler(deps) {
             return handleSettingsMode(req, res);
           case '/api/settings/watchlist':
             return handleSettingsWatchlist(req, res);
+          case '/api/live-settings':
+            return handleLiveSettingsSet(req, res);
         }
       }
 

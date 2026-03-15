@@ -199,6 +199,7 @@ function HealthWidget({ data, loading }) {
 
     const services = [
         { name: 'Broker API', key: 'broker', icon: '🔗' },
+        { name: 'Broker Token', key: 'brokerTokenValid', icon: '🔑' },
         { name: 'Redis', key: 'redis', icon: '🗄️' },
         { name: 'Database', key: 'db', icon: '💾' },
         { name: 'Data Feed', key: 'dataFeed', icon: '📡' },
@@ -221,6 +222,9 @@ function HealthWidget({ data, loading }) {
                 {services.map((service) => {
                     const status = data?.[service.key];
                     const isUp = status !== false;
+                    const dotClass = status === null ? 'dot-yellow' : status !== false ? 'dot-green' : 'dot-red';
+                    const statusText = status === null ? 'Not checked' : status !== false ? 'Valid' : 'EXPIRED';
+
                     return (
                         <div key={service.key} className="flex items-center justify-between py-2.5 px-3 rounded-lg hover:bg-[var(--bg-card-hover)] transition-colors">
                             <div className="flex items-center gap-2">
@@ -228,9 +232,9 @@ function HealthWidget({ data, loading }) {
                                 <span className="text-sm">{service.name}</span>
                             </div>
                             <div className="flex items-center gap-2">
-                                <span className={`dot ${isUp ? 'dot-green' : 'dot-red'}`} />
-                                <span className={`text-xs font-medium ${isUp ? 'text-green-400' : 'text-red-400'}`}>
-                                    {isUp ? 'Connected' : 'DOWN'}
+                                <span className={`dot ${dotClass}`} />
+                                <span className={`text-xs font-medium ${status === null ? 'text-yellow-400' : status !== false ? 'text-green-400' : 'text-red-400'}`}>
+                                    {service.key === 'brokerTokenValid' ? statusText : (isUp ? 'Connected' : 'DOWN')}
                                 </span>
                             </div>
                         </div>

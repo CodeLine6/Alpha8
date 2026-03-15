@@ -304,7 +304,7 @@ describe('VWAPMomentumStrategy', () => {
       { high: 110, low: 90, close: 100, volume: 1000 },
       { high: 115, low: 95, close: 105, volume: 2000 },
     ];
-    const vwap = strategy.calculateVWAP(candles);
+    const vwap = strategy.calculateVWAP(candles, { anchorToday: false });
 
     expect(vwap).toHaveLength(2);
     expect(vwap[0]).toBeCloseTo(100, 0); // TP1 = (110+90+100)/3 = 100

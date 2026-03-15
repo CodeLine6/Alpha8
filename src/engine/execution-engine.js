@@ -154,6 +154,7 @@ export class ExecutionEngine {
   async hydratePositions() {
     log.info('Hydrating open positions from DB...');
 
+    const isPaperMode = !this._config?.LIVE_TRADING;
     const result = await query(`
       SELECT symbol, price, quantity, strategy, created_at
       FROM (
@@ -161,12 +162,13 @@ export class ExecutionEngine {
           symbol, side, price, quantity, strategy, created_at, id
         FROM trades
         WHERE status = 'FILLED'
+          AND paper_mode = $1
           AND (created_at AT TIME ZONE 'Asia/Kolkata')::date =
               (NOW() AT TIME ZONE 'Asia/Kolkata')::date
         ORDER BY symbol, created_at DESC, id DESC
       ) AS latest_trades
       WHERE side = 'BUY'
-    `);
+    `, [isPaperMode]);
 
     this._filledPositions.clear();
 
@@ -837,11 +839,17 @@ export class ExecutionEngine {
     }
 
     try {
+      const heldSymbols = Array.from(this._filledPositions.keys());
+      const ltpKeys = heldSymbols.map(s => `NSE:${s}`);
+      const ltp = await broker.getLTP(ltpKeys);
+      // A symbol is considered closed externally if getLTP returns null/0 for it
+      // AND the broker's net positions don't contain it
       const rawPositions = await broker.getPositions();
-      const brokerPositions = (rawPositions?.net || rawPositions || []).filter(
-        (p) => (p.quantity || p.netQuantity || 0) !== 0
+      const brokerSymbols = new Set(
+        (rawPositions?.net || rawPositions || [])
+          .filter(p => (p.quantity || p.netQuantity || 0) !== 0)
+          .map(p => p.tradingsymbol || p.tradingSymbol || p.symbol)
       );
-      const brokerSymbols = new Set(brokerPositions.map(p => p.tradingsymbol || p.tradingSymbol || p.symbol));
 
       const reconciled = [];
       const stillOpen = [];
@@ -857,6 +865,13 @@ export class ExecutionEngine {
           this.markPositionClosed(symbol);
           if (this.riskManager) {
             this.riskManager.removePosition();
+          }
+          if (this.telegram?.enabled) {
+            this.telegram.sendRaw(
+              `⚠️ <b>Position Closed Externally — ${symbol}</b>\n` +
+              `Removed from engine state via reconciliation.\n` +
+              `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+            ).catch(() => {});
           }
           reconciled.push(symbol);
         } else {

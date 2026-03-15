@@ -361,6 +361,20 @@ export class BrokerManager {
     }
   }
 
+  async isTokenValid() {
+    try {
+      const profile = await this.primary.getProfile();
+      return !!(profile?.user_id || profile?.user_name);
+    } catch (err) {
+      const msg = (err.message || '').toLowerCase();
+      const isTokenError = msg.includes('token') || msg.includes('session') ||
+                           msg.includes('unauthorized') || msg.includes('403');
+      // Re-throw non-token errors so caller can distinguish API down vs token expired
+      if (!isTokenError) throw err;
+      return false;
+    }
+  }
+
   /**
    * Get combined status of both brokers for health monitoring.
    * @returns {{ primary: Object, fallback: Object | null, activeBroker: string }}

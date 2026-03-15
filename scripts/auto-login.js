@@ -84,8 +84,11 @@ async function sendTelegram(message) {
 
 // ─── Redis Helper ────────────────────────────────────────
 
+import { encryptToken } from '../src/lib/crypto-utils.js';
+
 async function storeTokenInRedis(accessToken) {
   const MAX_RETRIES = 3;
+  const valueToStore = encryptToken(accessToken);
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -102,7 +105,7 @@ async function storeTokenInRedis(accessToken) {
 
       try {
         await redis.connect();
-        await redis.set(REDIS_KEY, accessToken, 'EX', REDIS_TTL);
+        await redis.set(REDIS_KEY, valueToStore, 'EX', REDIS_TTL);
         console.log(`✅ Access token stored in Redis (key: alpha8:${REDIS_KEY}, TTL: 24h)`);
         return; // Success!
       } finally {
@@ -160,6 +163,52 @@ async function engageKillSwitch(reason) {
   } catch (err) {
     console.error('Failed to engage kill switch in Redis:', err.message);
   }
+}
+
+function classifyLoginError(err) {
+  const msg = (err.message || '').toLowerCase();
+
+  if (msg.includes('totp input field') || msg.includes('debug-totp-not-found')) {
+    return {
+      type: 'UI_CHANGED',
+      emoji: '🔧',
+      action: 'Zerodha login UI may have changed. Check selector in scripts/auto-login.js browserLogin(). Screenshot saved to scripts/debug-totp-not-found.png',
+    };
+  }
+  if (msg.includes('redirect timed out') || msg.includes('no request_token')) {
+    return {
+      type: 'UI_CHANGED',
+      emoji: '🔧',
+      action: 'Login redirect failed. Zerodha UI may have changed. Screenshot saved to scripts/debug-redirect-timeout.png',
+    };
+  }
+  if (msg.includes('invalid') && (msg.includes('totp') || msg.includes('otp'))) {
+    return {
+      type: 'BAD_CREDENTIALS',
+      emoji: '🔑',
+      action: 'TOTP is invalid. Check ZERODHA_TOTP_SECRET in .env — it may have changed.',
+    };
+  }
+  if (msg.includes('invalid') || msg.includes('incorrect') || msg.includes('wrong')) {
+    return {
+      type: 'BAD_CREDENTIALS',
+      emoji: '🔑',
+      action: 'Credentials rejected. Check ZERODHA_USER_ID and ZERODHA_PASSWORD in .env',
+    };
+  }
+  if (msg.includes('timeout') || msg.includes('econnrefused') || msg.includes('network')) {
+    return {
+      type: 'TRANSIENT',
+      emoji: '🌐',
+      action: 'Network/timeout error. Will retry automatically at next scheduled run.',
+    };
+  }
+
+  return {
+    type: 'UNKNOWN',
+    emoji: '❓',
+    action: 'Unknown failure. Check logs for full stack trace.',
+  };
 }
 
 // ─── Browser Login Flow ──────────────────────────────────
@@ -379,13 +428,17 @@ async function main() {
     // Engage kill switch
     await engageKillSwitch(`Auto-login failed: ${err.message}`);
 
+    const classification = classifyLoginError(err);
+    console.error(`[Login Failure Type: ${classification.type}] ${classification.action}`);
+
     // Telegram failure alert
     await sendTelegram(
-      `🛑 <b>Alpha8 Login FAILED</b>\n` +
-      `❌ Error: ${err.message}\n` +
-      `🕐 ${timestamp}\n\n` +
-      `⚠️ Kill switch ENGAGED — trading halted\n` +
-      `Fix credentials and run: <code>npm run login</code>`
+      `🛑 <b>Alpha8 Login FAILED</b>\n\n` +
+      `${classification.emoji} <b>Type: ${classification.type}</b>\n` +
+      `❌ Error: ${err.message}\n\n` +
+      `🔧 <b>Action required:</b>\n${classification.action}\n\n` +
+      `🕐 ${timestamp}\n` +
+      `Kill switch ENGAGED — trading halted.`
     );
 
     process.exit(1);

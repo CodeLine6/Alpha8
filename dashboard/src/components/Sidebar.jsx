@@ -7,6 +7,7 @@ const NAV_ITEMS = [
     { href: '/', label: 'Dashboard', icon: '📊' },
     { href: '/history', label: 'History', icon: '📋' },
     { href: '/strategies', label: 'Strategies', icon: '🧠' },
+    { href: '/live-params', label: 'Live Params', icon: '⚙️' },  // ← add this
     { href: '/settings', label: 'Settings', icon: '⚙️' },
 ];
 

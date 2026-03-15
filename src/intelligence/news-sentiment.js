@@ -76,14 +76,35 @@ export async function classifySentiment(symbol, headlines, apiKey) {
     const prompt = `Headlines:\n${headlineText}`;
 
     const systemInstruction =
-        `You are analyzing news headlines about a stock (Indian stock market, NSE/BSE) ` +
-        `to determine if they would positively or negatively impact the stock price TODAY.\n\n` +
-        `Respond ONLY with this exact JSON (no markdown, no preamble):\n` +
-        `{"sentiment":"POSITIVE|NEGATIVE|NEUTRAL","score":-100_to_100,"summary":"max 20 words"}\n\n` +
-        `NEGATIVE (-100 to -20): fraud, lawsuit, major loss, CEO resign, regulatory action, earnings miss\n` +
-        `POSITIVE (20 to 100): record profit, new contract, upgrade, buyback, strong results\n` +
-        `NEUTRAL (-19 to 19): routine news, analyst commentary, general market news`;
+        `You are a senior equity analyst specializing in Indian stock markets (NSE/BSE).
+Today's date: ${today}
 
+Your job: Given news headlines about ${symbol}, output a JSON sentiment score that predicts SHORT-TERM price impact within the SAME trading session.
+
+SCORING RULES:
+- Score range: -100 to +100
+- NEGATIVE (score -100 to -20): fraud allegations, SEBI action, earnings miss, promoter selling, CEO resignation, major lawsuit, credit downgrade, plant shutdown
+- NEUTRAL (score -19 to +19): routine filings, analyst initiations, general sector news, unrelated market commentary
+- POSITIVE (score +20 to +100): record quarterly profit, large order win, RBI approval, FII buying, buyback announcement, rating upgrade, major contract
+
+INDIAN MARKET CONTEXT — weight these heavily:
+- SEBI/RBI regulatory action = -80 to -100
+- Promoter pledge/sell = -40 to -70  
+- Results beat with guidance raise = +60 to +90
+- Block deal (buyer known) = +20 to +40
+
+CALIBRATION EXAMPLES:
+Headlines: ["Adani Group faces SEBI probe into related party transactions"]
+Output: {"sentiment":"NEGATIVE","score":-85,"summary":"SEBI probe creates regulatory risk"}
+
+Headlines: ["Reliance Industries Q3 profit up 18% YoY, beats estimates"]  
+Output: {"sentiment":"POSITIVE","score":72,"summary":"Strong earnings beat drives optimism"}
+
+Headlines: ["TCS to attend Goldman Sachs tech conference next week"]
+Output: {"sentiment":"NEUTRAL","score":5,"summary":"Routine investor relations activity"}
+
+OUTPUT FORMAT — respond ONLY with valid JSON, no markdown:
+{"sentiment":"POSITIVE|NEGATIVE|NEUTRAL","score":-100_to_100,"summary":"max 15 words"}`;
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
     const resp = await fetch(url, {
         method: 'POST',
@@ -165,7 +186,8 @@ export class NewsSentimentFilter {
         const result = await this._getOrFetch(symbol);
 
         if (result.sentiment === 'NEGATIVE' && result.score <= -20) {
-            await this._blockSymbol(symbol, result.summary);
+            const blockHours = result.score <= -60 ? 8 : result.score <= -40 ? 6 : 4;
+            await this._blockSymbol(symbol, result.summary, blockHours * 3600);
             return {
                 allowed: false,
                 confidenceBoost: 0,
@@ -186,49 +208,49 @@ export class NewsSentimentFilter {
 
     /** Manually unblock a symbol (e.g. from dashboard). */
     async unblock(symbol) {
-        try {
-            await this.redis.del(`${BLOCK_CACHE_PREFIX}${symbol}`);
-            this.logger(`[NewsSentimentFilter] ✅ ${symbol} manually unblocked`);
-        } catch (err) {
-            this.logger(`[NewsSentimentFilter] Failed to unblock ${symbol}: ${err.message}`);
-        }
+    try {
+        await this.redis.del(`${BLOCK_CACHE_PREFIX}${symbol}`);
+        this.logger(`[NewsSentimentFilter] ✅ ${symbol} manually unblocked`);
+    } catch (err) {
+        this.logger(`[NewsSentimentFilter] Failed to unblock ${symbol}: ${err.message}`);
     }
+}
 
     // ── Private ──────────────────────────────────────────────────────────────
 
     async _getOrFetch(symbol) {
-        const key = `${NEWS_CACHE_PREFIX}${symbol}`;
-        try {
-            const cached = await this.redis.get(key);
-            if (cached) return JSON.parse(cached);
-        } catch { /* cache miss */ }
+    const key = `${NEWS_CACHE_PREFIX}${symbol}`;
+    try {
+        const cached = await this.redis.get(key);
+        if (cached) return JSON.parse(cached);
+    } catch { /* cache miss */ }
 
-        try {
-            const headlines = await fetchNewsHeadlines(symbol);
-            const result = await classifySentiment(symbol, headlines, this.apiKey);
-            const val = { ...result, headlines, updatedAt: new Date().toISOString() };
+    try {
+        const headlines = await fetchNewsHeadlines(symbol);
+        const result = await classifySentiment(symbol, headlines, this.apiKey);
+        const val = { ...result, headlines, updatedAt: new Date().toISOString() };
 
-            await this.redis.setex(key, NEWS_CACHE_TTL_SEC, JSON.stringify(val));
-            this.logger(`[NewsSentimentFilter] ${symbol}: ${result.sentiment} (${result.score}) — ${result.summary}`);
-            return val;
-        } catch (err) {
-            this.logger(`[NewsSentimentFilter] Failed for ${symbol}: ${err.message} — allowing (fail-open)`);
-            return { sentiment: 'NEUTRAL', score: 0, summary: 'Fetch failed' };
-        }
+        await this.redis.setex(key, NEWS_CACHE_TTL_SEC, JSON.stringify(val));
+        this.logger(`[NewsSentimentFilter] ${symbol}: ${result.sentiment} (${result.score}) — ${result.summary}`);
+        return val;
+    } catch (err) {
+        this.logger(`[NewsSentimentFilter] Failed for ${symbol}: ${err.message} — allowing (fail-open)`);
+        return { sentiment: 'NEUTRAL', score: 0, summary: 'Fetch failed' };
     }
+}
 
     async _isBlocked(symbol) {
-        try {
-            return !!(await this.redis.get(`${BLOCK_CACHE_PREFIX}${symbol}`));
-        } catch { return false; }
-    }
+    try {
+        return !!(await this.redis.get(`${BLOCK_CACHE_PREFIX}${symbol}`));
+    } catch { return false; }
+}
 
     async _blockSymbol(symbol, reason) {
-        try {
-            await this.redis.setex(`${BLOCK_CACHE_PREFIX}${symbol}`, BLOCK_TTL_SEC, reason);
-            this.logger(`[NewsSentimentFilter] ⛔ ${symbol} blocked 4h: ${reason}`);
-        } catch (err) {
-            this.logger(`[NewsSentimentFilter] Failed to block ${symbol}: ${err.message}`);
-        }
+    try {
+        await this.redis.setex(`${BLOCK_CACHE_PREFIX}${symbol}`, BLOCK_TTL_SEC, reason);
+        this.logger(`[NewsSentimentFilter] ⛔ ${symbol} blocked 4h: ${reason}`);
+    } catch (err) {
+        this.logger(`[NewsSentimentFilter] Failed to block ${symbol}: ${err.message}`);
     }
+}
 }

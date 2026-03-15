@@ -22,20 +22,20 @@ import { groupByDay, toISTTimeString } from './historical-data-fetcher.js';
 // app boot sequence (no Redis, no DB, no broker needed).
 
 const STRATEGY_MAP = {
-  'ema-crossover': () => import('../strategies/ema-crossover.js'),
-  'rsi-reversion': () => import('../strategies/rsi-reversion.js'),
-  'vwap-momentum': () => import('../strategies/vwap-momentum.js'),
-  'breakout-volume': () => import('../strategies/breakout-volume.js'),
+  'EMA_CROSSOVER': () => import('../strategies/ema-crossover.js'),
+  'RSI_MEAN_REVERSION': () => import('../strategies/rsi-reversion.js'),
+  'VWAP_MOMENTUM': () => import('../strategies/vwap-momentum.js'),
+  'BREAKOUT_VOLUME': () => import('../strategies/breakout-volume.js'),
 };
 
 const ALL_STRATEGIES = Object.keys(STRATEGY_MAP);
 
 /** Minimum candle warm-up window per strategy before we start trading */
 const WARMUP_CANDLES = {
-  'ema-crossover': 25, // EMA 21 + buffer
-  'rsi-reversion': 16, // RSI 14 + buffer
-  'vwap-momentum': 5, // Needs a few candles for volume average
-  'breakout-volume': 22, // 20-period lookback + buffer
+  'EMA_CROSSOVER': 25, // EMA 21 + buffer
+  'RSI_MEAN_REVERSION': 16, // RSI 14 + buffer
+  'VWAP_MOMENTUM': 5, // Needs a few candles for volume average
+  'BREAKOUT_VOLUME': 22, // 20-period lookback + buffer
 };
 
 /** Square-off time in IST "HH:MM" */

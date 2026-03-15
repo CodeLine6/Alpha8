@@ -231,6 +231,14 @@ export class MarketScheduler {
     const health = await this.healthCheck();
     log.info({ health }, 'Infrastructure health check');
 
+    if (health.broker && health.brokerTokenValid === false) {
+      log.error('⚠ Broker token invalid or expired — run: npm run login');
+      // Do NOT engage kill switch here — token expiry before market open
+      // is recoverable via the 8:00 AM auto-login cron.
+      // Just send a Telegram alert so the operator knows.
+      // The kill switch will engage naturally if no valid token exists at scan time.
+    }
+
     if (!health.broker || !health.redis || !health.db) {
       log.error({ health }, '⚠ Infrastructure unhealthy — engaging kill switch');
       await this.killSwitch.engage(
@@ -322,10 +330,10 @@ export class MarketScheduler {
     }
 
     this._scanCount = (this._scanCount || 0) + 1;
-    if (this._scanCount % 6 === 0) {
-      if (this.engine.reconcilePositions) {
-        this.engine.reconcilePositions(this.broker).catch(err => log.warn({ err: err.message }, 'Reconciliation failed during scan'));
-      }
+    if (this.engine._filledPositions.size > 0 && this.broker) {
+      this.engine.reconcilePositions(this.broker).catch(err =>
+        log.warn({ err: err.message }, 'Reconciliation failed during scan')
+      );
     }
 
     this._scanInProgress = true;

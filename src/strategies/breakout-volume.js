@@ -1,4 +1,4 @@
-import { SMA, BollingerBands } from 'technicalindicators';
+import { BollingerBands } from 'technicalindicators';
 import { SIGNAL, STRATEGY } from '../config/constants.js';
 import { BaseStrategy } from './base-strategy.js';
 import { createLogger } from '../lib/logger.js';
@@ -8,41 +8,62 @@ const log = createLogger('strategy:breakout');
 /**
  * Breakout Detection with Volume Confirmation Strategy.
  *
- * Detects price breakouts above resistance or below support levels
- * using a lookback period. Confirmed by above-average volume.
- *
- * Uses Bollinger Bands as dynamic resistance/support and also checks
- * for N-period high/low breakouts.
+ * LIVE SETTINGS SUPPORT:
+ *   Call await strategy.refreshParams() once per scan cycle before analyze().
+ *   Overridable via /api/live-settings or /set Telegram command:
+ *     BREAKOUT_LOOKBACK           (default: 20)
+ *     BREAKOUT_VOLUME_MULTIPLIER  (default: 1.5)
+ *     BREAKOUT_BB_PERIOD          (default: 20)
+ *     BREAKOUT_BB_STDDEV          (default: 2)
  *
  * @extends BaseStrategy
  */
 export class BreakoutVolumeStrategy extends BaseStrategy {
-  /**
-   * @param {Object} [params]
-   * @param {number} [params.lookbackPeriod=20] - Candles to look back for high/low
-   * @param {number} [params.volumeMultiplier=1.5] - Volume must be this × avg for confirmation
-   * @param {number} [params.bbPeriod=20] - Bollinger Band period
-   * @param {number} [params.bbStdDev=2] - Bollinger Band standard deviations
-   * @param {number} [params.minCandles=25] - Minimum candles
-   */
   constructor(params = {}) {
     super(STRATEGY.BREAKOUT_VOLUME, params);
-    this.lookbackPeriod = params.lookbackPeriod ?? 20;
-    this.volumeMultiplier = params.volumeMultiplier ?? 1.5;
-    this.bbPeriod = params.bbPeriod ?? 20;
-    this.bbStdDev = params.bbStdDev ?? 2;
+
+    this._baseLookbackPeriod = params.lookbackPeriod ?? 20;
+    this._baseVolumeMultiplier = params.volumeMultiplier ?? 1.5;
+    this._baseBbPeriod = params.bbPeriod ?? 20;
+    this._baseBbStdDev = params.bbStdDev ?? 2;
+
+    this.lookbackPeriod = this._baseLookbackPeriod;
+    this.volumeMultiplier = this._baseVolumeMultiplier;
+    this.bbPeriod = this._baseBbPeriod;
+    this.bbStdDev = this._baseBbStdDev;
     this.minCandles = params.minCandles ?? 25;
+
+    this._getLiveSetting = params.getLiveSetting || null;
   }
 
-  /**
-   * Analyze candles for breakout signals with volume confirmation.
-   *
-   * @param {import('../data/historical-data.js').Candle[]} candles
-   * @returns {{ signal: 'BUY'|'SELL'|'HOLD', confidence: number, reason: string }}
-   */
+  async refreshParams() {
+    if (!this._getLiveSetting) return;
+
+    try {
+      this.lookbackPeriod = await this._getLiveSetting('BREAKOUT_LOOKBACK', this._baseLookbackPeriod);
+      this.volumeMultiplier = await this._getLiveSetting('BREAKOUT_VOLUME_MULTIPLIER', this._baseVolumeMultiplier);
+      this.bbPeriod = await this._getLiveSetting('BREAKOUT_BB_PERIOD', this._baseBbPeriod);
+      this.bbStdDev = await this._getLiveSetting('BREAKOUT_BB_STDDEV', this._baseBbStdDev);
+      this.minCandles = Math.max(this.lookbackPeriod + 5, 25);
+
+      log.debug({
+        lookbackPeriod: this.lookbackPeriod, volumeMultiplier: this.volumeMultiplier,
+        bbPeriod: this.bbPeriod, bbStdDev: this.bbStdDev, minCandles: this.minCandles,
+      }, 'Breakout params refreshed');
+    } catch (err) {
+      log.warn({ err: err.message }, 'Breakout refreshParams failed — keeping current values');
+    }
+  }
+
   analyze(candles) {
-    if (!candles || candles.length < this.minCandles) {
+    if (!candles) {
       return this.hold(`Insufficient data: need ${this.minCandles} candles, got ${candles?.length || 0}`);
+    }
+
+    candles = this.validateCandles(candles);
+
+    if (candles.length < this.minCandles) {
+      return this.hold(`Insufficient data: need ${this.minCandles} candles, got ${candles.length}`);
     }
 
     const closes = candles.map((c) => c.close);
@@ -53,65 +74,36 @@ export class BreakoutVolumeStrategy extends BaseStrategy {
     const currentPrice = closes[closes.length - 1];
     const currentVolume = volumes[volumes.length - 1];
 
-    // ─── Lookback High/Low ───────────────────────────────
-    const lookbackHighs = highs.slice(-this.lookbackPeriod - 1, -1); // exclude current
+    const lookbackHighs = highs.slice(-this.lookbackPeriod - 1, -1);
     const lookbackLows = lows.slice(-this.lookbackPeriod - 1, -1);
     const resistanceLevel = Math.max(...lookbackHighs);
     const supportLevel = Math.min(...lookbackLows);
 
-    // ─── Volume Analysis ─────────────────────────────────
     const recentVolumes = volumes.slice(-this.lookbackPeriod - 1, -1);
     const avgVolume = recentVolumes.reduce((a, b) => a + b, 0) / recentVolumes.length;
     const volumeRatio = avgVolume > 0 ? currentVolume / avgVolume : 0;
     const hasVolumeConfirmation = volumeRatio >= this.volumeMultiplier;
 
-    // ─── Bollinger Bands ─────────────────────────────────
     let bbUpper = null;
     let bbLower = null;
-    let bbMiddle = null;
 
-    const bbValues = BollingerBands.calculate({
-      period: this.bbPeriod,
-      values: closes,
-      stdDev: this.bbStdDev,
-    });
-
+    const bbValues = BollingerBands.calculate({ period: this.bbPeriod, values: closes, stdDev: this.bbStdDev });
     if (bbValues.length > 0) {
-      const lastBB = bbValues[bbValues.length - 1];
-      bbUpper = lastBB.upper;
-      bbLower = lastBB.lower;
-      bbMiddle = lastBB.middle;
+      bbUpper = bbValues[bbValues.length - 1].upper;
+      bbLower = bbValues[bbValues.length - 1].lower;
     }
 
-    // ─── Breakout Detection ──────────────────────────────
-
-    // Bullish breakout: price breaks above resistance
     const breakAboveResistance = currentPrice > resistanceLevel;
     const breakAboveBB = bbUpper && currentPrice > bbUpper;
-
-    // Bearish breakdown: price breaks below support
     const breakBelowSupport = currentPrice < supportLevel;
     const breakBelowBB = bbLower && currentPrice < bbLower;
 
-    // ─── Bullish Breakout ────────────────────────────────
     if (breakAboveResistance || breakAboveBB) {
       let confidence = 40;
-
-      // Breakout strength: how far above resistance
       const breakoutPct = ((currentPrice - resistanceLevel) / resistanceLevel) * 100;
       confidence += Math.min(breakoutPct * 10, 20);
-
-      // Volume confirmation is critical for breakouts
-      if (hasVolumeConfirmation) {
-        confidence += 25;
-      } else {
-        confidence -= 10; // penalty for no volume — could be false breakout
-      }
-
-      // Bollinger Band bonus
+      if (hasVolumeConfirmation) { confidence += 25; } else { confidence -= 10; }
       if (breakAboveBB) confidence += 10;
-
-      // Volume strength bonus
       confidence += Math.min(volumeRatio * 3, 10);
 
       const reason =
@@ -124,19 +116,11 @@ export class BreakoutVolumeStrategy extends BaseStrategy {
       return this.buildSignal(SIGNAL.BUY, confidence, reason);
     }
 
-    // ─── Bearish Breakdown ───────────────────────────────
     if (breakBelowSupport || breakBelowBB) {
       let confidence = 40;
-
       const breakdownPct = ((supportLevel - currentPrice) / supportLevel) * 100;
       confidence += Math.min(breakdownPct * 10, 20);
-
-      if (hasVolumeConfirmation) {
-        confidence += 25;
-      } else {
-        confidence -= 10;
-      }
-
+      if (hasVolumeConfirmation) { confidence += 25; } else { confidence -= 10; }
       if (breakBelowBB) confidence += 10;
       confidence += Math.min(volumeRatio * 3, 10);
 
@@ -150,11 +134,10 @@ export class BreakoutVolumeStrategy extends BaseStrategy {
       return this.buildSignal(SIGNAL.SELL, confidence, reason);
     }
 
-    // ─── No breakout ─────────────────────────────────────
     const range = resistanceLevel - supportLevel;
     const rangePct = ((range / supportLevel) * 100).toFixed(2);
     return this.hold(
-      `No breakout. Range: ${supportLevel.toFixed(2)}–${resistanceLevel.toFixed(2)} (${rangePct}%). ` +
+      `No breakout. Range: ${supportLevel.toFixed(2)}-${resistanceLevel.toFixed(2)} (${rangePct}%). ` +
       `Price: ${currentPrice.toFixed(2)}. Volume: ${volumeRatio.toFixed(1)}x avg`
     );
   }
