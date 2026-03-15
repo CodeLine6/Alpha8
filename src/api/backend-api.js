@@ -777,6 +777,21 @@ export function createApiHandler(deps) {
 
       // ── Validate value ─────────────────────────────────────────────────────
       const schema = LIVE_SETTINGS_SCHEMA[key];
+
+      // ADD THIS BLOCK before the numValue lines:
+      // Handle boolean type params (PARTIAL_EXIT_ENABLED, SIGNAL_REVERSAL_ENABLED)
+      if (schema.type === 'boolean') {
+        if (value !== 'true' && value !== 'false' && value !== true && value !== false) {
+          return json(res, { error: `Value must be 'true' or 'false' for boolean parameter ${key}` }, 400);
+        }
+        const boolValue = value === 'true' || value === true;
+        await setLiveSetting(key, String(boolValue));
+        log.info({ key, value: boolValue }, '⚙️  Live boolean setting updated');
+        json(res, { success: true, action: 'set', key, value: boolValue, label: schema.label });
+        return;
+      }
+
+
       const numValue = Number(value);
 
       if (isNaN(numValue)) {

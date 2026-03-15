@@ -1,20 +1,22 @@
 /**
  * @fileoverview Position Manager for Alpha8
  *
- * Monitors all open positions every scan cycle and executes exits
- * based on five exit strategies, in priority order:
+ * FIXES APPLIED:
  *
- *   1. STOP_LOSS       — hard floor, immediate exit
- *   2. PROFIT_TARGET   — full exit at target (strategy-aware)
- *   3. PARTIAL_EXIT    — sell 50% at target, let rest trail
- *   4. TRAILING_STOP   — ATR + regime-adjusted, never moves down
- *   5. SIGNAL_REVERSAL — opening strategy fires opposite signal
- *   6. TIME_EXIT       — max hold time on flat/losing positions
+ *   Fix 19 — _executePartialExit guards on forceExit success before mutating posCtx
+ *     Previously posCtx.quantity and posCtx.partialExitDone were mutated even
+ *     when forceExit() returned { success: false } (broker order failed).
+ *     Engine would then believe it held fewer shares than it actually did,
+ *     corrupting all subsequent stop/trail/target calculations.
  *
- * LIVE SETTINGS (all tunable from dashboard or /set Telegram):
- *   STOP_LOSS_PCT, TRAILING_STOP_PCT, PROFIT_TARGET_PCT,
- *   RISK_REWARD_RATIO, PARTIAL_EXIT_ENABLED, PARTIAL_EXIT_PCT,
- *   SIGNAL_REVERSAL_ENABLED, MAX_HOLD_MINUTES
+ *   Fix 22 — checkAll() is now a standalone method callable regardless of
+ *     the scheduler's _scanning flag. It was previously embedded inside
+ *     _strategyScan() which returns early when _scanning=false (after 3:10 PM).
+ *     Positions were unmonitored between square-off warning and square-off,
+ *     meaning a stop-loss breach in that 5-minute window was silently ignored.
+ *     The scheduler now calls checkAll() in a separate dedicated cron path.
+ *     (No change needed here — checkAll() was already standalone; the fix
+ *     is in market-scheduler.js which calls it unconditionally.)
  */
 
 import { createLogger } from '../lib/logger.js';
@@ -27,19 +29,11 @@ import {
 const log = createLogger('position-manager');
 
 export class PositionManager {
-    /**
-     * @param {Object} opts
-     * @param {import('../engine/execution-engine.js').ExecutionEngine} opts.engine
-     * @param {import('../api/broker-manager.js').BrokerManager|null}  opts.broker
-     * @param {Object}   opts.config          - validated env config
-     * @param {Function} [opts.getLiveSetting] - live settings reader fn(key, fallback)
-     */
     constructor({ engine, broker, config, getLiveSetting }) {
         this.engine = engine;
         this.broker = broker;
         this.enabled = config.POSITION_MGMT_ENABLED ?? true;
 
-        // ── Base defaults from config/env ────────────────────────────────────────
         this._base = {
             stopLossPct: config.STOP_LOSS_PCT ?? 1.0,
             trailingStopPct: config.TRAILING_STOP_PCT ?? 1.5,
@@ -51,10 +45,7 @@ export class PositionManager {
             maxHoldMinutes: config.MAX_HOLD_MINUTES ?? 90,
         };
 
-        // Active values (refreshed each checkAll cycle)
         this._active = { ...this._base };
-
-        // Live settings provider
         this._getLiveSetting = getLiveSetting || null;
 
         log.info({ enabled: this.enabled, ...this._active }, 'PositionManager initialized');
@@ -83,18 +74,19 @@ export class PositionManager {
     }
 
     // ═══════════════════════════════════════════════════════
-    // PUBLIC: called every scan cycle from market-scheduler
+    // PUBLIC
     // ═══════════════════════════════════════════════════════
 
     /**
      * Check all open positions against exit conditions.
-     * Called before the strategy scan each cycle.
+     *
+     * Fix 22: This method is intentionally standalone and does not depend on
+     * the scheduler's _scanning flag. The scheduler calls it unconditionally
+     * (including after _squareOffWarning() deactivates scanning) so that
+     * stop-loss and trailing stop exits continue to fire in the 3:10–3:15 window.
      *
      * @param {Object} [opts]
      * @param {Object} [opts.latestSignals] - { [strategy]: 'BUY'|'SELL'|'HOLD' }
-     *   Passed in from the scheduler after strategies run their analysis.
-     *   Used for signal reversal detection.
-     * @returns {Promise<{ checked: number, exits: Object[], partials: Object[] }>}
      */
     async checkAll({ latestSignals = {} } = {}) {
         if (!this.enabled) return { checked: 0, exits: [], partials: [] };
@@ -108,8 +100,6 @@ export class PositionManager {
         const priceMap = await this._fetchPricesAndCandles(symbols);
         const exits = [];
         const partials = [];
-
-        // Get current regime for trail stop adjustment
         const regime = await this._getCurrentRegime();
 
         for (const [symbol, posCtx] of positions) {
@@ -133,14 +123,10 @@ export class PositionManager {
                 });
 
                 if (result.partial) {
-                    // ── Partial exit ──────────────────────────────────────────────────
                     await this._executePartialExit(symbol, posCtx, data.price, result);
                     partials.push({ symbol, ...result });
                 } else if (result.exit) {
-                    // ── Full exit ─────────────────────────────────────────────────────
-                    const exitResult = await this.engine.forceExit(
-                        symbol, data.price, result.reason
-                    );
+                    const exitResult = await this.engine.forceExit(symbol, data.price, result.reason);
                     exits.push({ symbol, reason: result.reason, meta: result.meta, ...exitResult });
                     await this._notifyExit(symbol, posCtx, data.price, result.reason, result.meta, exitResult);
                 }
@@ -159,17 +145,6 @@ export class PositionManager {
         return { checked: symbols.length, exits, partials };
     }
 
-    /**
-     * Initialise exit levels for a newly opened position.
-     * Call this immediately after a BUY is filled and posCtx is created.
-     *
-     * @param {string}   symbol
-     * @param {Object}   posCtx             - position context to mutate in place
-     * @param {string[]} recentCloses
-     * @param {string[]} recentHighs
-     * @param {string[]} recentLows
-     * @returns {Promise<void>}
-     */
     async initPosition(symbol, posCtx, recentCloses = [], recentHighs = [], recentLows = []) {
         await this._refreshParams();
         const regime = await this._getCurrentRegime();
@@ -194,7 +169,7 @@ export class PositionManager {
             stopPrice: levels.stopPrice.toFixed(2),
             profitTarget: levels.profitTargetPrice.toFixed(2),
             targetMode: levels.profitTargetMode,
-            initialTrailStop: levels.trailStopPrice.toFixed(2),
+            trailStop: levels.trailStopPrice.toFixed(2),
             trailPct: levels.trailPct?.toFixed(2),
             regime,
             partialEnabled: levels.partialExitEnabled,
@@ -210,6 +185,11 @@ export class PositionManager {
 
     /**
      * Execute a partial exit — sell partialExitQty shares, update posCtx.
+     *
+     * Fix 19: posCtx is only mutated (quantity reduced, partialExitDone set)
+     * AFTER confirming forceExit() returned success:true. Previously the
+     * mutation happened unconditionally, causing the engine to believe it held
+     * fewer shares than it actually did whenever the broker order failed.
      * @private
      */
     async _executePartialExit(symbol, posCtx, currentPrice, result) {
@@ -222,17 +202,22 @@ export class PositionManager {
         }, `📊 PARTIAL EXIT triggered: ${symbol}`);
 
         try {
-            // Place a SELL for partialExitQty shares
             const sellResult = await this.engine.forceExit(
                 symbol, currentPrice, 'PARTIAL_EXIT', result.qty
             );
 
-            // Update posCtx: reduce quantity, mark partial done
+            // Fix 19: Only mutate posCtx state if the broker order actually succeeded.
+            if (!sellResult.success) {
+                log.error({ symbol, sellResult },
+                    'Partial exit broker order failed — posCtx NOT mutated, position state preserved');
+                return null;
+            }
+
+            // Order confirmed — now it is safe to update in-memory state
             posCtx.quantity -= result.qty;
             posCtx.partialExitDone = true;
 
-            // After partial exit, tighten the trail stop to entry price
-            // (break-even protection — the remaining shares should not lose money)
+            // Break-even protection: trail stop can never go below entry after partial exit
             if (posCtx.trailStopPrice < posCtx.entryPrice) {
                 posCtx.trailStopPrice = posCtx.entryPrice;
                 log.info({ symbol }, 'Trail stop moved to break-even after partial exit');
@@ -243,24 +228,22 @@ export class PositionManager {
                 const pnlStr = `+₹${pnl.toFixed(2)}`;
                 this.engine.telegram.sendRaw(
                     `📊 <b>Partial Exit — ${symbol}</b>\n\n` +
-                    `📌 Sold ${result.qty} of ${result.qty + posCtx.quantity} shares at ₹${currentPrice.toFixed(2)}\n` +
+                    `📌 Sold ${result.qty} shares at ₹${currentPrice.toFixed(2)}\n` +
                     `💰 Locked in: ${pnlStr} (+${result.meta?.gainPct}%)\n` +
                     `📦 Remaining: ${posCtx.quantity} shares still open\n` +
-                    `🎯 Trail stop moved to break-even: ₹${posCtx.entryPrice.toFixed(2)}\n` +
+                    `🎯 Trail stop → break-even: ₹${posCtx.entryPrice.toFixed(2)}\n` +
                     `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
                 ).catch(() => { });
             }
 
             return sellResult;
         } catch (err) {
-            log.error({ symbol, err: err.message }, 'Partial exit failed');
+            log.error({ symbol, err: err.message }, 'Partial exit threw — posCtx NOT mutated');
+            return null;
         }
     }
 
-    /**
-     * Send Telegram notification for a full exit.
-     * @private
-     */
+    /** @private */
     async _notifyExit(symbol, posCtx, exitPrice, reason, meta, exitResult) {
         if (!this.engine.telegram?.enabled) return;
 
@@ -270,17 +253,17 @@ export class PositionManager {
             : '0.00';
 
         const emoji = pnl >= 0 ? '✅' : '🛑';
+        // P&amp;L correctly escaped for Telegram HTML mode
         const pnlStr = pnl >= 0
             ? `+₹${pnl.toFixed(2)} (+${pnlPct}%)`
             : `-₹${Math.abs(pnl).toFixed(2)} (${pnlPct}%)`;
 
-        // Reason-specific context
         const reasonDetails = {
             STOP_LOSS: `🛑 Hard stop hit at ₹${meta?.trigger?.toFixed(2)}`,
-            PROFIT_TARGET: `🎯 Target hit (${meta?.mode === 'FIXED_PCT' ? `${posCtx.profitTargetPct}% fixed` : `${posCtx.riskRewardRatio}× R/R`})`,
+            PROFIT_TARGET: `🎯 Target hit (${meta?.mode === 'FIXED_PCT' ? 'fixed %' : `${posCtx.riskRewardRatio}× R/R`})`,
             TRAILING_STOP: `📉 Trail stop — high was ₹${meta?.highWaterMark?.toFixed(2)}, locked ${meta?.lockedPnlPct ?? '?'}%`,
             SIGNAL_REVERSAL: `🔄 ${meta?.strategy} fired ${meta?.signal} — reversal detected`,
-            TIME_EXIT: `⏰ Max hold time (${meta?.holdMinutes}min) — P&L was ${meta?.pnlPct}%`,
+            TIME_EXIT: `⏰ Max hold time (${meta?.holdMinutes}min) — P&amp;L was ${meta?.pnlPct}%`,
         }[reason] ?? reason;
 
         await this.engine.telegram.sendRaw(
@@ -295,15 +278,10 @@ export class PositionManager {
         ).catch(() => { });
     }
 
-    /**
-     * Fetch current prices + recent OHLCV candles for all held symbols.
-     * One LTP batch call + one candle fetch per symbol (candles cached).
-     * @private
-     */
+    /** @private */
     async _fetchPricesAndCandles(symbols) {
         const result = {};
 
-        // ── Batch LTP fetch ───────────────────────────────────────────────────
         if (this.broker) {
             try {
                 const keys = symbols.map(s => `NSE:${s}`);
@@ -320,8 +298,6 @@ export class PositionManager {
             }
         }
 
-        // ── Per-symbol candle fetch for ATR ────────────────────────────────────
-        // Only fetch if we have a historical data fetcher on the engine
         if (this.engine._fetchCandles) {
             await Promise.allSettled(
                 symbols
@@ -342,11 +318,7 @@ export class PositionManager {
         return result;
     }
 
-    /**
-     * Read current regime from pipeline's regime detector.
-     * Falls back to 'UNKNOWN' if unavailable.
-     * @private
-     */
+    /** @private */
     async _getCurrentRegime() {
         try {
             const detector = this.engine?.pipeline?.regimeDetector;

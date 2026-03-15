@@ -391,7 +391,17 @@ async function main() {
       `   Max hold:       ${config.MAX_HOLD_MINUTES} minutes (flat/losing positions only)`
     );
     engine.positionManager = positionManager;
-    engine._fetchCandles = (symbol, limit) => historicalData.fetchRecentCandles(symbol, '5minute', limit);
+    engine._fetchCandles = async (symbol, limit) => {
+      if (!broker) return [];
+      const instrumentToken = instrumentManager?.getToken(symbol) ?? null;
+      return fetchRecentCandles({
+        broker,
+        instrumentToken,
+        symbol,
+        interval: '5minute',
+        count: limit,
+      }).catch(() => []);
+    };
 
   } else {
     log.warn('⚠️  Position manager: DISABLED (POSITION_MGMT_ENABLED=false)');

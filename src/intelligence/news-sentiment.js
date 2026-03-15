@@ -208,49 +208,50 @@ export class NewsSentimentFilter {
 
     /** Manually unblock a symbol (e.g. from dashboard). */
     async unblock(symbol) {
-    try {
-        await this.redis.del(`${BLOCK_CACHE_PREFIX}${symbol}`);
-        this.logger(`[NewsSentimentFilter] ✅ ${symbol} manually unblocked`);
-    } catch (err) {
-        this.logger(`[NewsSentimentFilter] Failed to unblock ${symbol}: ${err.message}`);
+        try {
+            await this.redis.del(`${BLOCK_CACHE_PREFIX}${symbol}`);
+            this.logger(`[NewsSentimentFilter] ✅ ${symbol} manually unblocked`);
+        } catch (err) {
+            this.logger(`[NewsSentimentFilter] Failed to unblock ${symbol}: ${err.message}`);
+        }
     }
-}
 
     // ── Private ──────────────────────────────────────────────────────────────
 
     async _getOrFetch(symbol) {
-    const key = `${NEWS_CACHE_PREFIX}${symbol}`;
-    try {
-        const cached = await this.redis.get(key);
-        if (cached) return JSON.parse(cached);
-    } catch { /* cache miss */ }
+        const key = `${NEWS_CACHE_PREFIX}${symbol}`;
+        try {
+            const cached = await this.redis.get(key);
+            if (cached) return JSON.parse(cached);
+        } catch { /* cache miss */ }
 
-    try {
-        const headlines = await fetchNewsHeadlines(symbol);
-        const result = await classifySentiment(symbol, headlines, this.apiKey);
-        const val = { ...result, headlines, updatedAt: new Date().toISOString() };
+        try {
+            const headlines = await fetchNewsHeadlines(symbol);
+            const result = await classifySentiment(symbol, headlines, this.apiKey);
+            const val = { ...result, headlines, updatedAt: new Date().toISOString() };
 
-        await this.redis.setex(key, NEWS_CACHE_TTL_SEC, JSON.stringify(val));
-        this.logger(`[NewsSentimentFilter] ${symbol}: ${result.sentiment} (${result.score}) — ${result.summary}`);
-        return val;
-    } catch (err) {
-        this.logger(`[NewsSentimentFilter] Failed for ${symbol}: ${err.message} — allowing (fail-open)`);
-        return { sentiment: 'NEUTRAL', score: 0, summary: 'Fetch failed' };
+            await this.redis.setex(key, NEWS_CACHE_TTL_SEC, JSON.stringify(val));
+            this.logger(`[NewsSentimentFilter] ${symbol}: ${result.sentiment} (${result.score}) — ${result.summary}`);
+            return val;
+        } catch (err) {
+            this.logger(`[NewsSentimentFilter] Failed for ${symbol}: ${err.message} — allowing (fail-open)`);
+            return { sentiment: 'NEUTRAL', score: 0, summary: 'Fetch failed' };
+        }
     }
-}
 
     async _isBlocked(symbol) {
-    try {
-        return !!(await this.redis.get(`${BLOCK_CACHE_PREFIX}${symbol}`));
-    } catch { return false; }
-}
-
-    async _blockSymbol(symbol, reason) {
-    try {
-        await this.redis.setex(`${BLOCK_CACHE_PREFIX}${symbol}`, BLOCK_TTL_SEC, reason);
-        this.logger(`[NewsSentimentFilter] ⛔ ${symbol} blocked 4h: ${reason}`);
-    } catch (err) {
-        this.logger(`[NewsSentimentFilter] Failed to block ${symbol}: ${err.message}`);
+        try {
+            return !!(await this.redis.get(`${BLOCK_CACHE_PREFIX}${symbol}`));
+        } catch { return false; }
     }
-}
+
+    async _blockSymbol(symbol, reason, ttl = BLOCK_TTL_SEC) {
+        try {
+            await this.redis.setex(`${BLOCK_CACHE_PREFIX}${symbol}`, ttl, reason);
+            const hours = Math.round(ttl / 3600);
+            this.logger(`[NewsSentimentFilter] ⛔ ${symbol} blocked ${hours}h: ${reason}`);
+        } catch (err) {
+            this.logger(`[NewsSentimentFilter] Failed to block ${symbol}: ${err.message}`);
+        }
+    }
 }

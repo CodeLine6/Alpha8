@@ -297,7 +297,8 @@ export class SymbolScout {
         const changes = this._computeChanges(scored, currentDynamic);
 
         // 6. Apply changes to DB
-        await this._applyChanges(changes, currentDynamic);
+        await this._applyChanges(changes, currentDynamic, scored);
+
 
         // 7. Notify via Telegram
         await this._notify(changes, scored, Date.now() - startAt);
@@ -415,7 +416,8 @@ export class SymbolScout {
         return { added, removed, shouldBe: shouldAdd };
     }
 
-    async _applyChanges(changes, currentDynamic) {
+    async _applyChanges(changes, currentDynamic, scored = []) {
+
         const newDynamic = [
             ...currentDynamic.filter(s => !changes.removed.map(r => r.symbol.toUpperCase()).includes(s.toUpperCase())),
             ...changes.added.map(a => a.symbol),
@@ -434,7 +436,8 @@ export class SymbolScout {
         }
 
         // Write score snapshot to symbol_scores
-        this._persistScores(changes).catch(() => { });
+        this._persistScores(scored).catch(() => { });
+
     }
 
     async _notify(changes, scored, durationMs) {
@@ -627,10 +630,9 @@ export class SymbolScout {
         } catch { /* non-critical */ }
     }
 
-    async _persistScores(changes) {
+    async _persistScores(scored = []) {
         try {
-            // Bulk insert scored results
-            for (const s of (changes.scored || [])) {
+            for (const s of scored) {
                 if (!s) continue;
                 await query(
                     `INSERT INTO symbol_scores (symbol, score, breakdown, scanned_at)

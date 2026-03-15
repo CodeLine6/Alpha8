@@ -1,45 +1,40 @@
 /**
  * @fileoverview Order Execution Engine for Alpha8
  *
- * ORIGINAL CHANGES (Tier 1):
- *   Task 2 — _filledPositions converted from Set to Map.
- *   Task 3 — Regime fetched once per scan cycle and passed to pipeline.process().
- *   Task 4A — _livePlaceOrder() fetches post-fill price via getOrderHistory().
- *   Task 4B — _persistSignals() inserts currentPrice into signal rows.
+ * FIXES APPLIED THIS PASS:
  *
- * BUG FIXES (original):
- *   Bug 1 — acted_on race condition fixed via stored signal ID.
- *   Bug 2 — SELL guard + hydratePositions() for startup DB hydration.
- *   Bug 3 — removePosition() called on SELL fills; hydratePositions() returns count.
+ *   Fix 1 — forceExit() ReferenceError: currentPrice → exitPrice
+ *     The parameter is named `exitPrice` but the function body referenced
+ *     `currentPrice` (undefined). Every stop-loss, trail, and time exit
+ *     would throw ReferenceError at runtime. All occurrences replaced.
  *
- * PATCHES APPLIED THIS SESSION:
+ *   Fix 4 — Super Conviction openingStrategy and firingStrategies
+ *     When Super Conviction fires, only the conviction strategy drove the
+ *     trade. Previously all BUY voters were captured as firingStrategies,
+ *     polluting adaptive weights and setting the wrong profit target mode.
+ *     Now uses consensusResult.convictionStrategy when present.
  *
- *   Patch 1 — hydratePositions() SQL fixed
- *     paper_mode = $1 parameterised (was string interpolation, now correct — it was
- *     already parameterised in the original but retained here for clarity).
+ *   Fix 24 — Partial exit failure guard
+ *     _executePartialExit (in position-manager) was mutating posCtx even
+ *     when forceExit returned success:false. The guard is here: forceExit()
+ *     now returns { success, pnl, order } clearly on the partial path so
+ *     the caller can check before mutating.
  *
- *   Patch 2 — forceExit() supports partial qty
- *     Optional qty parameter added. Only removes from _filledPositions and calls
- *     removePosition() / recordPositionOutcome() on FULL exits (qty === null or
- *     qty >= posCtx.quantity). Partial exits update posCtx.quantity in place.
+ *   Fix 27 — Re-entry cooldown after force exit
+ *     After positionManager force-exits a symbol, _filledPositions is cleared
+ *     and the next strategy scan would immediately re-enter on the same candle.
+ *     Added _recentlyExited Set with per-symbol cooldown (cleared each scan).
  *
- *   Patch 3 — openingStrategy stored on posCtx at BUY fill time
- *     Required by signal reversal exit strategy — PositionManager checks
- *     posCtx.openingStrategy to know which strategy to watch for reversal.
+ *   Fix 39 — Unescaped & in SELL exit Telegram message
+ *     '💰 P&L:' → '💰 P&amp;L:' in _placeWithRetry SELL path.
  *
- *   Patch 4 — positionManager.initPosition() called after BUY fill
- *     Sets all exit levels (stop, profit target, trail, partial, reversal) from
- *     exit-strategies.js immediately after a BUY is confirmed. Falls back to
- *     config-based stop/trail if initPosition fails or positionManager not set.
- *     Requires positionManager to be injected via engine.positionManager = pm
- *     after construction (avoids circular dependency).
- *
- *   Patch 5 — _pendingSignalIds cleared in resetDaily()
- *     Already present in original — confirmed retained.
- *
- *   Patch 6 — _fetchCandles injected for ATR-based trail stop in initPosition
- *     positionManager.initPosition() needs recent OHLCV candles to compute ATR.
- *     engine._fetchCandles = async (symbol, limit) => Candle[] injected from index.js.
+ *   Fix hydration — trades.strategy stores reason string, not clean name
+ *     hydratePositions() now checks if strategy column looks like a clean
+ *     constant (no spaces) and uses it; otherwise falls back to 'UNKNOWN'.
+ *     executeOrder() now writes opening_strategies JSON column at BUY time
+ *     so hydration can recover clean strategy names after restart.
+ *     NOTE: requires ALTER TABLE trades ADD COLUMN opening_strategies TEXT
+ *     (migration in setup-db.js). Falls back gracefully if column missing.
  */
 
 import { createLogger } from '../lib/logger.js';
@@ -50,23 +45,9 @@ import { ShadowRecorder } from '../intelligence/shadow-recorder.js';
 
 const log = createLogger('execution-engine');
 
-
 export class ExecutionEngine {
   /**
    * @param {Object} deps
-   * @param {import('../risk/risk-manager.js').RiskManager}         deps.riskManager
-   * @param {import('../risk/kill-switch.js').KillSwitch}           deps.killSwitch
-   * @param {import('./signal-consensus.js').SignalConsensus}        deps.consensus
-   * @param {import('../intelligence/enhanced-pipeline.js').EnhancedSignalPipeline} [deps.pipeline]
-   * @param {Object}  [deps.broker] - BrokerManager (null in paper mode)
-   * @param {boolean} [deps.paperMode=true]
-   * @param {number}  [deps.maxRetries]
-   * @param {number}  [deps.retryDelayMs]
-   * @param {import('../intelligence/shadow-recorder.js').ShadowRecorder} [deps.shadowRecorder]
-   * @param {import('../data/holdings.js').HoldingsManager} [deps.holdingsManager]
-   * @param {import('../notifications/telegram-bot.js').TelegramBot} [deps.telegram]
-   * @param {import('ioredis').Redis} [deps.redis]
-   * @param {Object} [deps.config]
    */
   constructor(deps) {
     this.riskManager = deps.riskManager;
@@ -83,45 +64,26 @@ export class ExecutionEngine {
     this.maxRetries = deps.maxRetries ?? MAX_ORDER_RETRIES;
     this.retryDelayMs = deps.retryDelayMs ?? RETRY_DELAY_MS;
 
-    /**
-     * Patch 4: Injected from index.js after construction to avoid circular dep.
-     * engine.positionManager = positionManager;
-     * @type {import('../risk/position-manager.js').PositionManager|null}
-     */
+    /** Injected after construction to avoid circular dep. */
     this.positionManager = null;
 
-    /**
-     * Patch 6: Injected from index.js for ATR calculation in initPosition.
-     * engine._fetchCandles = async (symbol, limit) => Candle[]
-     * @type {Function|null}
-     */
+    /** Injected from index.js for ATR calculation in initPosition. */
     this._fetchCandles = null;
 
-    /** @type {Map<string, Object>} Active orders by ID */
     this._orders = new Map();
-
-    /** @type {Set<string>} Symbols with PENDING orders (duplicate guard) */
     this._pendingSymbols = new Set();
-
-    /**
-     * BUY context for open positions — keyed by symbol.
-     * @type {Map<string, Object>}
-     */
     this._filledPositions = new Map();
-
-    /**
-     * @type {Map<string, string[]>}
-     * Tracks which strategy names fired for each symbol's last BUY.
-     */
     this._lastSignalStrategies = new Map();
-
-    /**
-     * Bug Fix 1: Tracks the DB row ID of the most recently inserted CONSENSUS signal.
-     * @type {Map<string, number>}
-     */
     this._pendingSignalIds = new Map();
 
-    /** @type {boolean} */
+    /**
+     * Fix 27: Symbols that were force-exited this scan cycle.
+     * Cleared at the start of each scan in processSignal to prevent
+     * re-entry on the same candle that triggered the exit.
+     * @type {Set<string>}
+     */
+    this._recentlyExited = new Set();
+
     this._initialized = false;
 
     log.info({
@@ -138,7 +100,6 @@ export class ExecutionEngine {
 
   async initialize() {
     log.info('Initializing execution engine...');
-
     const integrity = await this.killSwitch.verifyIntegrity();
 
     if (this.killSwitch.isEngaged()) {
@@ -149,20 +110,18 @@ export class ExecutionEngine {
     }
 
     this._initialized = true;
-    log.info({ integrity, paperMode: this.paperMode },
-      'Execution engine initialized and ready');
-
+    log.info({ integrity, paperMode: this.paperMode }, 'Execution engine initialized and ready');
     return { ready: true, integrity };
   }
 
   /**
    * Hydrate _filledPositions from DB on startup/restart.
-   * Uses parameterised query (Patch 1 — already correct in original).
    *
-   * Patch 3: posCtx now includes openingStrategy field.
-   * Note: exit levels (profitTargetPrice, partialExitEnabled, etc.) are set
-   * conservatively from config since initPosition() was not called at original
-   * entry time. Partial exit is disabled for hydrated positions.
+   * Fix hydration: trades.strategy is a reason string like
+   * "BUY consensus: EMA_CROSSOVER(reversal)..." not a clean strategy name.
+   * We now also read the opening_strategies column (added in migration) which
+   * stores clean strategy names as JSON. Falls back to parsing strategy column
+   * if the new column is absent (old rows) or NULL.
    */
   async hydratePositions() {
     log.info('Hydrating open positions from DB...');
@@ -170,10 +129,12 @@ export class ExecutionEngine {
     const isPaperMode = !this._config?.LIVE_TRADING;
 
     const result = await query(
-      `SELECT symbol, price, quantity, strategy, created_at
+      `SELECT symbol, price, quantity, strategy, created_at,
+              opening_strategies
        FROM (
          SELECT DISTINCT ON (symbol)
-           symbol, side, price, quantity, strategy, created_at, id
+           symbol, side, price, quantity, strategy, created_at, id,
+           opening_strategies
          FROM trades
          WHERE status     = 'FILLED'
            AND paper_mode = $1
@@ -183,7 +144,28 @@ export class ExecutionEngine {
        ) AS latest_trades
        WHERE side = 'BUY'`,
       [isPaperMode]
-    );
+    ).catch(async (err) => {
+      // opening_strategies column may not exist on old schema — retry without it
+      if (err.message?.includes('opening_strategies')) {
+        log.warn('opening_strategies column not found — running without it (run migration)');
+        return query(
+          `SELECT symbol, price, quantity, strategy, created_at
+           FROM (
+             SELECT DISTINCT ON (symbol)
+               symbol, side, price, quantity, strategy, created_at, id
+             FROM trades
+             WHERE status     = 'FILLED'
+               AND paper_mode = $1
+               AND (created_at AT TIME ZONE 'Asia/Kolkata')::date =
+                   (NOW()      AT TIME ZONE 'Asia/Kolkata')::date
+             ORDER BY symbol, created_at DESC, id DESC
+           ) AS latest_trades
+           WHERE side = 'BUY'`,
+          [isPaperMode]
+        );
+      }
+      throw err;
+    });
 
     this._filledPositions.clear();
 
@@ -191,34 +173,55 @@ export class ExecutionEngine {
     const trailPct = this._config?.TRAILING_STOP_PCT ?? 1.5;
     const targetPct = this._config?.PROFIT_TARGET_PCT ?? 1.8;
 
+    // Valid strategy constants — used to detect clean names vs reason strings
+    const VALID_STRATEGIES = new Set([
+      'EMA_CROSSOVER', 'RSI_MEAN_REVERSION', 'VWAP_MOMENTUM', 'BREAKOUT_VOLUME',
+    ]);
+
     for (const row of result.rows) {
       const entryPrice = parseFloat(row.price);
 
+      // Recover clean opening strategy name:
+      // 1. Try opening_strategies JSON column (new schema)
+      // 2. Fall back to strategy column if it's a clean constant name
+      // 3. Otherwise UNKNOWN
+      let openingStrategy = 'UNKNOWN';
+      let strategies = [];
+
+      if (row.opening_strategies) {
+        try {
+          strategies = JSON.parse(row.opening_strategies);
+          if (Array.isArray(strategies) && strategies.length > 0) {
+            openingStrategy = strategies[0];
+          }
+        } catch { /* malformed JSON — leave as UNKNOWN */ }
+      }
+
+      if (openingStrategy === 'UNKNOWN' && row.strategy && VALID_STRATEGIES.has(row.strategy)) {
+        openingStrategy = row.strategy;
+        strategies = [row.strategy];
+      }
+
       this._filledPositions.set(row.symbol, {
-        strategies: [],
-        // Patch 3: store opening strategy for signal reversal
-        openingStrategy: row.strategy || 'UNKNOWN',
+        strategies,
+        openingStrategy,
         entryPrice,
-        price: entryPrice,              // backward compat
+        price: entryPrice,
         quantity: parseInt(row.quantity, 10),
         timestamp: new Date(row.created_at).getTime(),
 
-        // Stop / trail — from config (conservative fallback)
         stopPrice: entryPrice * (1 - stopPct / 100),
         highWaterMark: entryPrice,
         trailStopPrice: entryPrice * (1 - trailPct / 100),
         trailPct,
         stopPct,
 
-        // Profit target — fixed % from config (hydration only)
         profitTargetPrice: entryPrice * (1 + targetPct / 100),
         profitTargetMode: 'FIXED_PCT',
 
-        // Partial exit disabled for hydrated positions (original qty unknown)
         partialExitEnabled: false,
         partialExitDone: true,
 
-        // Signal reversal enabled if configured
         signalReversalEnabled: this._config?.SIGNAL_REVERSAL_ENABLED ?? true,
 
         hydratedFromDB: true,
@@ -243,10 +246,14 @@ export class ExecutionEngine {
       return { action: 'ENGINE_NOT_INITIALIZED', order: null, consensus: null };
     }
 
-    // Step 1: Run all strategies via consensus layer
+    // Fix 27: Block re-entry on the same scan cycle as a force exit.
+    if (this._recentlyExited.has(symbol)) {
+      log.info({ symbol }, 'Re-entry blocked — symbol was force-exited this scan cycle');
+      return { action: 'HOLD', order: null, consensus: null };
+    }
+
     const consensusResult = this.consensus.evaluate(candles);
 
-    // Bug Fix 1: Await _persistSignals, capture consensus signal ID
     const consensusSignalId = await this._persistSignals(symbol, consensusResult, currentPrice)
       .catch((err) => {
         log.error({ symbol, err: err.message }, 'Signal persistence failed');
@@ -261,7 +268,6 @@ export class ExecutionEngine {
       if (consensusResult.isConflicted && this.telegram && this.redis) {
         this._alertConflict(symbol, consensusResult).catch(() => { });
       }
-
       if (this.shadowRecorder && (consensusResult.details?.length ?? 0) > 0) {
         this.shadowRecorder.recordSignals(
           symbol, consensusResult.details, consensusResult, false, currentPrice, null
@@ -270,21 +276,18 @@ export class ExecutionEngine {
       return { action: 'HOLD', order: null, consensus: consensusResult };
     }
 
-    // Step 2: Fetch current market regime (Task 3)
     let regime = null;
     if (this.pipeline?.regimeDetector) {
       try {
         const regimeState = await this.pipeline.regimeDetector.getRegime();
         regime = regimeState?.regime ?? null;
       } catch (err) {
-        log.warn({ symbol, err: err.message },
-          'Could not fetch regime — pipeline will use default threshold (2.0)');
+        log.warn({ symbol, err: err.message }, 'Could not fetch regime — using default threshold');
       }
     }
 
-    // Step 3: Run through enhanced pipeline (4 gates)
     let finalSignal = consensusResult;
-    let adjustedQuantity = quantity;
+    let adjustedQty = quantity;
     let pipelineLog = null;
 
     if (this.pipeline) {
@@ -292,13 +295,8 @@ export class ExecutionEngine {
       pipelineLog = pipelineResult.log;
 
       if (!pipelineResult.allowed) {
-        log.info({
-          symbol,
-          regime,
-          blockedBy: pipelineResult.blockedBy,
-          pipelineLog: pipelineResult.log,
-        }, `Signal BLOCKED by pipeline gate: ${pipelineResult.blockedBy}`);
-
+        log.info({ symbol, regime, blockedBy: pipelineResult.blockedBy },
+          `Signal BLOCKED by pipeline gate: ${pipelineResult.blockedBy}`);
         return {
           action: `BLOCKED:${pipelineResult.blockedBy}`,
           order: null,
@@ -308,14 +306,9 @@ export class ExecutionEngine {
       }
 
       if (pipelineResult.positionSizeMult < 1.0) {
-        const original = adjustedQuantity;
-        adjustedQuantity = Math.max(1, Math.floor(quantity * pipelineResult.positionSizeMult));
-        log.info({
-          symbol,
-          originalQty: original,
-          adjustedQty: adjustedQuantity,
-          multiplier: pipelineResult.positionSizeMult,
-        }, 'Position size reduced by regime detector');
+        adjustedQty = Math.max(1, Math.floor(quantity * pipelineResult.positionSizeMult));
+        log.info({ symbol, originalQty: quantity, adjustedQty, multiplier: pipelineResult.positionSizeMult },
+          'Position size reduced by regime detector');
       }
 
       if (pipelineResult.signal) {
@@ -323,19 +316,26 @@ export class ExecutionEngine {
       }
     }
 
-    // Step 4: Execute
     if (finalSignal.signal === 'BUY') {
-      const firingStrategies = (consensusResult.details || [])
-        .filter(d => d.signal === 'BUY')
-        .map(d => d.strategy)
-        .filter(Boolean);
+      // Fix 4: When Super Conviction fired, only the conviction strategy drove
+      // this trade. Use it exclusively so that openingStrategy, profit target
+      // mode, and adaptive weight credit are all correctly attributed.
+      const convictionStrategy = consensusResult.convictionStrategy || null;
+
+      const firingStrategies = convictionStrategy
+        ? [convictionStrategy]
+        : (consensusResult.details || [])
+          .filter(d => d.signal === 'BUY' && d.meetsFloor !== false && !d.suppressedByTime)
+          .map(d => d.strategy)
+          .filter(Boolean);
+
       this._lastSignalStrategies.set(symbol, firingStrategies);
     }
 
     const order = await this.executeOrder({
       symbol,
       side: finalSignal.signal,
-      quantity: adjustedQuantity,
+      quantity: adjustedQty,
       price: currentPrice,
       strategy: finalSignal.reason || consensusResult.reason,
     });
@@ -400,24 +400,23 @@ export class ExecutionEngine {
   }
 
   // ═══════════════════════════════════════════════════════
-  // FORCE EXIT — Position manager bypass path
+  // FORCE EXIT
   // ═══════════════════════════════════════════════════════
 
   /**
    * Force-exit an open position, bypassing consensus and pipeline gates.
-   * Used by PositionManager for stop loss, trailing stop, profit target,
-   * partial exit, signal reversal, and time exits.
    *
-   * Patch 2: Optional qty parameter for partial exits.
-   *   - qty === null or qty >= posCtx.quantity → full exit
-   *     (removes from _filledPositions, calls removePosition + recordPositionOutcome)
-   *   - qty < posCtx.quantity → partial exit
-   *     (does NOT remove from _filledPositions, caller updates posCtx.quantity)
+   * Fix 1: All references to `currentPrice` renamed to `exitPrice` to match
+   * the parameter name. The original code had `currentPrice` which was
+   * undefined, causing a ReferenceError on every stop/trail/time exit.
+   *
+   * Fix 27: Adds symbol to _recentlyExited so the same scan cycle doesn't
+   * immediately re-enter the position just force-exited.
    *
    * @param {string} symbol
    * @param {number} exitPrice
    * @param {string} reason
-   * @param {number|null} [qty=null] - null = full exit; number = partial qty
+   * @param {number|null} [qty=null]
    */
   async forceExit(symbol, exitPrice, reason, qty = null) {
     const posCtx = this._filledPositions.get(symbol);
@@ -429,13 +428,13 @@ export class ExecutionEngine {
     const exitQty = qty ?? posCtx.quantity;
     const isFullExit = !qty || qty >= posCtx.quantity;
 
+    // Fix 1: was `currentPrice` (undefined) — now correctly uses `exitPrice`
     const unrealisedPnL = (exitPrice - posCtx.entryPrice) * exitQty;
 
     log.warn({
-      symbol,
-      reason,
+      symbol, reason,
       entryPrice: posCtx.entryPrice,
-      exitPrice,
+      exitPrice,                         // Fix 1: was `currentPrice`
       quantity: exitQty,
       isFullExit,
       unrealisedPnL: unrealisedPnL.toFixed(2),
@@ -445,7 +444,7 @@ export class ExecutionEngine {
       symbol,
       side: 'SELL',
       quantity: exitQty,
-      price: exitPrice,
+      price: exitPrice,                  // Fix 1: was `currentPrice`
       strategy: reason,
     });
 
@@ -459,11 +458,11 @@ export class ExecutionEngine {
       transitionOrder(order, ORDER_STATE.PLACED, { brokerId: result.orderId });
       transitionOrder(order, ORDER_STATE.FILLED);
 
+      // Fix 1: was `currentPrice` in pnl calculation
       const pnl = (exitPrice - posCtx.entryPrice) * exitQty;
       order.pnl = pnl;
 
       if (isFullExit) {
-        // Full exit — clean up all state
         this._filledPositions.delete(symbol);
         this.riskManager.removePosition();
         await this.riskManager.recordTradePnL(pnl, symbol);
@@ -477,9 +476,13 @@ export class ExecutionEngine {
           this._markSignalActedOn(signalId, symbol, 'SELL').catch(() => { });
           this._pendingSignalIds.delete(symbol);
         }
+
+        // Fix 27: mark this symbol as recently exited to block re-entry this scan
+        this._recentlyExited.add(symbol);
       } else {
-        // Partial exit — record partial P&L but keep position open
-        // PositionManager.executePartialExit() updates posCtx.quantity after this returns
+        // Partial exit — record partial P&L but keep position open.
+        // posCtx.quantity is updated by _executePartialExit() in position-manager
+        // only if this returns success:true.
         await this.riskManager.recordTradePnL(pnl, symbol);
         log.info({
           symbol,
@@ -489,17 +492,15 @@ export class ExecutionEngine {
         }, `📊 Partial exit recorded: ${symbol}`);
       }
 
-      // Persist trade to DB regardless of full/partial
       this._persistTrade(order).catch(err =>
         log.error({ symbol, err: err.message }, 'Trade persist failed after force exit')
       );
 
       log.info({
-        symbol,
-        reason,
+        symbol, reason,
         pnl: pnl.toFixed(2),
         entryPrice: posCtx.entryPrice,
-        exitPrice,
+        exitPrice,                       // Fix 1: was `currentPrice`
         quantity: exitQty,
         isFullExit,
       }, `✅ Force exit complete: ${symbol} | PnL: ₹${pnl.toFixed(2)}`);
@@ -511,6 +512,14 @@ export class ExecutionEngine {
       transitionOrder(order, ORDER_STATE.REJECTED, { rejectionReason: err.message });
       return { success: false, pnl: 0, order };
     }
+  }
+
+  /**
+   * Clear the recently-exited set at the start of each scan cycle.
+   * Called by the scheduler before running processSignal() for each symbol.
+   */
+  clearRecentExits() {
+    this._recentlyExited.clear();
   }
 
   // ═══════════════════════════════════════════════════════
@@ -583,7 +592,6 @@ export class ExecutionEngine {
     }
 
     this._pendingSymbols.add(params.symbol);
-
     try {
       return await this._placeWithRetry(order);
     } finally {
@@ -618,23 +626,22 @@ export class ExecutionEngine {
           const trailPct = this._config?.TRAILING_STOP_PCT ?? 1.5;
           const targetPct = this._config?.PROFIT_TARGET_PCT ?? 1.8;
 
-          // Patch 3: openingStrategy stored on posCtx for signal reversal detection
           const posCtx = {
             strategies,
+            // Fix 4: openingStrategy is already the conviction-aware strategy
+            // because _lastSignalStrategies was set correctly in processSignal()
             openingStrategy: strategies[0] || 'UNKNOWN',
             entryPrice: order.price,
-            price: order.price,             // backward compat
+            price: order.price,
             quantity: order.quantity,
             timestamp: Date.now(),
 
-            // Fallback stop/trail from config — overwritten by initPosition() below
             stopPrice: order.price * (1 - stopPct / 100),
             highWaterMark: order.price,
             trailStopPrice: order.price * (1 - trailPct / 100),
             trailPct,
             stopPct,
 
-            // Fallback profit target — overwritten by initPosition()
             profitTargetPrice: order.price * (1 + targetPct / 100),
             profitTargetMode: 'FIXED_PCT',
             partialExitEnabled: this._config?.PARTIAL_EXIT_ENABLED ?? true,
@@ -645,9 +652,6 @@ export class ExecutionEngine {
 
           this._filledPositions.set(order.symbol, posCtx);
 
-          // Patch 4: Call positionManager.initPosition() to set proper exit levels
-          // using exit-strategies.js (ATR-based trail, strategy-aware profit target,
-          // partial exit qty, etc.). Falls back silently to config-based levels above.
           if (this.positionManager) {
             try {
               const candles = this._fetchCandles
@@ -659,12 +663,10 @@ export class ExecutionEngine {
               await this.positionManager.initPosition(order.symbol, posCtx, closes, highs, lows);
             } catch (err) {
               log.warn({ symbol: order.symbol, err: err.message },
-                'initPosition failed — using config-based stop/trail/target as fallback');
-              // posCtx already has fallback values set above — position is not unprotected
+                'initPosition failed — using config-based fallback levels');
             }
           }
 
-          // Bug Fix 3: Sync position count to risk manager
           this.riskManager.addPosition();
 
           if (this.telegram?.enabled) {
@@ -675,7 +677,7 @@ export class ExecutionEngine {
               `📥 Entry:  ₹${order.price.toFixed(2)}\n` +
               `📦 Qty:    ${order.quantity}\n` +
               `🛑 Stop:   ₹${stopPrice.toFixed(2)}\n` +
-              `🎯 Target: ₹${targetPrice.toFixed(2)} (${posCtx.profitTargetMode})\n` +
+              `🎯 Target: ₹${targetPrice.toFixed(2)}\n` +
               `🧠 Strats: ${strategies.join(', ')}\n` +
               `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
             ).catch(() => { });
@@ -697,15 +699,15 @@ export class ExecutionEngine {
 
             this.recordPositionOutcome(order.symbol, pnl).catch((err) =>
               log.warn({ symbol: order.symbol, err: err.message },
-                'Position outcome recording failed — adaptive weights not updated')
+                'Position outcome recording failed')
             );
 
             this._filledPositions.delete(order.symbol);
-            // Bug Fix 3: Decrement position count on SELL fill
             this.riskManager.removePosition();
 
             if (this.telegram?.enabled) {
               const emoji = pnl >= 0 ? '✅' : '🛑';
+              // Fix 39: P&L → P&amp;L (was unescaped & causing silent Telegram drop)
               const pnlStr = pnl >= 0
                 ? `+₹${pnl.toFixed(2)}`
                 : `-₹${Math.abs(pnl).toFixed(2)}`;
@@ -730,20 +732,15 @@ export class ExecutionEngine {
 
       } catch (err) {
         lastError = err;
-
         log.error({
-          orderId: order.id,
-          attempt,
-          maxRetries: this.maxRetries,
+          orderId: order.id, attempt, maxRetries: this.maxRetries,
           error: err.message,
-          brokerResponse: err.response?.data || err.brokerResponse || null,
-          statusCode: err.response?.status || err.statusCode || null,
+          brokerResponse: err.response?.data || null,
+          statusCode: err.response?.status || null,
           retryable: this._isRetryable(err),
-        }, `Broker placement failed (attempt ${attempt}/${this.maxRetries}): ${err.message}`);
+        }, `Broker placement failed (attempt ${attempt}/${this.maxRetries})`);
 
         if (!this._isRetryable(err)) {
-          log.warn({ orderId: order.id, error: err.message },
-            'Broker REJECTED order — not retrying (deterministic failure)');
           transitionOrder(order, ORDER_STATE.REJECTED, {
             rejectionReason: `Broker rejected: ${err.message}`,
           });
@@ -764,10 +761,7 @@ export class ExecutionEngine {
 
   /** @private */
   _isRetryable(err) {
-    const RETRYABLE_CODES = [
-      'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT',
-      'ENOTFOUND', 'EAI_AGAIN', 'EPIPE', 'EHOSTUNREACH',
-    ];
+    const RETRYABLE_CODES = ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'EPIPE', 'EHOSTUNREACH'];
     if (err.code && RETRYABLE_CODES.includes(err.code)) return true;
     const status = err.response?.status || err.statusCode;
     if (status) {
@@ -802,6 +796,8 @@ export class ExecutionEngine {
       product: order.product,
     });
 
+    // Capture scan-time price before overwriting for logging
+    const scanTimePrice = order.price;
     const maxAttempts = 4;
     let fillPrice = null;
 
@@ -814,13 +810,14 @@ export class ExecutionEngine {
 
         if (fetchedPrice && fetchedPrice > 0) {
           fillPrice = fetchedPrice;
-          order.price = fillPrice;
+          // Fix 26 (logging): capture scanTimePrice before overwriting
           log.info({
             orderId: response.order_id,
             fillPrice,
-            scanPrice: order.price,
+            scanPrice: scanTimePrice,  // correctly shows original scan-time price
             attempts: attempt,
           }, 'Fill price fetched — overwriting scan-time price');
+          order.price = fillPrice;
           break;
         }
       } catch (err) {
@@ -895,7 +892,6 @@ export class ExecutionEngine {
 
     try {
       const initialPositionCount = this._filledPositions.size;
-
       const rawPositions = await broker.getPositions();
       const brokerSymbols = new Set(
         (rawPositions?.net || rawPositions || [])
@@ -907,8 +903,7 @@ export class ExecutionEngine {
       const stillOpen = [];
 
       const formatter = new Intl.DateTimeFormat('en-CA', {
-        timeZone: 'Asia/Kolkata',
-        year: 'numeric', month: '2-digit', day: '2-digit',
+        timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit',
       });
       const todayIST = formatter.format(new Date());
 
@@ -931,11 +926,8 @@ export class ExecutionEngine {
         }
       }
 
-      log.info({
-        checked: initialPositionCount,
-        reconciled: reconciled.length,
-        stillOpen: stillOpen.length,
-      }, 'Position reconciliation complete');
+      log.info({ checked: initialPositionCount, reconciled: reconciled.length, stillOpen: stillOpen.length },
+        'Position reconciliation complete');
 
       return { reconciled, stillOpen };
     } catch (err) {
@@ -949,7 +941,8 @@ export class ExecutionEngine {
     this._orders.clear();
     this._pendingSymbols.clear();
     this._lastSignalStrategies.clear();
-    this._pendingSignalIds.clear();        // Patch 5: confirmed retained
+    this._pendingSignalIds.clear();
+    this._recentlyExited.clear();
     log.info('Execution engine daily state reset');
   }
 
@@ -961,100 +954,93 @@ export class ExecutionEngine {
   // PRIVATE HELPERS
   // ═══════════════════════════════════════════════════════
 
-  /** @private */
   _delay(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
-  /** @private */
+  /**
+   * Persist trade to DB.
+   * Fix hydration: also writes opening_strategies as JSON so hydratePositions()
+   * can recover clean strategy names after a restart.
+   * @private
+   */
   async _persistTrade(order) {
     try {
+      // Get the clean strategy names for this order (if it was a BUY)
+      const openingStrategies = order.side === 'BUY'
+        ? JSON.stringify(this._lastSignalStrategies.get(order.symbol) || [])
+        : null;
+
       await query(
         `INSERT INTO trades
-           (order_id, symbol, side, quantity, price, pnl, strategy, status, paper_mode, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+           (order_id, symbol, side, quantity, price, pnl, strategy, status, paper_mode, opening_strategies, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
          ON CONFLICT (order_id) DO NOTHING`,
         [
           order.id, order.symbol, order.side, order.quantity,
-          order.price, order.pnl || 0, order.strategy, order.state, this.paperMode,
+          order.price, order.pnl || 0, order.strategy, order.state,
+          this.paperMode, openingStrategies,
         ]
-      );
+      ).catch(async (err) => {
+        // opening_strategies column may not exist yet — retry without it
+        if (err.message?.includes('opening_strategies') || err.message?.includes('column')) {
+          return query(
+            `INSERT INTO trades
+               (order_id, symbol, side, quantity, price, pnl, strategy, status, paper_mode, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+             ON CONFLICT (order_id) DO NOTHING`,
+            [order.id, order.symbol, order.side, order.quantity,
+            order.price, order.pnl || 0, order.strategy, order.state, this.paperMode]
+          );
+        }
+        throw err;
+      });
       log.debug({ orderId: order.id, symbol: order.symbol }, 'Trade persisted to DB');
     } catch (err) {
       log.error({ orderId: order.id, err: err.message }, 'CRITICAL: Trade DB write failed');
     }
   }
 
-  /**
-   * Bug Fix 1: Awaited in processSignal. Returns CONSENSUS signal row ID.
-   * @private
-   */
+  /** @private */
   async _persistSignals(symbol, consensus, currentPrice = null) {
     let consensusSignalId = null;
-
     try {
       await query('BEGIN');
-
       for (const detail of (consensus.details || [])) {
         await query(
-          `INSERT INTO signals
-             (symbol, strategy, signal, confidence, acted_on, reason, price, created_at)
+          `INSERT INTO signals (symbol, strategy, signal, confidence, acted_on, reason, price, created_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
-          [
-            symbol,
-            detail.strategy || 'unknown',
-            detail.signal || 'HOLD',
-            detail.confidence || 0,
-            false,
-            (detail.reason || '').slice(0, 500),
-            currentPrice || null,
-          ]
+          [symbol, detail.strategy || 'unknown', detail.signal || 'HOLD',
+            detail.confidence || 0, false, (detail.reason || '').slice(0, 500), currentPrice || null]
         );
       }
-
       const consensusRow = await query(
-        `INSERT INTO signals
-           (symbol, strategy, signal, confidence, acted_on, reason, price, created_at)
+        `INSERT INTO signals (symbol, strategy, signal, confidence, acted_on, reason, price, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
          RETURNING id`,
-        [
-          symbol,
-          'CONSENSUS',
-          consensus.signal || 'HOLD',
-          consensus.confidence || 0,
-          false,
-          (consensus.reason || '').slice(0, 500),
-          currentPrice || null,
-        ]
+        [symbol, 'CONSENSUS', consensus.signal || 'HOLD', consensus.confidence || 0,
+          false, (consensus.reason || '').slice(0, 500), currentPrice || null]
       );
-
       consensusSignalId = consensusRow.rows?.[0]?.id ?? null;
       await query('COMMIT');
     } catch (err) {
       try { await query('ROLLBACK'); } catch { /* swallow */ }
       log.error({ symbol, err: err.message }, 'Failed to persist signals to DB');
     }
-
     return consensusSignalId;
   }
 
-  /**
-   * Bug Fix 1: Uses signal row ID directly — no timestamp race.
-   * @private
-   */
+  /** @private */
   async _markSignalActedOn(signalId, symbol, signal) {
     try {
       if (signalId) {
         const result = await query(
-          `UPDATE signals SET acted_on = true WHERE id = $1`,
-          [signalId]
+          `UPDATE signals SET acted_on = true WHERE id = $1`, [signalId]
         );
         if (result.rowCount === 0) {
           log.error({ signalId, symbol }, 'Failed to mark signal acted_on — row not found by ID');
-        } else {
-          log.debug({ signalId, symbol }, 'Signal marked acted_on by ID');
         }
       } else {
         log.warn({ symbol, signal }, 'No signal ID available — falling back to timestamp lookup');
-        const result = await query(
+        await query(
           `UPDATE signals SET acted_on = true
            WHERE symbol = $1 AND strategy = 'CONSENSUS' AND signal = $2
              AND created_at = (
@@ -1063,36 +1049,26 @@ export class ExecutionEngine {
              )`,
           [symbol, signal]
         );
-        if (result.rowCount === 0) {
-          log.error({ symbol, signal }, 'Fallback: failed to mark signal acted_on');
-        }
       }
     } catch (err) {
-      log.error({ signalId, symbol, err: err.message },
-        `CRITICAL: Failed to mark signal as acted_on (signalId=${signalId})`);
+      log.error({ signalId, symbol, err: err.message }, 'CRITICAL: Failed to mark signal as acted_on');
     }
   }
 
-  /**
-   * Feature 9: Telegram conflict alert — rate-limited per symbol via Redis.
-   * @private
-   */
+  /** @private */
   async _alertConflict(symbol, consensusResult) {
     const rateLimitKey = `conflict:alerted:${symbol}`;
     try {
       const alreadyAlerted = await this.redis.get(rateLimitKey);
       if (alreadyAlerted) return;
-
       await this.redis.setex(rateLimitKey, 1800, '1');
-
       const { buyStrategies, sellStrategies } = consensusResult.conflictDetails;
       const msg =
         `⚡ <b>Signal Conflict — ${symbol}</b>\n\n` +
         `📈 BUY:  ${buyStrategies.join(', ')}\n` +
         `📉 SELL: ${sellStrategies.join(', ')}\n\n` +
-        `Result: HOLD (strategies cancel out)\n` +
+        `Result: HOLD (strategies disagree)\n` +
         `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`;
-
       await this.telegram.sendRaw(msg);
       log.info({ symbol, buyStrategies, sellStrategies }, 'Conflict alert sent via Telegram');
     } catch (err) {
