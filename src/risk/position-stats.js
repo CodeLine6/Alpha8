@@ -124,4 +124,80 @@ export class PositionStats {
             };
         }
     }
+
+    /**
+     * Batch fetch Kelly-input stats for multiple symbols in a single DB query.
+     * Use this in scan loops instead of calling getStats() N times.
+     * Does NOT use Redis cache (assumed to be called once per scan cycle).
+     *
+     * @param {string[]} symbols
+     * @returns {Promise<Map<string, Object>>}
+     */
+    async getStatsBatch(symbols) {
+        if (!symbols || symbols.length === 0) {
+            return new Map();
+        }
+
+        const statsMap = new Map();
+
+        // Pre-fill map with defaults for all requested symbols
+        for (const symbol of symbols) {
+            statsMap.set(symbol, {
+                ...DEFAULTS,
+                sampleSize: 0,
+                usingDefaults: true,
+            });
+        }
+
+        try {
+            log.debug({ symbols: symbols.length, dbQuery: 1 }, 'Fetching position stats batch');
+
+            const result = await query(
+                `SELECT
+                   symbol,
+                   COUNT(*)                                              AS total,
+                   COUNT(*) FILTER (WHERE outcome = 'WIN')              AS wins,
+                   AVG(pnl)  FILTER (WHERE outcome = 'WIN' AND pnl > 0) AS avg_win,
+                   AVG(ABS(pnl)) FILTER (WHERE outcome = 'LOSS' AND pnl < 0) AS avg_loss
+                 FROM signal_outcomes
+                 WHERE symbol = ANY($1::text[])
+                   AND recorded_at >= NOW() - INTERVAL '60 days'
+                 GROUP BY symbol`,
+                [symbols]
+            );
+
+            for (const row of result.rows) {
+                const symbol = row.symbol;
+                const total = parseInt(row.total, 10) || 0;
+
+                if (total >= 10) {
+                    const wins = parseInt(row.wins, 10) || 0;
+                    const rawWinRate = wins / total;
+                    const winRate = Math.min(Math.max(rawWinRate, 0.1), 0.9);
+                    const avgWin = parseFloat(row.avg_win) || DEFAULTS.avgWin;
+                    const avgLoss = parseFloat(row.avg_loss) || DEFAULTS.avgLoss;
+
+                    statsMap.set(symbol, {
+                        winRate,
+                        avgWin,
+                        avgLoss,
+                        sampleSize: total,
+                        usingDefaults: false,
+                    });
+                } else {
+                    // Update sample size even if using defaults
+                    statsMap.set(symbol, {
+                        ...DEFAULTS,
+                        sampleSize: total,
+                        usingDefaults: true,
+                    });
+                }
+            }
+
+            return statsMap;
+        } catch (err) {
+            log.error({ err: err.message }, 'posStats: error fetching batched stats — returning defaults for all');
+            return statsMap;
+        }
+    }
 }

@@ -104,20 +104,20 @@ export class MarketScheduler {
       cron.schedule('0,5,10,15,20,25,30,35,40,45,50,55 10-14 * * 1-5', () => this._runJob('strategy-scan', () => this._strategyScan()), opts)
     );
     this._cronJobs.push(
-      cron.schedule('0,5 15 * * 1-5', () => this._runJob('strategy-scan', () => this._strategyScan()), opts)
+      cron.schedule('0,5,10 15 * * 1-5', () => this._runJob('strategy-scan', () => this._strategyScan()), opts)
     );
 
-    // 4. Square-off warning: 3:10 PM IST
+    // 4. Square-off warning: 15:10 PM IST
     this._cronJobs.push(
       cron.schedule('10 15 * * 1-5', () => this._runJob('squareoff-warning', () => this._squareOffWarning()), opts)
     );
 
-    // 5. Square-off: 3:15 PM IST
+    // 5. Square-off: 15:15 PM IST
     this._cronJobs.push(
       cron.schedule('15 15 * * 1-5', () => this._runJob('square-off', () => this._squareOff()), opts)
     );
 
-    // 6. Post-market: 3:35 PM IST
+    // 6. Post-market: 15:35 PM IST
     this._cronJobs.push(
       cron.schedule('35 15 * * 1-5', () => this._runJob('post-market', () => this._postMarket()), opts)
     );

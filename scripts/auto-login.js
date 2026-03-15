@@ -29,6 +29,7 @@ dotenvConfig();
 import puppeteer from 'puppeteer';
 import { TOTP } from 'otpauth';
 import { createRequire } from 'node:module';
+import { normalizeRedisUrl } from '../src/lib/redis-utils.js';
 
 const require = createRequire(import.meta.url);
 const { KiteConnect } = require('kiteconnect');
@@ -93,23 +94,23 @@ async function storeTokenInRedis(accessToken) {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
       const { default: Redis } = await import('ioredis');
-      const url = (REDIS_URL.includes('upstash.io') && REDIS_URL.startsWith('redis://'))
-        ? REDIS_URL.replace('redis://', 'rediss://')
-        : REDIS_URL;
+      const url = normalizeRedisUrl(REDIS_URL);
 
-      const redis = new Redis(url, {
-        keyPrefix: 'alpha8:',
-        lazyConnect: true,
-        family: 4
-      });
-
+      let redis;
       try {
+        redis = new Redis(url, {
+          keyPrefix: 'alpha8:',
+          lazyConnect: true,
+          family: 4
+        });
+
         await redis.connect();
         await redis.set(REDIS_KEY, valueToStore, 'EX', REDIS_TTL);
         console.log(`✅ Access token stored in Redis (key: alpha8:${REDIS_KEY}, TTL: 24h)`);
         return; // Success!
       } finally {
-        await redis.quit();
+        // Always release connection regardless of outcome
+        if (redis) await redis.quit();
       }
     } catch (err) {
       console.error(`❌ Redis store attempt ${attempt}/${MAX_RETRIES} failed: ${err.message}`);
@@ -140,26 +141,29 @@ async function storeTokenInRedis(accessToken) {
 async function engageKillSwitch(reason) {
   try {
     const { default: Redis } = await import('ioredis');
-    const url = (REDIS_URL.includes('upstash.io') && REDIS_URL.startsWith('redis://'))
-      ? REDIS_URL.replace('redis://', 'rediss://')
-      : REDIS_URL;
+    const url = normalizeRedisUrl(REDIS_URL);
 
-    const redis = new Redis(url, {
-      keyPrefix: 'alpha8:',
-      lazyConnect: true,
-      family: 4
-    });
+    let redis;
+    try {
+      redis = new Redis(url, {
+        keyPrefix: 'alpha8:',
+        lazyConnect: true,
+        family: 4
+      });
 
-    await redis.connect();
-    const killState = JSON.stringify({
-      engaged: true,
-      reason,
-      engagedAt: new Date().toISOString(),
-      drawdownPct: 0,
-    });
-    await redis.set('risk:kill_switch', killState);
-    console.log('🛑 Kill switch ENGAGED in Redis');
-    await redis.quit();
+      await redis.connect();
+      const killState = JSON.stringify({
+        engaged: true,
+        reason,
+        engagedAt: new Date().toISOString(),
+        drawdownPct: 0,
+      });
+      await redis.set('risk:kill_switch', killState);
+      console.log('🛑 Kill switch ENGAGED in Redis');
+    } finally {
+      // Always release connection regardless of outcome
+      if (redis) await redis.quit();
+    }
   } catch (err) {
     console.error('Failed to engage kill switch in Redis:', err.message);
   }
@@ -375,18 +379,25 @@ async function generateAccessToken(requestToken) {
 
 // ─── Main ────────────────────────────────────────────────
 
-async function main() {
+export async function runAutoLogin(options = {}) {
+  const { silent = false } = options;
   const startTime = Date.now();
   const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
 
-  console.log('');
-  console.log('═══════════════════════════════════════════════════');
-  console.log('  🔐 Alpha8 Auto-Login');
-  console.log(`  🕐 ${timestamp}`);
-  console.log('═══════════════════════════════════════════════════');
-  console.log('');
+  if (!silent) {
+    console.log('');
+    console.log('═══════════════════════════════════════════════════');
+    console.log('  🔐 Alpha8 Auto-Login');
+    console.log(`  🕐 ${timestamp}`);
+    console.log('═══════════════════════════════════════════════════');
+    console.log('');
+  }
 
-  validateConfig();
+  try {
+    validateConfig();
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
 
   try {
     // Step 1: Browser login → request_token
@@ -402,7 +413,10 @@ async function main() {
     const kite = new KiteConnect({ api_key: KITE_API_KEY });
     kite.setAccessToken(accessToken);
     const profile = await kite.getProfile();
-    console.log(`✅ Token verified — logged in as: ${profile.user_name} (${profile.user_id})`);
+
+    if (!silent) {
+      console.log(`✅ Token verified — logged in as: ${profile.user_name} (${profile.user_id})`);
+    }
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
@@ -416,14 +430,19 @@ async function main() {
       `🟢 Ready to trade`
     );
 
-    console.log('');
-    console.log(`🎯 Login complete in ${elapsed}s — ready to trade!`);
-    console.log('');
-    process.exit(0);
+    if (!silent) {
+      console.log('');
+      console.log(`🎯 Login complete in ${elapsed}s — ready to trade!`);
+      console.log('');
+    }
+
+    return { success: true, accessToken };
   } catch (err) {
-    console.error('');
-    console.error(`❌ AUTO-LOGIN FAILED: ${err.message}`);
-    console.error('');
+    if (!silent) {
+      console.error('');
+      console.error(`❌ AUTO-LOGIN FAILED: ${err.message}`);
+      console.error('');
+    }
 
     // Engage kill switch
     await engageKillSwitch(`Auto-login failed: ${err.message}`);
@@ -441,8 +460,14 @@ async function main() {
       `Kill switch ENGAGED — trading halted.`
     );
 
-    process.exit(1);
+    return { success: false, error: err.message };
   }
 }
 
-main();
+// ─── CLI Entrypoint ──────────────────────────────────────
+if (import.meta.url === new URL(process.argv[1], 'file:').href) {
+  runAutoLogin({ silent: false }).then(result => {
+    if (!result.success) process.exit(1);
+    process.exit(0);
+  });
+}

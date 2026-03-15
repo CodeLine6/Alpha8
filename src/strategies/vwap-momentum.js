@@ -67,6 +67,7 @@ export class VWAPMomentumStrategy extends BaseStrategy {
     } catch (err) {
       log.warn({ err: err.message }, 'VWAP refreshParams failed — keeping current values');
     }
+
   }
 
   /**
@@ -75,17 +76,23 @@ export class VWAPMomentumStrategy extends BaseStrategy {
    *
    * @param {import('../data/historical-data.js').Candle[]} candles
    * @param {Object} [options]
-   * @param {boolean} [options.anchorToday=true]
-   * @returns {number[]}
+   * @param {import('../data/historical-data.js').Candle[]} candles
+   * @param {Object} [options]
+   * @param {boolean} [options.anchorToday=true] - When true, filters to current IST session (09:15 onwards). Set false for backtesting with pre-sliced daily candles.
+   * @returns {number[]} Running VWAP values
+
    */
   calculateVWAP(candles, { anchorToday = true } = {}) {
     let filteredCandles = candles;
 
     if (anchorToday && candles.length > 0) {
+      // Find today's date in IST from the latest candle safely
       const validCandles = candles.filter(c => {
+        if (!c) return false;
         const ts = c.timestamp || c.date;
         if (!ts) return false;
         const t = new Date(ts).getTime();
+
         return !isNaN(t) && t > 0;
       });
 
@@ -98,6 +105,8 @@ export class VWAPMomentumStrategy extends BaseStrategy {
         if (t > maxTime) maxTime = t;
       }
 
+      // 19800000 = 330 minutes * 60 * 1000 = +5:30 IST
+
       const latestIstDate = new Date(maxTime + 19800000);
       if (isNaN(latestIstDate.getTime())) return [];
 
@@ -107,14 +116,20 @@ export class VWAPMomentumStrategy extends BaseStrategy {
         const ts = c.timestamp || c.date;
         const cTime = new Date(ts).getTime();
         const istDate = new Date(cTime + 19800000);
+
         if (isNaN(istDate.getTime())) return false;
+
         const isToday = istDate.toISOString().split('T')[0] === todayDateStr;
+
         const uDate = new Date(cTime);
         const utcMinutes = uDate.getUTCHours() * 60 + uDate.getUTCMinutes();
         return isToday && utcMinutes >= 225;
       });
 
-      if (filteredCandles.length < this.minCandles) return [];
+      if (filteredCandles.length < this.minCandles) {
+        return [];
+      }
+
     }
 
     const vwapValues = [];
@@ -148,6 +163,8 @@ export class VWAPMomentumStrategy extends BaseStrategy {
         return this.hold(`Insufficient data: need ${this.minCandles} candles, got ${candles.length}`);
       }
 
+      // Calculate VWAP
+
       const vwapValues = this.calculateVWAP(candles, { anchorToday: this.anchorToday });
 
       if (vwapValues.length === 0) {
@@ -159,6 +176,8 @@ export class VWAPMomentumStrategy extends BaseStrategy {
 
       const currentVWAP = vwapValues[vwapValues.length - 1];
       const previousVWAP = vwapValues[vwapValues.length - 2];
+
+
       const currentPrice = closes[closes.length - 1];
       const previousPrice = closes[closes.length - 2];
       const currentVolume = volumes[volumes.length - 1];
@@ -166,12 +185,18 @@ export class VWAPMomentumStrategy extends BaseStrategy {
       // Average volume
       const recentVolumes = volumes.slice(-this.volumeAvgPeriod);
       const avgVolume = recentVolumes.reduce((a, b) => a + b, 0) / recentVolumes.length;
-      const volumeRatio = avgVolume > 0 ? currentVolume / avgVolume : 0;
-      const hasVolumeConfirmation = volumeRatio >= this.volumeMultiplier;
+
+      // Price deviation from VWAP
 
       const deviation = ((currentPrice - currentVWAP) / currentVWAP) * 100;
       const absDeviation = Math.abs(deviation);
       const bandThreshold = this.priceBandPct;
+
+      // Volume confirmation
+      const volumeRatio = avgVolume > 0 ? currentVolume / avgVolume : 0;
+      const hasVolumeConfirmation = volumeRatio >= this.volumeMultiplier;
+
+      // Detect VWAP crossover
 
       const bullishCross = previousPrice <= previousVWAP && currentPrice > currentVWAP;
       const bearishCross = previousPrice >= previousVWAP && currentPrice < currentVWAP;
@@ -179,9 +204,10 @@ export class VWAPMomentumStrategy extends BaseStrategy {
       // ─── Bullish: Price crosses above VWAP ───────────────
       if (bullishCross && absDeviation > bandThreshold) {
         let confidence = 45;
-        confidence += Math.min(absDeviation * 10, 25);
-        if (hasVolumeConfirmation) confidence += 20;
-        confidence += Math.min(volumeRatio * 5, 10);
+        confidence += Math.min(absDeviation * 10, 25); // deviation bonus
+        if (hasVolumeConfirmation) confidence += 20; // volume bonus
+        confidence += Math.min(volumeRatio * 5, 10); // extra volume strength
+
 
         const reason =
           `Price crossed above VWAP. ` +
@@ -222,12 +248,17 @@ export class VWAPMomentumStrategy extends BaseStrategy {
         }
       }
 
+
+      // ─── Neutral ─────────────────────────────────────────
+
       const side = deviation > 0 ? 'above' : 'below';
       return this.hold(
         `Price ${side} VWAP (${deviation.toFixed(2)}%). ` +
         `VWAP=${currentVWAP.toFixed(2)}. Volume: ${volumeRatio.toFixed(1)}x avg`
       );
     } catch (err) {
+      // We append a specialized tag so if this bubbles up, we know EXACTLY where it came from.
+
       err.message = '[VWAP_CRITICAL] ' + err.message + '\nStack: ' + err.stack;
       throw err;
     }

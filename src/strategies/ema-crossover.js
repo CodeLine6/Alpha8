@@ -102,6 +102,8 @@ export class EMACrossoverStrategy extends BaseStrategy {
       return this.hold('Not enough EMA data points for crossover detection');
     }
 
+    // EMA library outputs same-length arrays; tail indexing is safe without offset
+
     const currentFast = fastEMA[fastEMA.length - 1];
     const previousFast = fastEMA[fastEMA.length - 2];
     const currentSlow = slowEMA[slowEMA.length - 1];

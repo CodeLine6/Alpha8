@@ -49,29 +49,7 @@ const MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS idx_trades_created_at ON trades(created_at);`,
   `CREATE INDEX IF NOT EXISTS idx_trades_status     ON trades(status);`,
 
-  // ─── 2. POSITIONS ────────────────────────────────────────────────────────────
-  // Writers : nothing in current codebase (populated externally / future)
-  // Readers : backend-api.js — reads avg_price, current_price, stop_loss, product, strategy
-  // NO UNIQUE on symbol — multiple position rows per symbol must be allowed
-  `CREATE TABLE IF NOT EXISTS positions (
-    id            SERIAL PRIMARY KEY,
-    symbol        VARCHAR(20)  NOT NULL,
-    side          VARCHAR(4)   NOT NULL CHECK (side IN ('BUY', 'SELL')),
-    quantity      INTEGER      NOT NULL,
-    avg_price     NUMERIC(12,2) NOT NULL,
-    current_price NUMERIC(12,2),
-    stop_loss     NUMERIC(12,2),
-    product       VARCHAR(10)  DEFAULT 'MIS',
-    strategy      VARCHAR(50),
-    paper_trade   BOOLEAN      NOT NULL DEFAULT true,
-    opened_at     TIMESTAMPTZ  DEFAULT NOW(),
-    updated_at    TIMESTAMPTZ  DEFAULT NOW()
-  );`,
-
-  `CREATE INDEX IF NOT EXISTS idx_positions_symbol    ON positions(symbol);`,
-  `CREATE INDEX IF NOT EXISTS idx_positions_opened_at ON positions(opened_at);`,
-
-  // ─── 3. SIGNALS ──────────────────────────────────────────────────────────────
+  // ─── 2. SIGNALS ──────────────────────────────────────────────────────────────
   // Writers : execution-engine.js — INSERT (symbol, strategy, signal, confidence, acted_on, reason, created_at)
   //           execution-engine.js — UPDATE signals SET acted_on = true
   // Readers : backend-api.js — reads strategy, symbol, signal, confidence, acted_on, created_at
@@ -91,29 +69,7 @@ const MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS idx_signals_strategy   ON signals(strategy);`,
   `CREATE INDEX IF NOT EXISTS idx_signals_created_at ON signals(created_at);`,
 
-  // ─── 4. DAILY SUMMARY ────────────────────────────────────────────────────────
-  // Writers : nothing in current codebase (populated externally / future)
-  // Readers : backend-api.js — reads pnl, pnl_pct, trade_count, win_count, loss_count,
-  //                             filled, rejected, best_trade, worst_trade
-  // best_trade / worst_trade are NUMERIC — backend does parseFloat(dbSummary.best_trade)
-  `CREATE TABLE IF NOT EXISTS daily_summary (
-    id          SERIAL PRIMARY KEY,
-    trade_date  DATE         NOT NULL UNIQUE,
-    pnl         NUMERIC(12,2) DEFAULT 0,
-    pnl_pct     NUMERIC(6,2)  DEFAULT 0,
-    trade_count INTEGER      DEFAULT 0,
-    win_count   INTEGER      DEFAULT 0,
-    loss_count  INTEGER      DEFAULT 0,
-    filled      INTEGER      DEFAULT 0,
-    rejected    INTEGER      DEFAULT 0,
-    best_trade  NUMERIC(12,2),
-    worst_trade NUMERIC(12,2),
-    created_at  TIMESTAMPTZ  DEFAULT NOW()
-  );`,
-
-  `CREATE INDEX IF NOT EXISTS idx_daily_summary_date ON daily_summary(trade_date);`,
-
-  // ─── 5. SETTINGS ─────────────────────────────────────────────────────────────
+  // ─── 3. SETTINGS ─────────────────────────────────────────────────────────────
   // Writers : backend-api.js        — stores watchlist as JSON.stringify(array)
   //           symbol-scout.js       — stores dynamic_watchlist as JSON.stringify(array)
   // Readers : backend-api.js, symbol-scout.js — both do JSON.parse(result.rows[0].value)
@@ -125,7 +81,7 @@ const MIGRATIONS = [
     updated_at TIMESTAMPTZ  DEFAULT NOW()
   );`,
 
-  // ─── 6. SIGNAL OUTCOMES ──────────────────────────────────────────────────────
+  // ─── 4. SIGNAL OUTCOMES ──────────────────────────────────────────────────────
   // Writers : adaptive-weights.js — INSERT (strategy, signal, symbol, outcome, pnl, recorded_at)
   // Readers : adaptive-weights.js — SELECT per strategy for weight calculation
   //           symbol-scout.js     — SELECT per symbol for track record scoring + consecutive losses
@@ -142,7 +98,7 @@ const MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS idx_signal_outcomes_strategy ON signal_outcomes(strategy, recorded_at);`,
   `CREATE INDEX IF NOT EXISTS idx_signal_outcomes_symbol   ON signal_outcomes(symbol, recorded_at);`,
 
-  // ─── 7. SYMBOL SCORES ────────────────────────────────────────────────────────
+  // ─── 5. SYMBOL SCORES ────────────────────────────────────────────────────────
   // Writers : symbol-scout.js — INSERT nightly score snapshot per symbol
   // Readers : symbol-scout.js — SELECT latest scan for dashboard display
   `CREATE TABLE IF NOT EXISTS symbol_scores (
@@ -156,7 +112,7 @@ const MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS idx_symbol_scores_symbol     ON symbol_scores(symbol, scanned_at DESC);`,
   `CREATE INDEX IF NOT EXISTS idx_symbol_scores_scanned_at ON symbol_scores(scanned_at DESC);`,
 
-  // ─── 8. WATCHLIST LOG ────────────────────────────────────────────────────────
+  // ─── 6. WATCHLIST LOG ────────────────────────────────────────────────────────
   // Writers : symbol-scout.js — INSERT on every add/remove
   // Readers : dashboard (audit trail of scout decisions)
   `CREATE TABLE IF NOT EXISTS watchlist_log (
@@ -170,7 +126,7 @@ const MIGRATIONS = [
 
   `CREATE INDEX IF NOT EXISTS idx_watchlist_log_symbol    ON watchlist_log(symbol, logged_at DESC);`,
   `CREATE INDEX IF NOT EXISTS idx_watchlist_log_logged_at ON watchlist_log(logged_at DESC);`,
-  // ─── 9. SHADOW SIGNALS ───────────────────────────────────────────────────────
+  // ─── 7. SHADOW SIGNALS ───────────────────────────────────────────────────────
   // Writers : shadow-recorder.js  — INSERT on every scan cycle (fire-and-forget)
   //           shadow-recorder.js  — UPDATE price_after_* columns every 30min background job
   // Readers : shadow-recorder.js  — getStrategyAccuracy() for unbiased weight calculation

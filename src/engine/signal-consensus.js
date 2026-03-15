@@ -123,6 +123,7 @@ export class SignalConsensus {
     this.minAgreement = config.minAgreement ?? 2;
     this.minConfidence = config.minConfidence ?? 40;
     this.groupedConsensus = config.groupedConsensus ?? true;
+    this.superConvictionEnabled = config.superConvictionEnabled ?? false;
 
     /** @type {import('../strategies/base-strategy.js').BaseStrategy[]} */
     this.strategies = [];
@@ -361,6 +362,25 @@ export class SignalConsensus {
       const reason = `SELL consensus: ${reversalNames.map(n => `${n}(reversal)`).join(' + ')} + ${momentumNames.map(n => `${n}(momentum)`).join(' + ')} agree`;
 
       return { signal: SIGNAL.SELL, confidence, reason };
+    }
+
+    // ── Super Conviction Bypass ───────────────────────────────────────────
+    if (this.superConvictionEnabled) {
+      const extremeResults = results.filter(
+        (r) => r.confidence >= 80 && r.meetsFloor && !r.suppressedByTime && r.signal !== SIGNAL.HOLD
+      );
+
+      if (extremeResults.length > 0) {
+        const best = extremeResults.reduce((prev, current) =>
+          (prev.confidence > current.confidence) ? prev : current
+        );
+
+        return {
+          signal: best.signal,
+          confidence: best.confidence,
+          reason: `SUPER CONVICTION BYPASS: ${best.strategy} reached ${best.confidence}% confidence. Cross-group consensus skipped.`
+        };
+      }
     }
 
     // ── No cross-group agreement ──────────────────────────────────────────

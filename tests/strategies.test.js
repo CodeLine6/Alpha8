@@ -292,7 +292,7 @@ describe('RSIMeanReversionStrategy', () => {
 // ─── VWAP Momentum ──────────────────────────────────────
 
 describe('VWAPMomentumStrategy', () => {
-  const strategy = new VWAPMomentumStrategy();
+  const strategy = new VWAPMomentumStrategy({ anchorToday: false });
 
   test('should return HOLD with insufficient data', () => {
     const signal = strategy.analyze([]);
@@ -409,7 +409,7 @@ describe('Strategy Signal Consistency', () => {
   const strategies = [
     new EMACrossoverStrategy(),
     new RSIMeanReversionStrategy(),
-    new VWAPMomentumStrategy(),
+    new VWAPMomentumStrategy({ anchorToday: false }),
     new BreakoutVolumeStrategy(),
   ];
 

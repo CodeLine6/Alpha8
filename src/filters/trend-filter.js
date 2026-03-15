@@ -30,10 +30,10 @@ const log = createLogger('trend-filter');
 
 // NOTE: Redis client has keyPrefix: 'alpha8:' — do NOT add 'alpha8:' here
 const CACHE_PREFIX = 'trend:';
-const CACHE_TTL_SEC = 6 * 60 * 60; // 6 hours — refreshed at pre-market
+const CACHE_TTL_SEC = 30 * 60; // 30 minutes — prevents stale null values from persisting all day
 const SMA_SHORT_DAYS = 20;
 const SMA_LONG_DAYS = 50;
-const HISTORY_DAYS = 70; // fetch 70 days → enough for 50-day SMA with buffer
+const HISTORY_DAYS = 100; // fetch 70 days → enough for 50-day SMA with buffer
 
 /**
  * @typedef {object} TrendState

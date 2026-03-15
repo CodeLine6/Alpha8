@@ -4,6 +4,7 @@ import { createLogger } from './lib/logger.js';
 import { initShutdownHandlers, registerShutdown } from './lib/shutdown.js';
 import { initDatabase, checkDatabaseHealth, query } from './lib/db.js';
 import { initRedis, checkRedisHealth, cacheGet, cacheSet, getRedis } from './lib/redis.js';
+import axios from 'axios';
 import { KillSwitch } from './risk/kill-switch.js';
 import { RiskManager } from './risk/risk-manager.js';
 import { calculatePositionSize } from './risk/position-sizer.js';
@@ -252,12 +253,22 @@ async function main() {
   log.info('✅ Risk manager initialized');
 
   // ─── Initialize Strategies + Consensus ─────────────────
-  const consensus = new SignalConsensus({ minAgreement: 2 });
+  let superConvictionEnabled = false;
+  if (redisHealthy) {
+    try {
+      const val = await getRedis().get('super_conviction_enabled');
+      superConvictionEnabled = (val === 'true');
+    } catch (err) {
+      log.warn({ err: err.message }, 'Failed to read super_conviction_enabled from Redis');
+    }
+  }
+
+  const consensus = new SignalConsensus({ minAgreement: 2, superConvictionEnabled });
   consensus.addStrategy(new EMACrossoverStrategy());
   consensus.addStrategy(new RSIMeanReversionStrategy());
   consensus.addStrategy(new VWAPMomentumStrategy());
   consensus.addStrategy(new BreakoutVolumeStrategy());
-  log.info(`✅ Signal consensus: ${consensus.strategies.length} strategies loaded`);
+  log.info(`✅ Signal consensus: ${consensus.strategies.length} strategies loaded (Super Conviction: ${superConvictionEnabled ? 'ON' : 'OFF'})`);
 
   // ─── Initialize Enhanced Signal Pipeline ───────────────
   let pipeline = null;
@@ -291,6 +302,13 @@ async function main() {
   } else {
     log.warn('⚠️  Shadow recorder disabled — DB not available');
   }
+
+  // ─── Initialize Telegram Bot ───────────────────────────
+  const telegram = new TelegramBot({
+    token: config.TELEGRAM_BOT_TOKEN,
+    chatId: config.TELEGRAM_CHAT_ID,
+  });
+  telegramRef = telegram;
 
   // ─── Initialize Execution Engine ───────────────────────
   const engine = new ExecutionEngine({
@@ -371,12 +389,6 @@ async function main() {
     log.warn('⚠️  Position manager: DISABLED (POSITION_MGMT_ENABLED=false)');
   }
 
-  // ─── Initialize Telegram Bot ───────────────────────────
-  const telegram = new TelegramBot({
-    token: config.TELEGRAM_BOT_TOKEN,
-    chatId: config.TELEGRAM_CHAT_ID,
-  });
-  telegramRef = telegram;
 
   if (telegram.enabled) {
     log.info('✅ Telegram bot initialized');
@@ -477,10 +489,17 @@ async function main() {
           `<i>This takes ~30–60 seconds. Results will follow automatically.</i>`
         );
 
-        scout.runNightly().catch(err => {
-          log.error({ err: err.message }, 'Manual scout run failed');
-          telegram.sendRaw(`❌ <b>Scout failed</b>\n${err.message}`);
-        });
+        scout.runNightly()
+          .then(async () => {
+            telegram.sendRaw('✅ <b>Scout Complete</b>\nReconciling active symbols with data feed...');
+            const active = await scout.getActiveWatchlist();
+            await resubscribeTickFeed(active);
+            telegram.sendRaw(`✅ <b>Reconciliation Complete</b>\nNow tracking ${active.length} active symbols.`);
+          })
+          .catch(err => {
+            log.error({ err: err.message }, 'Manual scout run failed');
+            telegram.sendRaw(`❌ <b>Scout failed</b>\n${err.message}`);
+          });
       });
 
       telegram.onCommand('/watchlist', async () => {
@@ -503,7 +522,30 @@ async function main() {
         }
       });
 
-      log.info('✅ Telegram /scout and /watchlist commands registered');
+      telegram.onCommand('/conviction', async (text) => {
+        const args = text.toLowerCase().replace('/conviction', '').trim();
+        const turnOn = args === 'on';
+        const turnOff = args === 'off';
+
+        if (!turnOn && !turnOff) {
+          telegram.sendRaw(`ℹ️ <b>Super Conviction Bypass is currently ${consensus.superConvictionEnabled ? 'ON' : 'OFF'}</b>\n\nUse <code>/conviction on</code> or <code>/conviction off</code> to toggle.`);
+          return;
+        }
+
+        consensus.superConvictionEnabled = turnOn;
+        if (redisHealthy) {
+          try {
+            await getRedis().set('super_conviction_enabled', turnOn ? 'true' : 'false');
+          } catch (e) {
+            log.warn('Could not save super conviction flag to Redis');
+          }
+        }
+
+        log.info({ superConvictionEnabled: turnOn }, 'Super Conviction Bypass toggled via Telegram');
+        telegram.sendRaw(`⚡ <b>Super Conviction Bypass is now ${turnOn ? 'ON' : 'OFF'}</b>\n\n${turnOn ? 'Signals with 80+ confidence will bypass cross-group consensus checks.' : 'Strict cross-group consensus logic is fully enforced.'}`);
+      });
+
+      log.info('✅ Telegram /scout, /watchlist, and /conviction commands registered');
     }
   } else {
     log.warn('⚠️  Symbol scout disabled — DB not available (falling back to pinned watchlist only)');
@@ -553,6 +595,10 @@ async function main() {
 
     const items = [];
 
+    // Bug Fix 6: Batch query for all position stats outside the loop 
+    // to avoid N sequential queries and heavily reduce DB latency on scans
+    const statsMap = positionStats ? await positionStats.getStatsBatch(activeSymbols) : null;
+
     for (const symbol of activeSymbols) {
       try {
         const instrumentToken = instrumentManager?.getToken(symbol)
@@ -569,7 +615,9 @@ async function main() {
           try {
             const ltp = await broker.getLTP([`NSE:${symbol}`]);
             currentPrice = ltp?.[`NSE:${symbol}`]?.last_price || 0;
-          } catch { /* skip */ }
+          } catch (ltpErr) {
+            log.warn({ symbol, err: ltpErr.message }, 'LTP fetch failed — price unresolvable this cycle');
+          }
         }
 
         // Task 4: Skip symbol if price cannot be determined.
@@ -585,16 +633,16 @@ async function main() {
           try {
             candles = await fetchRecentCandles({
               broker, instrumentToken, symbol,
-              interval: '5minute', count: 50,
+              interval: '5minute', count: 100,
             });
-          } catch { /* skip */ }
+          } catch (candleErr) {
+            log.warn({ symbol, err: candleErr.message }, 'Candle fetch failed — strategy will receive empty candles');
+          }
         }
 
         // Feature 4: Use real historical win-rate / avg P&L from signal_outcomes
         // instead of fixed defaults. Falls back to defaults if sample size < 10.
-        const stats = positionStats
-          ? await positionStats.getStats(symbol)
-          : { winRate: 0.5, avgWin: 1000, avgLoss: 500 };
+        const stats = statsMap?.get(symbol) ?? { winRate: 0.5, avgWin: 1000, avgLoss: 500 };
 
         const sizing = calculatePositionSize({
           capital: config.TRADING_CAPITAL,
@@ -793,12 +841,11 @@ async function main() {
     const { default: cron } = await import('node-cron');
 
     // ─── Keep-Awake Cron (Every 10 mins) ───────────────────
-    cron.schedule('*/10 * * * *', async () => {
+    cron.schedule('*/5 * * * *', async () => {
       const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${config.PORT}`;
       const pingUrl = url.endsWith('/') ? `${url}health` : `${url}/health`;
       log.info(`🔌 Pinging service to keep awake: ${pingUrl}`);
       try {
-        const { default: axios } = await import('axios');
         await axios.get(pingUrl);
       } catch (err) {
         log.warn({ err: err.message }, '⚠️  Keep-awake ping failed');
@@ -808,36 +855,33 @@ async function main() {
     cron.schedule('0 8 * * 1-5', async () => {
       log.info('🔐 Running scheduled auto-login...');
       try {
-        const { exec } = await import('node:child_process');
-        const { promisify } = await import('node:util');
-        const execAsync = promisify(exec);
+        const { runAutoLogin } = await import('../scripts/auto-login.js');
+        const loginResult = await runAutoLogin({ silent: false });
 
-        const { stdout, stderr } = await execAsync('node scripts/auto-login.js', {
-          cwd: process.cwd(), timeout: 120000, env: process.env,
-        });
-        if (stdout) log.info({ stdout: stdout.slice(-500) }, 'Auto-login output');
-        if (stderr) log.warn({ stderr: stderr.slice(-500) }, 'Auto-login stderr');
-
-        const newToken = await getRedis().get('kite:access_token');
-        if (newToken && broker) {
-          broker.primary.setAccessToken(newToken);
-          log.info('✅ Broker access token refreshed');
-        } else if (newToken && !broker) {
-          try {
-            kiteClient = new KiteClient({
-              apiKey: config.KITE_API_KEY,
-              apiSecret: config.KITE_API_SECRET,
-              accessToken: newToken,
-            });
-            broker = new BrokerManager(kiteClient);
-            engine.broker = broker;
-            engine.paperMode = !config.LIVE_TRADING;
-            scheduler.broker = broker;
-            if (scout) scout.broker = broker;   // ← give scout live broker too
-            log.info('✅ Broker initialized from scheduled auto-login');
-          } catch (initErr) {
-            log.error({ err: initErr.message }, 'Failed to init broker after login');
+        if (loginResult.success && loginResult.accessToken) {
+          const newToken = loginResult.accessToken;
+          if (broker) {
+            broker.primary.setAccessToken(newToken);
+            log.info('✅ Broker access token refreshed');
+          } else {
+            try {
+              kiteClient = new KiteClient({
+                apiKey: config.KITE_API_KEY,
+                apiSecret: config.KITE_API_SECRET,
+                accessToken: newToken,
+              });
+              broker = new BrokerManager(kiteClient);
+              engine.broker = broker;
+              engine.paperMode = !config.LIVE_TRADING;
+              scheduler.broker = broker;
+              if (scout) scout.broker = broker;   // ← give scout live broker too
+              log.info('✅ Broker initialized from scheduled auto-login');
+            } catch (initErr) {
+              log.error({ err: initErr.message }, 'Failed to init broker after login');
+            }
           }
+        } else {
+          throw new Error(loginResult.error || 'Token not returned');
         }
       } catch (err) {
         log.error({ err: err.message }, '❌ Scheduled auto-login failed');

@@ -102,6 +102,7 @@ export class RSIMeanReversionStrategy extends BaseStrategy {
     }
 
     const closes = candles.map((c) => c.close);
+
     const rsiValues = RSI.calculate({ period: this.period, values: closes });
 
     if (rsiValues.length < 2) {

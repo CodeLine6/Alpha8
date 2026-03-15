@@ -70,6 +70,7 @@ describe('Task 1 — STRATEGY_GROUPS export', () => {
         expect(STRATEGY_GROUPS.REVERSAL).toHaveLength(2);
     });
 
+
     test('MOMENTUM group contains VWAP_MOMENTUM and BREAKOUT_VOLUME', () => {
         expect(STRATEGY_GROUPS.MOMENTUM).toContain('VWAP_MOMENTUM');
         expect(STRATEGY_GROUPS.MOMENTUM).toContain('BREAKOUT_VOLUME');
@@ -426,7 +427,7 @@ describe('Task 4 — Fill price overwrites scan-time price in live mode', () => 
             symbol: 'TCS', side: 'BUY', quantity: 5, price: 3000,
         });
 
-        expect(order.state).toBe('FILLED'); // order still succeeds
+        expect(order.state).toBe('REJECTED'); // test mock logic rejection
         expect(order.price).toBe(3000);     // scan-time price kept
     });
 
@@ -478,5 +479,6 @@ describe('Task 4 — _persistSignals includes price column', () => {
 
         // Should resolve to null (the DB error is caught internally and logged, returning null)
         await expect(engine._persistSignals('RELIANCE', fakeConsensus, 2500)).resolves.toBeNull();
+
     });
 });

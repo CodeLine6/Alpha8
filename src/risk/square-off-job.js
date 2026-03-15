@@ -103,11 +103,23 @@ export async function executeSquareOff({ broker, riskManager, engine, getOpenPos
     try {
       let squareOffPrice = 0;
       let orderId;
-      let paperMode = !broker;
+      // If engine is provided, respect its LIVE_TRADING config; otherwise rely strictly on missing broker
+      let paperMode = engine ? !engine._config?.LIVE_TRADING : !broker;
 
       if (paperMode) {
         orderId = `SQOFF-${symbol}-${Date.now()}`;
-        squareOffPrice = pos.last_price || pos.close_price || pos.average_price || 0;
+
+        let ltp = 0;
+        if (broker) {
+          try {
+            const quote = await broker.getLTP([`NSE:${symbol}`]);
+            ltp = quote[`NSE:${symbol}`]?.last_price || 0;
+          } catch (err) {
+            log.warn({ symbol, err: err.message }, 'Failed to fetch LTP for paper square-off');
+          }
+        }
+
+        squareOffPrice = pos.last_price || pos.close_price || ltp || pos.average_price || 0;
       } else {
         const squareOffResult = await broker.placeOrder({
           symbol,
@@ -121,13 +133,14 @@ export async function executeSquareOff({ broker, riskManager, engine, getOpenPos
         squareOffPrice = squareOffResult.price || squareOffResult.average_price || squareOffResult.raw?.average_price || squareOffResult.raw?.price || pos.last_price || pos.close_price || 0;
       }
 
+      let pnl = 0;
       if (engine && riskManager) {
         const posCtx = engine._filledPositions?.get(symbol);
         engine.markPositionClosed(symbol);
         riskManager.removePosition();
 
         if (posCtx) {
-          const pnl = (squareOffPrice - posCtx.price) * posCtx.quantity;
+          pnl = (squareOffPrice - posCtx.price) * posCtx.quantity;
           await engine.recordPositionOutcome(symbol, pnl).catch(err => log.warn({ symbol, err: err.message }, 'Outcome recording failed'));
         }
       } else if (riskManager) {
@@ -140,10 +153,10 @@ export async function executeSquareOff({ broker, riskManager, engine, getOpenPos
       // C3: Persist square-off trade to DB for audit trail
       try {
         await query(
-          `INSERT INTO trades (order_id, symbol, side, quantity, price, strategy, status, paper_mode, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+          `INSERT INTO trades (order_id, symbol, side, quantity, price, pnl, strategy, status, paper_mode, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
            ON CONFLICT (order_id) DO NOTHING`,
-          [orderId, symbol, side, qty, squareOffPrice, 'SQUARE_OFF', 'FILLED', paperMode]
+          [orderId, symbol, side, qty, squareOffPrice, pnl, 'SQUARE_OFF', 'FILLED', paperMode]
         );
       } catch (dbErr) {
         log.error({ symbol, err: dbErr.message }, 'Failed to persist square-off trade to DB');

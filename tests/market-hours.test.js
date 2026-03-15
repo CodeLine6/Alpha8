@@ -34,6 +34,7 @@ describe('Market Hours', () => {
   describe('getISTTime', () => {
     test('should return correct IST components', () => {
       // Thursday, March 5, 2026, 10:30 IST
+
       const date = istDate('2026-03-05', '10:30');
       const ist = getISTTime(date);
 
@@ -60,6 +61,7 @@ describe('Market Hours', () => {
 
     test('should return false for Thursday', () => {
       const wed = istDate('2026-03-05', '10:00'); // Thursday
+
       expect(isWeekend(wed)).toBe(false);
     });
   });

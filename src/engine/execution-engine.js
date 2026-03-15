@@ -163,6 +163,7 @@ export class ExecutionEngine {
         FROM trades
         WHERE status = 'FILLED'
           AND paper_mode = $1
+
           AND (created_at AT TIME ZONE 'Asia/Kolkata')::date =
               (NOW() AT TIME ZONE 'Asia/Kolkata')::date
         ORDER BY symbol, created_at DESC, id DESC
@@ -458,6 +459,7 @@ export class ExecutionEngine {
       transitionOrder(order, ORDER_STATE.FILLED);
 
       const pnl = (currentPrice - posCtx.entryPrice) * posCtx.quantity;
+      order.pnl = pnl;
 
       // Update all state — mirror what _placeWithRetry does on SELL fill
       this._filledPositions.delete(symbol);
@@ -659,11 +661,23 @@ export class ExecutionEngine {
           // Bug Fix 3: Sync position count to risk manager after map change
           this.riskManager.addPosition();
 
+          if (this.telegram?.enabled) {
+            this.telegram.sendRaw(
+              `📦 <b>Position ENTRY — ${order.symbol}</b>\n\n` +
+              `📥 Entry: ₹${order.price.toFixed(2)}\n` +
+              `📦 Qty:   ${order.quantity}\n` +
+              `🛑 Stop:  ₹${+(order.price * (1 - stopPct / 100)).toFixed(2)}\n` +
+              `🧠 Strats: ${strategies.join(', ')}\n` +
+              `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+            ).catch(() => { });
+          }
+
         } else if (order.side === 'SELL') {
           const posCtx = this._filledPositions.get(order.symbol);
           if (posCtx) {
             const sellPrice = order.price;
             const pnl = (sellPrice - posCtx.price) * posCtx.quantity;
+            order.pnl = pnl;
             log.info({
               symbol: order.symbol,
               entryPrice: posCtx.price,
@@ -680,6 +694,21 @@ export class ExecutionEngine {
             this._filledPositions.delete(order.symbol);
             // Bug Fix 3: Decrement position count on SELL fill
             this.riskManager.removePosition();
+
+            if (this.telegram?.enabled) {
+              const emoji = pnl >= 0 ? '✅' : '🛑';
+              const pnlStr = pnl >= 0 ? `+₹${pnl.toFixed(2)}` : `-₹${Math.abs(pnl).toFixed(2)}`;
+
+              this.telegram.sendRaw(
+                `${emoji} <b>Position EXIT — ${order.symbol}</b>\n\n` +
+                `📌 Reason: SIGNAL_EXIT\n` +
+                `📥 Entry: ₹${posCtx.price.toFixed(2)}\n` +
+                `📤 Exit:  ₹${sellPrice.toFixed(2)}\n` +
+                `💰 P&L:   ${pnlStr}\n` +
+                `📦 Qty:   ${posCtx.quantity}\n` +
+                `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+              ).catch(() => { });
+            }
           }
         }
 
@@ -762,23 +791,47 @@ export class ExecutionEngine {
       product: order.product,
     });
 
-    // Task 4A: Fetch actual fill price post-placement. Non-fatal.
-    try {
-      const history = await this.broker.getOrderHistory(response.order_id);
-      const fillPrice = history?.average_price
-        || (Array.isArray(history) ? history[history.length - 1]?.average_price : null)
-        || null;
-      if (fillPrice && fillPrice > 0) {
-        log.info({
-          orderId: response.order_id,
-          scanPrice: order.price,
-          fillPrice,
-        }, 'Fill price fetched — overwriting scan-time price with actual executed price');
-        order.price = fillPrice;
+    const maxAttempts = 4;
+    let fillPrice = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const history = await this.broker.getOrderHistory(response.order_id);
+        const fetchedPrice = history?.average_price
+          || (Array.isArray(history) ? history[history.length - 1]?.average_price : null)
+          || null;
+
+        if (fetchedPrice && fetchedPrice > 0) {
+          fillPrice = fetchedPrice;
+          log.info({
+            orderId: response.order_id,
+            fillPrice,
+            scanPrice: order.price,
+            attempts: attempt
+          }, 'Fill price fetched — overwriting scan-time price with actual executed price');
+          order.price = fillPrice;
+          break; // Success, exit retry loop
+        }
+      } catch (err) {
+        // Only throw for real broker errors, ignore 404 (order not found yet)
+        if (err.response?.status !== 404 && err.statusCode !== 404) {
+          throw err;
+        }
       }
-    } catch (err) {
-      log.warn({ orderId: response.order_id, err: err.message },
-        'Could not fetch fill price — using scan-time price');
+
+      // If this wasn't the last attempt, wait before trying again
+      if (attempt < maxAttempts) {
+        await this._delay(400);
+      }
+    }
+
+    // If loop exhausted and no fill price
+    if (!fillPrice) {
+      log.warn({
+        orderId: response.order_id,
+        attempts: maxAttempts,
+        fallback: 'scan-time price'
+      }, 'Could not fetch fill price — using scan-time price');
     }
 
     return { orderId: response.order_id };
@@ -839,11 +892,8 @@ export class ExecutionEngine {
     }
 
     try {
-      const heldSymbols = Array.from(this._filledPositions.keys());
-      const ltpKeys = heldSymbols.map(s => `NSE:${s}`);
-      const ltp = await broker.getLTP(ltpKeys);
-      // A symbol is considered closed externally if getLTP returns null/0 for it
-      // AND the broker's net positions don't contain it
+      const initialPositionCount = this._filledPositions.size;
+
       const rawPositions = await broker.getPositions();
       const brokerSymbols = new Set(
         (rawPositions?.net || rawPositions || [])
@@ -880,7 +930,7 @@ export class ExecutionEngine {
       }
 
       log.info({
-        checked: this._filledPositions.size + reconciled.length,
+        checked: initialPositionCount,
         reconciled: reconciled.length,
         stillOpen: stillOpen.length
       }, 'Position reconciliation complete');
@@ -912,10 +962,10 @@ export class ExecutionEngine {
   async _persistTrade(order) {
     try {
       await query(
-        `INSERT INTO trades (order_id, symbol, side, quantity, price, strategy, status, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+        `INSERT INTO trades (order_id, symbol, side, quantity, price, pnl, strategy, status, paper_mode, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
          ON CONFLICT (order_id) DO NOTHING`,
-        [order.id, order.symbol, order.side, order.quantity, order.price, order.strategy, order.state]
+        [order.id, order.symbol, order.side, order.quantity, order.price, order.pnl || 0, order.strategy, order.state, this.paperMode]
       );
       log.debug({ orderId: order.id, symbol: order.symbol }, 'Trade persisted to DB');
     } catch (err) {
@@ -935,6 +985,8 @@ export class ExecutionEngine {
     let consensusSignalId = null;
 
     try {
+      await query('BEGIN');
+
       for (const detail of (consensus.details || [])) {
         await query(
           `INSERT INTO signals (symbol, strategy, signal, confidence, acted_on, reason, price, created_at)
@@ -968,7 +1020,13 @@ export class ExecutionEngine {
       );
 
       consensusSignalId = consensusRow.rows?.[0]?.id ?? null;
+      await query('COMMIT');
     } catch (err) {
+      try {
+        await query('ROLLBACK');
+      } catch (rollbackErr) {
+        // Silently swallow rollback failure
+      }
       log.error({ symbol, err: err.message }, 'Failed to persist signals to DB');
     }
 
