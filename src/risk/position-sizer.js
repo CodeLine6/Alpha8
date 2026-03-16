@@ -37,7 +37,7 @@ export function calculatePositionSize({
   entryPrice,
   maxRiskPct = RISK_DEFAULTS.PER_TRADE_STOP_LOSS_PCT,
   kellyFraction = 0.5,
-  maxPositionPct = 20,
+  maxPositionPct = RISK_DEFAULTS.MAX_POSITION_VALUE_PCT,
 }) {
   // Validate inputs
   if (!capital || capital <= 0 || !entryPrice || entryPrice <= 0) {
@@ -118,14 +118,21 @@ export function calculatePositionSize({
   let quantity = Math.floor(riskAmount / stopLossPerShare);
 
   // Cap by max position value
-  const positionValue = quantity * entryPrice;
-  if (positionValue > maxPositionValue) {
-    quantity = Math.floor(maxPositionValue / entryPrice);
-    reasons.push(`Position capped at ${maxPositionPct}% of capital`);
+  const maxAllowedByCapValue = Math.floor(maxPositionValue / entryPrice);
+  if (quantity > maxAllowedByCapValue) {
+    quantity = maxAllowedByCapValue;
+    reasons.push(`Position capped at ${maxPositionPct}% of capital (max ${maxAllowedByCapValue} shares)`);
   }
 
-  // Minimum quantity is 1 (if we should trade at all)
-  quantity = Math.max(quantity, kellyPct > 0 ? 1 : 0);
+  // Hard Cap: Total value must not exceed available capital
+  const maxAllowedByTotalCapital = Math.floor(capital / entryPrice);
+  if (quantity > maxAllowedByTotalCapital) {
+    quantity = maxAllowedByTotalCapital;
+    reasons.push(`Position capped by total capital (max ${maxAllowedByTotalCapital} shares)`);
+  }
+
+  // S1 FIX: guard against NaN quantity.
+  if (!Number.isFinite(quantity)) quantity = 0;
 
   const finalPositionValue = quantity * entryPrice;
 

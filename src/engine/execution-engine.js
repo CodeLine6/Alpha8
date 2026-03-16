@@ -48,6 +48,7 @@ const log = createLogger('execution-engine');
 export class ExecutionEngine {
   /**
    * @param {Object} deps
+   * @param {import('../data/holdings.js').HoldingsManager} [deps.holdingsManager]
    */
   constructor(deps) {
     this.riskManager = deps.riskManager;
@@ -294,7 +295,13 @@ export class ExecutionEngine {
     let pipelineLog = null;
 
     if (this.pipeline) {
-      const pipelineResult = await this.pipeline.process(symbol, consensusResult.details || [], regime);
+      const isConviction = !!consensusResult.convictionStrategy;
+      const pipelineResult = await this.pipeline.process(
+        symbol,
+        consensusResult.details || [],
+        regime,
+        isConviction
+      );
       pipelineLog = pipelineResult.log;
 
       if (!pipelineResult.allowed) {
@@ -375,13 +382,19 @@ export class ExecutionEngine {
   // POSITION OUTCOME RECORDING
   // ═══════════════════════════════════════════════════════
 
-  async recordPositionOutcome(symbol, pnl) {
+  async recordPositionOutcome(symbol, pnl, forceStrategies = null) {
     if (!this.pipeline) {
       log.warn({ symbol }, 'recordPositionOutcome: pipeline not available');
       return;
     }
 
-    const strategies = this._lastSignalStrategies.get(symbol) || [];
+    let strategies = forceStrategies || this._lastSignalStrategies.get(symbol) || [];
+
+    // Fallback: Check _filledPositions if _lastSignalStrategies is empty (e.g. after restart)
+    if (strategies.length === 0 && this._filledPositions.has(symbol)) {
+      strategies = this._filledPositions.get(symbol).strategies || [];
+    }
+
     if (strategies.length === 0) {
       log.warn({ symbol }, 'recordPositionOutcome: no BUY strategies on record for symbol');
       return;
@@ -391,8 +404,6 @@ export class ExecutionEngine {
     log.info({ symbol, pnl, outcome, strategies }, 'Recording position outcome for adaptive weights');
 
     for (const strategy of strategies) {
-      await this.pipeline.recordTradeOutcome(strategy, 'BUY', symbol, pnl);
-
       if (this.pipeline.adaptiveWeights) {
         await this.pipeline.adaptiveWeights.recordOutcome({
           strategy, signal: 'BUY', symbol, outcome, pnl,
@@ -468,13 +479,15 @@ export class ExecutionEngine {
       order.pnl = pnl;
 
       if (isFullExit) {
+        // Fix for post-restart credit: pass strategies explicitly before deleting from _filledPositions
+        const strategies = posCtx.strategies || [];
+        this.recordPositionOutcome(symbol, pnl, strategies).catch(err =>
+          log.warn({ symbol, err: err.message }, 'Outcome recording failed after force exit')
+        );
+
         this._filledPositions.delete(symbol);
         this.riskManager.removePosition();
         await this.riskManager.recordTradePnL(pnl, symbol);
-
-        this.recordPositionOutcome(symbol, pnl).catch(err =>
-          log.warn({ symbol, err: err.message }, 'Outcome recording failed after force exit')
-        );
 
         const signalId = this._pendingSignalIds.get(symbol);
         if (signalId) {
@@ -579,13 +592,20 @@ export class ExecutionEngine {
       return order;
     }
 
+    // ─── Phase 1: Risk Engine Check ──────────────────────
+    let totalExposure = 0;
+    if (this.holdingsManager) {
+      const exposureData = await this.holdingsManager.getTotalExposureValue();
+      totalExposure = exposureData.totalValue;
+    }
+
     const riskDecision = this.riskManager.validateOrder({
       symbol: params.symbol,
       side: params.side,
       quantity: params.quantity,
       price: params.price,
       strategy: params.strategy,
-    });
+    }, totalExposure);
 
     if (!riskDecision.allowed) {
       transitionOrder(order, ORDER_STATE.REJECTED, {

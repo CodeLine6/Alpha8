@@ -67,8 +67,9 @@ const REGIME_SIZE_MULTIPLIERS = {
 // ── AdaptiveWeightManager ────────────────────────────────────────────────────
 
 export class AdaptiveWeightManager {
-    constructor({ redis, dbQuery }) {
+    constructor({ redis, intradayDecay, dbQuery }) {
         this.redis = redis;
+        this.intradayDecay = intradayDecay;
         this.dbQuery = dbQuery || query;
         this._cacheKey = 'strategy:weights';
     }
@@ -229,6 +230,11 @@ export class AdaptiveWeightManager {
                 [strategy, signal, symbol, outcome, pnl, paperMode] // Fix S6
             );
             log.debug({ strategy, symbol, outcome, pnl, paperMode }, 'Outcome recorded');
+
+            // NEW: Also record as an intraday "wrong" for immediate weight decay
+            if (outcome === 'LOSS' && this.intradayDecay) {
+                this.intradayDecay.recordWrong(strategy).catch(() => { });
+            }
         } catch (err) {
             log.error({ strategy, symbol, err: err.message }, 'Failed to record outcome');
         }

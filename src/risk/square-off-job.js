@@ -85,6 +85,7 @@ export async function executeSquareOff({ broker, riskManager, engine, getOpenPos
       let squareOffResult = null;
 
       if (!isPaperMode && broker) {
+        // ... (live mode logic unchanged)
         squareOffResult = await broker.placeOrder({
           symbol,
           exchange: 'NSE',
@@ -105,8 +106,19 @@ export async function executeSquareOff({ broker, riskManager, engine, getOpenPos
           pos.close_price ||
           0;
       } else {
-        // Paper mode: approximate with last known price
+        // Paper mode: Get the freshest price possible
+        let freshPrice = 0;
+        if (broker) {
+          try {
+            const ltp = await broker.getLTP(`NSE:${symbol}`);
+            if (ltp && ltp.last_price) freshPrice = ltp.last_price;
+          } catch (e) {
+            log.warn({ symbol, err: e.message }, 'Failed to fetch LTP for paper square-off fallback');
+          }
+        }
+
         squareOffPrice =
+          freshPrice ||
           pos.last_price ||
           pos.close_price ||
           pos.average_price ||

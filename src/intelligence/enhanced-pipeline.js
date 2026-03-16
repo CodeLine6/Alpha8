@@ -108,7 +108,7 @@ export class EnhancedSignalPipeline {
             : null;
 
         this.adaptiveWeights = adaptiveEnabled
-            ? new AdaptiveWeightManager({ redis, logger: logFn })
+            ? new AdaptiveWeightManager({ redis, intradayDecay, logger: logFn })
             : null;
 
         this.newsSentiment = newsEnabled && geminiApiKey
@@ -156,9 +156,10 @@ export class EnhancedSignalPipeline {
      *                                         Fetched ONCE per scan cycle in execution-engine.js
      *                                         and passed here to avoid double-detection.
      *                                         Falls back to default threshold (2.0) if null.
+     * @param {boolean}      [isConvictionBypass=false] - If true, skips Gate 1 (Weighted Consensus).
      * @returns {Promise<PipelineResult>}
      */
-    async process(symbol, strategySignals, regime = null) {
+    async process(symbol, strategySignals, regime = null, isConvictionBypass = false) {
         const gateLog = [];
         let positionSizeMult = 1.0;
 
@@ -167,10 +168,23 @@ export class EnhancedSignalPipeline {
         // The regime is detected once per scan cycle in execution-engine.js,
         // passed here as a parameter to keep detection logic in one place.
         const threshold = REGIME_THRESHOLDS[regime] ?? 2.0;
-        log.debug({ regime, threshold }, 'Gate 1 threshold resolved from regime');
+        log.debug({ regime, threshold, isConvictionBypass }, 'Gate 1 threshold resolved');
 
         let finalSignal;
-        if (this.adaptiveWeights) {
+
+        if (isConvictionBypass) {
+            // Feature 10: Super Conviction Bypass
+            // If the consensus layer flagged this as an extreme conviction signal,
+            // we bypass the weighted consensus requirement but still run Trend/Regime/News.
+            finalSignal = strategySignals.find(s => s.confidence >= 80 && s.signal !== 'HOLD');
+            if (finalSignal) {
+                gateLog.push(`⏩ Super Conviction Bypass: ${finalSignal.strategy} (${finalSignal.confidence}%)`);
+            } else {
+                // Should not happen if flag is true, but safety first
+                gateLog.push('❌ Conviction bypass requested but no high-confidence signal found');
+                return this._blocked('CONSENSUS', gateLog, positionSizeMult);
+            }
+        } else if (this.adaptiveWeights) {
             // Feature 7: Fetch base weights, apply intraday decay multipliers (if available),
             // then call weightedConsensusWithWeights() to skip the redundant Redis fetch.
             // On any failure, falls back to the original weightedConsensus() call.

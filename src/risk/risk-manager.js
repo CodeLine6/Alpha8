@@ -55,12 +55,15 @@ export class RiskManager {
     this._basePerTradeStopLossPct = config.perTradeStopLossPct ?? RISK_DEFAULTS.PER_TRADE_STOP_LOSS_PCT;
     this._baseMaxPositionCount = config.maxPositionCount ?? RISK_DEFAULTS.MAX_POSITION_COUNT;
     this._baseKillSwitchDrawdownPct = config.killSwitchDrawdownPct ?? RISK_DEFAULTS.KILL_SWITCH_DRAWDOWN_PCT;
+    this._baseMaxPositionPct = config.maxPositionPct ?? RISK_DEFAULTS.MAX_POSITION_VALUE_PCT;
 
     // Live (active) values — start as base values, updated by refreshLiveSettings()
     this.maxDailyLossPct = this._baseMaxDailyLossPct;
     this.perTradeStopLossPct = this._basePerTradeStopLossPct;
     this.maxPositionCount = this._baseMaxPositionCount;
     this.killSwitchDrawdownPct = this._baseKillSwitchDrawdownPct;
+    this.maxPositionPct = this._baseMaxPositionPct;
+    this.maxCapitalExposurePct = config.maxCapitalExposurePct ?? RISK_DEFAULTS.MAX_CAPITAL_EXPOSURE_PCT;
 
     // Optional live settings provider (injected from index.js)
     this._getLiveSetting = config.getLiveSetting || null;
@@ -114,6 +117,7 @@ export class RiskManager {
       perTradeStopLossPct: this.perTradeStopLossPct,
       maxPositionCount: this.maxPositionCount,
       killSwitchDrawdownPct: this.killSwitchDrawdownPct,
+      maxPositionPct: this.maxPositionPct,
     };
 
     try {
@@ -121,6 +125,8 @@ export class RiskManager {
       this.perTradeStopLossPct = await this._getLiveSetting('PER_TRADE_STOP_LOSS_PCT', this._basePerTradeStopLossPct);
       this.maxPositionCount = await this._getLiveSetting('MAX_POSITION_COUNT', this._baseMaxPositionCount);
       this.killSwitchDrawdownPct = await this._getLiveSetting('KILL_SWITCH_DRAWDOWN_PCT', this._baseKillSwitchDrawdownPct);
+      this.maxCapitalExposurePct = await this._getLiveSetting('MAX_CAPITAL_EXPOSURE_PCT', this.maxCapitalExposurePct);
+      this.maxPositionPct = await this._getLiveSetting('MAX_POSITION_VALUE_PCT', this._baseMaxPositionPct);
 
       // Capital override — only affects position sizing, NOT today's P&L tracking
       const liveCapital = await this._getLiveSetting('TRADING_CAPITAL', this.capital);
@@ -161,6 +167,7 @@ export class RiskManager {
     this._maxDailyLossAmount = this.capital * (this.maxDailyLossPct / 100);
     this._killSwitchAmount = this.capital * (this.killSwitchDrawdownPct / 100);
     this._perTradeMaxLoss = this.capital * (this.perTradeStopLossPct / 100);
+    this._maxCapitalExposureAmount = this.capital * (this.maxCapitalExposurePct / 100);
   }
 
   // ═══════════════════════════════════════════════════════
@@ -302,9 +309,10 @@ export class RiskManager {
    * @param {number} order.quantity - Number of shares
    * @param {number} order.price - Expected execution price
    * @param {string} [order.strategy] - Which strategy generated this
+   * @param {number} [totalExposureValue] - Optional current total value of all open positions
    * @returns {{ allowed: boolean, reason: string, context: Object }}
    */
-  validateOrder(order) {
+  validateOrder(order, totalExposureValue = 0) {
     const context = {
       symbol: order.symbol,
       side: order.side,
@@ -320,7 +328,9 @@ export class RiskManager {
         perTradeStopLossPct: this.perTradeStopLossPct,
         maxPositionCount: this.maxPositionCount,
         killSwitchDrawdownPct: this.killSwitchDrawdownPct,
+        maxCapitalExposurePct: this.maxCapitalExposurePct,
       },
+      currentExposure: totalExposureValue,
     };
 
     // ─── Check 1: Kill Switch (highest priority) ─────────
@@ -359,9 +369,23 @@ export class RiskManager {
 
     // ─── Check 5: Square-Off Time Guard ──────────────────
     if (order.side === 'BUY' && isSquareOffTime()) {
-      const reason = `New BUY orders blocked after ${SQUARE_OFF_TIME} IST (square-off window)`;
+      const reason = `New BUY orders blocked after ${SQUARE_OFF_TIME} IST (square-off-window)`;
       log.warn({ ...context }, `ORDER REJECTED — ${reason}`);
       return { allowed: false, reason, context };
+    }
+
+    // ─── Check 6: Total Capital Exposure (only for BUY) ──
+    if (order.side === 'BUY') {
+      const newTradeValue = order.quantity * order.price;
+      const totalAfterTrade = totalExposureValue + newTradeValue;
+
+      if (totalAfterTrade > this._maxCapitalExposureAmount) {
+        const reason =
+          `Total capital exposure limit reached: ₹${totalAfterTrade.toFixed(2)} ` +
+          `exceeds max ₹${this._maxCapitalExposureAmount.toFixed(2)} (${this.maxCapitalExposurePct}% of capital)`;
+        log.warn({ ...context, newTradeValue, totalAfterTrade }, `ORDER REJECTED — ${reason}`);
+        return { allowed: false, reason, context };
+      }
     }
 
     // ─── All checks passed ───────────────────────────────

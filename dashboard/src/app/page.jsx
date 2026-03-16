@@ -339,7 +339,7 @@ function PositionsTable({ data, loading }) {
                         </thead>
                         <tbody>
                             {positions.map((pos, i) => {
-                                const unrealized = ((pos.currentPrice || 0) - (pos.avgPrice || 0)) * (pos.quantity || 0);
+                                const unrealized = pos.unrealisedPnL ?? 0;
                                 return (
                                     <tr key={i}>
                                         <td className="font-medium text-[var(--text-primary)]">{pos.symbol}</td>

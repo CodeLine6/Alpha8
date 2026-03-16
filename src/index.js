@@ -243,8 +243,11 @@ async function main() {
     perTradeStopLossPct: config.PER_TRADE_STOP_LOSS_PCT,
     maxPositionCount: config.MAX_POSITION_COUNT,
     killSwitchDrawdownPct: config.KILL_SWITCH_DRAWDOWN_PCT,
+    maxCapitalExposurePct: config.MAX_CAPITAL_EXPOSURE_PCT,
+    maxPositionPct: config.MAX_POSITION_VALUE_PCT,
     cacheGet: redisHealthy ? cacheGet : null,
     cacheSet: redisHealthy ? cacheSet : null,
+    getLiveSetting,
   });
 
   if (redisHealthy) {
@@ -277,18 +280,18 @@ async function main() {
       redis: getRedis(),
       broker,
       instrumentManager,
-      anthropicApiKey: config.ANTHROPIC_API_KEY || null,
+      geminiApiKey: config.GEMINI_API_KEY || null,
       trendEnabled: true,
       regimeEnabled: true,
       adaptiveEnabled: dbHealthy,
-      newsEnabled: !!config.ANTHROPIC_API_KEY,
+      newsEnabled: !!config.GEMINI_API_KEY,
       intradayDecay,  // Feature 7: applies intraday decay before weightedConsensus
     });
     log.info({
       trend: true,
       regime: true,
       adaptive: dbHealthy,
-      news: !!config.ANTHROPIC_API_KEY,
+      news: !!config.GEMINI_API_KEY,
     }, '✅ Enhanced signal pipeline initialized');
   } else {
     log.warn('⚠️  Enhanced pipeline disabled — Redis not available');
@@ -678,6 +681,7 @@ async function main() {
           avgLoss: stats.avgLoss,
           entryPrice: currentPrice || 100,
           maxRiskPct: config.PER_TRADE_STOP_LOSS_PCT,
+          maxPositionPct: config.MAX_POSITION_VALUE_PCT || 100,
         });
 
         log.debug({
@@ -697,11 +701,13 @@ async function main() {
           continue;
         }
 
-        // S1 FIX: guard against NaN quantity. If sizing.quantity is 0 but
-        // kellyNegative is false (e.g. tiny capital), trade at minimum of 1.
-        const finalQuantity = Number.isFinite(sizing.quantity) && sizing.quantity > 0
-          ? sizing.quantity
-          : 1;
+        // S1 FIX: guard against NaN quantity.
+        if (!Number.isFinite(sizing.quantity) || sizing.quantity <= 0) {
+           log.debug({ symbol, quantity: sizing.quantity }, 'Skipping symbol — quantity is zero or invalid');
+           continue;
+        }
+
+        const finalQuantity = sizing.quantity;
 
         items.push({ symbol, instrumentToken, candles, price: currentPrice, quantity: finalQuantity });
       } catch (err) {
@@ -750,11 +756,26 @@ async function main() {
 
       const positions = [];
       for (const [symbol, posCtx] of engine._filledPositions.entries()) {
+        let lastPrice = posCtx.price || posCtx.entryPrice;
+
+        // Try to get a fresh price if broker is connected
+        if (broker) {
+          try {
+            const ltp = await broker.getLTP(`NSE:${symbol}`);
+            if (ltp && ltp.last_price) {
+              lastPrice = ltp.last_price;
+            }
+          } catch (e) {
+            log.warn({ symbol, err: e.message }, 'Failed to fetch fresh LTP for paper position');
+          }
+        }
+
         positions.push({
           symbol: symbol,
           tradingsymbol: symbol,
           quantity: posCtx.quantity,
           average_price: posCtx.entryPrice,
+          last_price: lastPrice,
         });
       }
       return positions;
@@ -842,7 +863,7 @@ async function main() {
         const rStatus = riskManager.getStatus();
         const eStatus = engine.getStatus();
 
-        const msg = 
+        const msg =
           `🖥️ <b>System Status</b>\n` +
           `━━━━━━━━━━━━━━━━━━━━\n` +
           `🛰️ <b>Scanning:</b> ${sStatus.scanning ? '🟢 ACTIVE' : '⚪ INACTIVE'}\n` +
@@ -852,7 +873,7 @@ async function main() {
           `⚡ <b>Kill Switch:</b> ${rStatus.killSwitch.engaged ? '🔴 ENGAGED' : '🟢 NORMAL'}\n` +
           `━━━━━━━━━━━━━━━━━━━━\n` +
           `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`;
-        
+
         telegram.sendRaw(msg);
       } catch (err) {
         telegram.sendRaw(`❌ <b>Status Error:</b> ${err.message}`);
@@ -862,7 +883,7 @@ async function main() {
     telegram.onCommand('/market_open', async () => {
       log.info('Manual market open triggered via Telegram');
       telegram.sendRaw('⏳ <b>Manual Market Open</b>\nInitializing market-day routines...');
-      
+
       try {
         const result = await scheduler._marketOpen();
         if (result.scanning) {

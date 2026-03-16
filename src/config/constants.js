@@ -62,6 +62,8 @@ export const RISK_DEFAULTS = Object.freeze({
   PER_TRADE_STOP_LOSS_PCT: 1,
   MAX_POSITION_COUNT: 5,
   KILL_SWITCH_DRAWDOWN_PCT: 5,
+  MAX_CAPITAL_EXPOSURE_PCT: 100,
+  MAX_POSITION_VALUE_PCT: 100,
 });
 
 // ─── Exchange Identifiers ───────────────────────────────

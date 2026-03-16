@@ -372,10 +372,13 @@ export function createApiHandler(deps) {
 
           return {
             symbol,
+            side: 'BUY',
+            quantity: ctx.quantity,
+            avgPrice: entryPrice,
             entryPrice,
             currentPrice,
-            quantity: ctx.quantity,
             stopPrice: ctx.stopPrice ?? null,
+            stopLoss: ctx.stopPrice ?? null,
             trailStopPrice: ctx.trailStopPrice ?? null,
             highWaterMark: ctx.highWaterMark ?? null,
             unrealisedPnL: unrealisedPnL != null ? +unrealisedPnL.toFixed(2) : null,
@@ -393,25 +396,35 @@ export function createApiHandler(deps) {
       let positions = [];
       try {
         const result = await query('SELECT * FROM positions ORDER BY opened_at DESC');
-        positions = result.rows.map((p) => ({
-          symbol: p.symbol,
-          side: p.side,
-          quantity: p.quantity,
-          entryPrice: parseFloat(p.avg_price),
-          currentPrice: parseFloat(p.current_price || p.avg_price),
-          stopPrice: p.stop_loss ? parseFloat(p.stop_loss) : null,
-          product: p.product,
-          strategy: p.strategy,
-        }));
+        positions = result.rows.map((p) => {
+          const entryPrice = parseFloat(p.avg_price);
+          const currentPrice = parseFloat(p.current_price || p.avg_price);
+          return {
+            symbol: p.symbol,
+            side: p.side,
+            quantity: p.quantity,
+            avgPrice: entryPrice,
+            entryPrice,
+            currentPrice,
+            stopPrice: p.stop_loss ? parseFloat(p.stop_loss) : null,
+            stopLoss: p.stop_loss ? parseFloat(p.stop_loss) : null,
+            unrealisedPnL: (currentPrice - entryPrice) * p.quantity,
+            product: p.product,
+            strategy: p.strategy,
+          };
+        });
       } catch {
         const active = engine.getActiveOrders();
         positions = active.map((o) => ({
           symbol: o.symbol,
           side: o.side,
           quantity: o.quantity,
+          avgPrice: o.price,
           entryPrice: o.price,
           currentPrice: o.filledPrice || o.price,
           stopPrice: null,
+          stopLoss: null,
+          unrealisedPnL: ((o.filledPrice || o.price) - o.price) * o.quantity,
           product: o.product || 'MIS',
           strategy: o.strategy,
         }));

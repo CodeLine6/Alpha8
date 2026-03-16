@@ -52,6 +52,8 @@ const envSchema = z.object({
   MAX_POSITION_COUNT: z.coerce.number().int().positive().default(5),
   PER_TRADE_STOP_LOSS_PCT: z.coerce.number().positive().max(100).default(1),
   KILL_SWITCH_DRAWDOWN_PCT: z.coerce.number().positive().max(100).default(5),
+  MAX_CAPITAL_EXPOSURE_PCT: z.coerce.number().positive().max(100).default(100),
+  MAX_POSITION_VALUE_PCT: z.coerce.number().positive().max(100).default(100),
 
   // ─── Position Management ─────────────────────────────
   STOP_LOSS_PCT: z.coerce.number().positive().max(100).default(1),
