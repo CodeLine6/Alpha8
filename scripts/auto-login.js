@@ -30,6 +30,8 @@ import puppeteer from 'puppeteer';
 import { TOTP } from 'otpauth';
 import { createRequire } from 'node:module';
 import { normalizeRedisUrl } from '../src/lib/redis-utils.js';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const { KiteConnect } = require('kiteconnect');
@@ -465,7 +467,10 @@ export async function runAutoLogin(options = {}) {
 }
 
 // ─── CLI Entrypoint ──────────────────────────────────────
-if (import.meta.url === new URL(process.argv[1], 'file:').href) {
+const isMain = process.argv[1] &&
+  fileURLToPath(import.meta.url).toLowerCase() === path.resolve(process.argv[1]).toLowerCase();
+
+if (isMain) {
   runAutoLogin({ silent: false }).then(result => {
     if (!result.success) process.exit(1);
     process.exit(0);
