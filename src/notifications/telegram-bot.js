@@ -120,6 +120,25 @@ export class TelegramBot {
   }
 
   /**
+   * Register available commands with Telegram Bot API so they appear in the UI menu.
+   * @param {{ command: string, description: string }[]} commands
+   */
+  async setCommands(commands) {
+    if (!this.enabled) return;
+    try {
+      const url = `https://api.telegram.org/bot${this.token}/setMyCommands`;
+      const res = await axios.post(url, { commands });
+      if (res.data?.ok) {
+        log.info({ count: commands.length }, 'Telegram bot commands menu registered successfully');
+      } else {
+        log.warn({ res: res.data }, 'Telegram bot commands menu registration partial failure');
+      }
+    } catch (err) {
+      log.error({ err: err.message }, 'Failed to set Telegram commands');
+    }
+  }
+
+  /**
    * Start polling for incoming messages.
    * Discards all historical messages on boot to prevent replay of old commands.
    */

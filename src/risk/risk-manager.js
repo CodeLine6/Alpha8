@@ -81,6 +81,8 @@ export class RiskManager {
 
     /** @type {number} Number of trades executed today */
     this._tradeCount = 0;
+    this._wins = 0;
+    this._losses = 0;
 
     // Derived limits — recomputed on every refreshLiveSettings() call
     this._recomputeLimits();
@@ -194,10 +196,14 @@ export class RiskManager {
           this._dailyPnL = stored.dailyPnL || 0;
           this._openPositionCount = stored.openPositionCount || 0;
           this._tradeCount = stored.tradeCount || 0;
+          this._wins = stored.wins || 0;
+          this._losses = stored.losses || 0;
           log.warn({
             dailyPnL: this._dailyPnL,
             openPositions: this._openPositionCount,
             tradeCount: this._tradeCount,
+            wins: this._wins,
+            losses: this._losses,
           }, 'Risk manager state RESTORED from Redis');
         } else {
           log.info('Redis risk state is from a different day — starting fresh');
@@ -283,6 +289,8 @@ export class RiskManager {
         dailyPnL: this._dailyPnL,
         openPositionCount: this._openPositionCount,
         tradeCount: this._tradeCount,
+        wins: this._wins,
+        losses: this._losses,
       });
     } catch (err) {
       log.error({ err: err.message }, 'Failed to persist risk state to Redis');
@@ -409,6 +417,8 @@ export class RiskManager {
   async recordTradePnL(pnl, symbol = '') {
     this._dailyPnL += pnl;
     this._tradeCount++;
+    if (pnl > 0) this._wins++;
+    else if (pnl < 0) this._losses++;
 
     const drawdownPct = this.capital > 0
       ? (Math.abs(Math.min(this._dailyPnL, 0)) / this.capital) * 100
@@ -468,6 +478,8 @@ export class RiskManager {
     this._dailyPnL = 0;
     this._openPositionCount = 0;
     this._tradeCount = 0;
+    this._wins = 0;
+    this._losses = 0;
     this._persistToRedis().catch(() => { });
     log.info({ capital: this.capital }, 'Risk manager daily state reset');
   }
@@ -497,6 +509,8 @@ export class RiskManager {
       openPositions: this._openPositionCount,
       maxPositions: this.maxPositionCount,
       tradeCount: this._tradeCount,
+      wins: this._wins,
+      losses: this._losses,
       killSwitch: this.killSwitch.getStatus(),
       // Active params (live overrides applied)
       activeParams: {

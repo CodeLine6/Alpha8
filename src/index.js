@@ -414,6 +414,20 @@ async function main() {
   if (telegram.enabled) {
     log.info('✅ Telegram bot initialized');
 
+    // Register command menu with Telegram
+    telegram.setCommands([
+      { command: 'status', description: 'View current system and PnL status' },
+      { command: 'watchlist', description: 'View the active trading watchlist' },
+      { command: 'scout', description: 'Trigger a manual symbol scout scan' },
+      { command: 'params', description: 'View current live risk parameters' },
+      { command: 'set', description: 'Set a live risk parameter (e.g. /set STOP_LOSS_PCT 0.8)' },
+      { command: 'reset', description: 'Reset a live parameter to default' },
+      { command: 'conviction', description: 'Toggle Super Conviction Bypass (on/off)' },
+      { command: 'reset_kill_switch', description: 'Reset the system kill switch' },
+      { command: 'market_open', description: 'Manually trigger market-open routines' },
+      { command: 'help', description: 'Show available commands' },
+    ]);
+
     // Start polling for secure remote commands
     telegram.startPolling();
 
@@ -897,7 +911,23 @@ async function main() {
       }
     });
 
-    log.info('✅ Telegram /status and /market_open commands registered');
+    telegram.onCommand('/help', async () => {
+      const msg =
+        `📋 <b>Available Commands</b>\n\n` +
+        `/status - View current system and PnL status\n` +
+        `/watchlist - View active watchlist symbols\n` +
+        `/scout - Manual symbol scout scan\n` +
+        `/params - View current live risk parameters\n` +
+        `/set <code>KEY value</code> - Set risk parameter\n` +
+        `/reset <code>KEY</code> - Reset parameter to default\n` +
+        `/conviction <code>on/off</code> - Toggle Super Conviction\n` +
+        `/reset_kill_switch - Reset the kill switch\n` +
+        `/market_open - Trigger market routines\n` +
+        `/help - Show this help message`;
+      telegram.sendRaw(msg);
+    });
+
+    log.info('✅ Telegram /status, /market_open and /help commands registered');
   }
 
   registerShutdown('scheduler', async () => {

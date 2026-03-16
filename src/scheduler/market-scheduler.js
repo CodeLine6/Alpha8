@@ -466,11 +466,15 @@ export class MarketScheduler {
       await this.dataFeed.disconnect().catch(() => { });
     }
 
+    const riskStatus = this.riskManager.getStatus();
     const summary = {
       date: new Date().toISOString().split('T')[0],
-      pnl: this.riskManager.getStatus().dailyPnL,
-      tradeCount: this.riskManager.getStatus().tradeCount,
+      pnl: riskStatus.dailyPnL,
+      trades: riskStatus.tradeCount,
+      wins: riskStatus.wins || 0,
+      losses: riskStatus.losses || 0,
       openPositions: this.engine.getOpenPositionCount(),
+      mode: config.LIVE_TRADING ? 'LIVE' : 'PAPER',
     };
 
     await this.sendReport(summary).catch(err =>
