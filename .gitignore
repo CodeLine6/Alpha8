@@ -44,6 +44,21 @@ __snapshots__/
 # Temporary
 tmp/
 .cache/
+debug_hang.txt
+debug_utf8.txt
+failed_tests.txt
+open_handles_utf8.txt
+open_handles.txt
+res.json
+test_details_utf8.txt
+test_details.txt
+test_output_utf8.txt
+test_output.txt
+test_report.json
+test_results.json
+test_utf8.json
+tier1_output.txt
+tier1_utf8.txt
 analyze_consensus.js
 analyze_signals_deep.js
 analyze_signals.js
@@ -60,3 +75,4 @@ data/13-03/signals_rows (3).json
 data/13-03/signals_rows (4).json
 data/13-03/signals_rows (5).json
 data/13-03/signals_rows (6).json
+

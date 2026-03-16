@@ -1,4 +1,3 @@
-import { VWAP, SMA } from 'technicalindicators';
 import { SIGNAL, STRATEGY } from '../config/constants.js';
 import { BaseStrategy } from './base-strategy.js';
 import { createLogger } from '../lib/logger.js';
@@ -8,29 +7,67 @@ const log = createLogger('strategy:vwap-momentum');
 /**
  * VWAP Intraday Momentum Strategy.
  *
+ * LIVE SETTINGS SUPPORT:
+ *   Call await strategy.refreshParams() once per scan cycle before analyze().
+ *   Overridable via /api/live-settings or /set Telegram command:
+ *     VWAP_VOLUME_MULTIPLIER  (default: 1.2) — min volume vs avg to confirm signal
+ *     VWAP_PRICE_BAND_PCT     (default: 0.2) — % band around VWAP to filter noise
+ *     VWAP_VOLUME_AVG_PERIOD  (default: 20)  — period for avg volume calc
+ *
  * Uses Volume-Weighted Average Price as dynamic support/resistance.
  * BUY when price crosses above VWAP with volume confirmation,
  * SELL when price crosses below VWAP with volume confirmation.
- *
- * Best suited for intraday (MIS) trades.
  *
  * @extends BaseStrategy
  */
 export class VWAPMomentumStrategy extends BaseStrategy {
   /**
    * @param {Object} [params]
-   * @param {number} [params.volumeMultiplier=1.2] - Min volume vs avg to confirm signal
-   * @param {number} [params.priceBandPct=0.2] - % band around VWAP to filter noise
-   * @param {number} [params.volumeAvgPeriod=20] - Period for avg volume calc
-   * @param {number} [params.minCandles=15] - Minimum candles
+   * @param {number} [params.volumeMultiplier=1.2]
+   * @param {number} [params.priceBandPct=0.2]
+   * @param {number} [params.volumeAvgPeriod=20]
+   * @param {number} [params.minCandles=15]
+   * @param {boolean} [params.anchorToday=true]
+   * @param {Function} [params.getLiveSetting]
    */
   constructor(params = {}) {
     super(STRATEGY.VWAP_MOMENTUM, params);
-    this.volumeMultiplier = params.volumeMultiplier ?? 1.2;
-    this.priceBandPct = params.priceBandPct ?? 0.2;
-    this.volumeAvgPeriod = params.volumeAvgPeriod ?? 20;
+
+    this._baseVolumeMultiplier = params.volumeMultiplier ?? 1.2;
+    this._basePriceBandPct = params.priceBandPct ?? 0.2;
+    this._baseVolumeAvgPeriod = params.volumeAvgPeriod ?? 20;
+
+    this.volumeMultiplier = this._baseVolumeMultiplier;
+    this.priceBandPct = this._basePriceBandPct;
+    this.volumeAvgPeriod = this._baseVolumeAvgPeriod;
     this.minCandles = params.minCandles ?? 15;
     this.anchorToday = params.anchorToday ?? true;
+
+    this._getLiveSetting = params.getLiveSetting || null;
+  }
+
+  /**
+   * Pull latest parameter overrides from Redis.
+   * Call once per scan cycle before analyze().
+   * @returns {Promise<void>}
+   */
+  async refreshParams() {
+    if (!this._getLiveSetting) return;
+
+    try {
+      this.volumeMultiplier = await this._getLiveSetting('VWAP_VOLUME_MULTIPLIER', this._baseVolumeMultiplier);
+      this.priceBandPct = await this._getLiveSetting('VWAP_PRICE_BAND_PCT', this._basePriceBandPct);
+      this.volumeAvgPeriod = await this._getLiveSetting('VWAP_VOLUME_AVG_PERIOD', this._baseVolumeAvgPeriod);
+
+      log.debug({
+        volumeMultiplier: this.volumeMultiplier,
+        priceBandPct: this.priceBandPct,
+        volumeAvgPeriod: this.volumeAvgPeriod,
+      }, 'VWAP params refreshed');
+    } catch (err) {
+      log.warn({ err: err.message }, 'VWAP refreshParams failed — keeping current values');
+    }
+
   }
 
   /**
@@ -39,8 +76,11 @@ export class VWAPMomentumStrategy extends BaseStrategy {
    *
    * @param {import('../data/historical-data.js').Candle[]} candles
    * @param {Object} [options]
+   * @param {import('../data/historical-data.js').Candle[]} candles
+   * @param {Object} [options]
    * @param {boolean} [options.anchorToday=true] - When true, filters to current IST session (09:15 onwards). Set false for backtesting with pre-sliced daily candles.
    * @returns {number[]} Running VWAP values
+
    */
   calculateVWAP(candles, { anchorToday = true } = {}) {
     let filteredCandles = candles;
@@ -48,8 +88,11 @@ export class VWAPMomentumStrategy extends BaseStrategy {
     if (anchorToday && candles.length > 0) {
       // Find today's date in IST from the latest candle safely
       const validCandles = candles.filter(c => {
-        if (!c || !c.date) return false;
-        const t = new Date(c.date).getTime();
+        if (!c) return false;
+        const ts = c.timestamp || c.date;
+        if (!ts) return false;
+        const t = new Date(ts).getTime();
+
         return !isNaN(t) && t > 0;
       });
 
@@ -57,18 +100,21 @@ export class VWAPMomentumStrategy extends BaseStrategy {
 
       let maxTime = -Infinity;
       for (const c of validCandles) {
-        const t = new Date(c.date).getTime();
+        const ts = c.timestamp || c.date;
+        const t = new Date(ts).getTime();
         if (t > maxTime) maxTime = t;
       }
 
       // 19800000 = 330 minutes * 60 * 1000 = +5:30 IST
+
       const latestIstDate = new Date(maxTime + 19800000);
       if (isNaN(latestIstDate.getTime())) return [];
 
       const todayDateStr = latestIstDate.toISOString().split('T')[0];
 
       filteredCandles = validCandles.filter(c => {
-        const cTime = new Date(c.date).getTime();
+        const ts = c.timestamp || c.date;
+        const cTime = new Date(ts).getTime();
         const istDate = new Date(cTime + 19800000);
 
         if (isNaN(istDate.getTime())) return false;
@@ -83,10 +129,11 @@ export class VWAPMomentumStrategy extends BaseStrategy {
       if (filteredCandles.length < this.minCandles) {
         return [];
       }
+
     }
 
     const vwapValues = [];
-    let cumulativeTPV = 0; // Typical Price × Volume
+    let cumulativeTPV = 0;
     let cumulativeVolume = 0;
 
     for (const c of filteredCandles) {
@@ -101,7 +148,6 @@ export class VWAPMomentumStrategy extends BaseStrategy {
 
   /**
    * Analyze candles for VWAP momentum signals.
-   *
    * @param {import('../data/historical-data.js').Candle[]} candles
    * @returns {{ signal: 'BUY'|'SELL'|'HOLD', confidence: number, reason: string }}
    */
@@ -118,6 +164,7 @@ export class VWAPMomentumStrategy extends BaseStrategy {
       }
 
       // Calculate VWAP
+
       const vwapValues = this.calculateVWAP(candles, { anchorToday: this.anchorToday });
 
       if (vwapValues.length === 0) {
@@ -130,6 +177,7 @@ export class VWAPMomentumStrategy extends BaseStrategy {
       const currentVWAP = vwapValues[vwapValues.length - 1];
       const previousVWAP = vwapValues[vwapValues.length - 2];
 
+
       const currentPrice = closes[closes.length - 1];
       const previousPrice = closes[closes.length - 2];
       const currentVolume = volumes[volumes.length - 1];
@@ -139,6 +187,7 @@ export class VWAPMomentumStrategy extends BaseStrategy {
       const avgVolume = recentVolumes.reduce((a, b) => a + b, 0) / recentVolumes.length;
 
       // Price deviation from VWAP
+
       const deviation = ((currentPrice - currentVWAP) / currentVWAP) * 100;
       const absDeviation = Math.abs(deviation);
       const bandThreshold = this.priceBandPct;
@@ -148,6 +197,7 @@ export class VWAPMomentumStrategy extends BaseStrategy {
       const hasVolumeConfirmation = volumeRatio >= this.volumeMultiplier;
 
       // Detect VWAP crossover
+
       const bullishCross = previousPrice <= previousVWAP && currentPrice > currentVWAP;
       const bearishCross = previousPrice >= previousVWAP && currentPrice < currentVWAP;
 
@@ -157,6 +207,7 @@ export class VWAPMomentumStrategy extends BaseStrategy {
         confidence += Math.min(absDeviation * 10, 25); // deviation bonus
         if (hasVolumeConfirmation) confidence += 20; // volume bonus
         confidence += Math.min(volumeRatio * 5, 10); // extra volume strength
+
 
         const reason =
           `Price crossed above VWAP. ` +
@@ -197,7 +248,9 @@ export class VWAPMomentumStrategy extends BaseStrategy {
         }
       }
 
+
       // ─── Neutral ─────────────────────────────────────────
+
       const side = deviation > 0 ? 'above' : 'below';
       return this.hold(
         `Price ${side} VWAP (${deviation.toFixed(2)}%). ` +
@@ -205,6 +258,7 @@ export class VWAPMomentumStrategy extends BaseStrategy {
       );
     } catch (err) {
       // We append a specialized tag so if this bubbles up, we know EXACTLY where it came from.
+
       err.message = '[VWAP_CRITICAL] ' + err.message + '\nStack: ' + err.stack;
       throw err;
     }

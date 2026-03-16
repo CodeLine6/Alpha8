@@ -29,6 +29,8 @@ import { PositionStats } from './risk/position-stats.js';
 import { HoldingsManager } from './data/holdings.js';
 import { IntradayDecayManager } from './intelligence/intraday-decay.js';
 import { PositionManager } from './risk/position-manager.js';
+import { getAllLiveSettings, getLiveSetting, resetLiveSetting, setLiveSetting } from './lib/settings-store.js';
+import { decryptToken } from './lib/crypto-utils.js';
 
 const log = createLogger('main');
 const APP_VERSION = '1.0.0';
@@ -158,7 +160,8 @@ async function main() {
 
   try {
     if (redisHealthy) {
-      accessToken = await getRedis().get('kite:access_token');
+      const raw = await getRedis().get('kite:access_token');
+      accessToken = raw ? decryptToken(raw) : null;
     }
 
     if (accessToken && config.KITE_API_KEY && config.KITE_API_KEY !== 'dev_placeholder') {
@@ -368,7 +371,12 @@ async function main() {
   // Must be initialized AFTER engine.hydratePositions() because it references
   // engine._filledPositions directly. Requires broker for LTP price fetching.
   const positionManager = config.POSITION_MGMT_ENABLED
-    ? new PositionManager({ engine, broker, config })
+    ? new PositionManager({
+      engine,
+      broker,
+      config,
+      getLiveSetting: redisHealthy ? getLiveSetting : null,  // ← add this
+    })
     : null;
 
   if (positionManager) {
@@ -382,6 +390,19 @@ async function main() {
       `   Trailing stop:  ${config.TRAILING_STOP_PCT}% below peak\n` +
       `   Max hold:       ${config.MAX_HOLD_MINUTES} minutes (flat/losing positions only)`
     );
+    engine.positionManager = positionManager;
+    engine._fetchCandles = async (symbol, limit) => {
+      if (!broker) return [];
+      const instrumentToken = instrumentManager?.getToken(symbol) ?? null;
+      return fetchRecentCandles({
+        broker,
+        instrumentToken,
+        symbol,
+        interval: '5minute',
+        count: limit,
+      }).catch(() => []);
+    };
+
   } else {
     log.warn('⚠️  Position manager: DISABLED (POSITION_MGMT_ENABLED=false)');
   }
@@ -401,6 +422,43 @@ async function main() {
       } else {
         telegram.sendRaw('ℹ️ <b>Kill Switch</b> is not currently engaged.');
       }
+    });
+
+    telegram.onCommand('/set', async (text) => {
+      // Usage: /set STOP_LOSS_PCT 0.8
+      const parts = text.trim().split(/\s+/);
+      if (parts.length !== 3) {
+        telegram.sendRaw('Usage: <code>/set PARAM_KEY value</code>\nExample: <code>/set STOP_LOSS_PCT 0.8</code>');
+        return;
+      }
+      const [, key, value] = parts;
+      try {
+        await setLiveSetting(key, value);
+        telegram.sendRaw(`✅ <b>${key}</b> set to <code>${value}</code>\nTakes effect on next scan cycle.`);
+      } catch (err) {
+        telegram.sendRaw(`❌ Error: ${err.message}`);
+      }
+    });
+
+    telegram.onCommand('/params', async () => {
+      const live = await getAllLiveSettings();
+      const keys = Object.keys(live);
+      if (keys.length === 0) {
+        telegram.sendRaw('ℹ️ No live overrides active — all params using .env defaults.');
+        return;
+      }
+      const lines = keys.map(k => `<b>${k}</b>: <code>${live[k]}</code>`).join('\n');
+      telegram.sendRaw(`📋 <b>Active Parameter Overrides</b>\n\n${lines}`);
+    });
+
+    telegram.onCommand('/reset', async (text) => {
+      const key = text.replace('/reset', '').trim();
+      if (!key) {
+        telegram.sendRaw('Usage: <code>/reset PARAM_KEY</code>');
+        return;
+      }
+      await resetLiveSetting(key);
+      telegram.sendRaw(`✅ <b>${key}</b> reset to .env default.`);
     });
   } else {
     log.warn('⚠️  Telegram bot disabled — missing token or chatId');
@@ -863,6 +921,10 @@ async function main() {
   const { createServer } = await import('node:http');
   const apiHandler = createApiHandler({
     killSwitch, riskManager, engine, config, broker, telegram, scout, holdingsManager,
+    getLiveSetting: redisHealthy ? getLiveSetting : null,
+    setLiveSetting: redisHealthy ? setLiveSetting : null,
+    getAllLiveSettings: redisHealthy ? getAllLiveSettings : null,
+    resetLiveSetting: redisHealthy ? resetLiveSetting : null,
   });
 
   const apiServer = createServer(apiHandler);

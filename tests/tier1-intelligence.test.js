@@ -64,13 +64,14 @@ function makeEngine({ consensus, pipeline = null, paperMode = true } = {}) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe('Task 1 — STRATEGY_GROUPS export', () => {
-    test('REVERSAL group contains ema-crossover and rsi-reversion', () => {
+    test('REVERSAL group contains EMA_CROSSOVER and RSI_MEAN_REVERSION', () => {
         expect(STRATEGY_GROUPS.REVERSAL).toContain('EMA_CROSSOVER');
         expect(STRATEGY_GROUPS.REVERSAL).toContain('RSI_MEAN_REVERSION');
         expect(STRATEGY_GROUPS.REVERSAL).toHaveLength(2);
     });
 
-    test('MOMENTUM group contains vwap-momentum and breakout-volume', () => {
+
+    test('MOMENTUM group contains VWAP_MOMENTUM and BREAKOUT_VOLUME', () => {
         expect(STRATEGY_GROUPS.MOMENTUM).toContain('VWAP_MOMENTUM');
         expect(STRATEGY_GROUPS.MOMENTUM).toContain('BREAKOUT_VOLUME');
         expect(STRATEGY_GROUPS.MOMENTUM).toHaveLength(2);
@@ -476,7 +477,8 @@ describe('Task 4 — _persistSignals includes price column', () => {
             details: [{ strategy: 'EMA_CROSSOVER', signal: 'BUY', confidence: 75, reason: 'test' }],
         };
 
-        // Should resolve (the DB error is caught internally and only logged)
+        // Should resolve to null (the DB error is caught internally and logged, returning null)
         await expect(engine._persistSignals('RELIANCE', fakeConsensus, 2500)).resolves.toBeNull();
+
     });
 });

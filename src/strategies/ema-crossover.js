@@ -8,6 +8,13 @@ const log = createLogger('strategy:ema-crossover');
 /**
  * EMA 9/21 Moving Average Crossover Strategy.
  *
+ * LIVE SETTINGS SUPPORT:
+ *   Call await strategy.refreshParams() once per scan cycle before analyze().
+ *   Overridable via /api/live-settings or /set Telegram command:
+ *     EMA_FAST_PERIOD   (default: 9)
+ *     EMA_SLOW_PERIOD   (default: 21)
+ *     EMA_MIN_CANDLES   (default: auto = slowPeriod + 5, min 25)
+ *
  * Generates BUY when fast EMA (9) crosses above slow EMA (21),
  * and SELL when fast crosses below slow.
  *
@@ -22,12 +29,50 @@ export class EMACrossoverStrategy extends BaseStrategy {
    * @param {number} [params.fastPeriod=9] - Fast EMA period
    * @param {number} [params.slowPeriod=21] - Slow EMA period
    * @param {number} [params.minCandles=25] - Minimum candles required
+   * @param {Function} [params.getLiveSetting] - Live settings reader fn(key, fallback)
    */
   constructor(params = {}) {
     super(STRATEGY.EMA_CROSSOVER, params);
-    this.fastPeriod = params.fastPeriod ?? 9;
-    this.slowPeriod = params.slowPeriod ?? 21;
+
+    // Base defaults — used as fallback when no live override is set
+    this._baseFastPeriod = params.fastPeriod ?? 9;
+    this._baseSlowPeriod = params.slowPeriod ?? 21;
+
+    // Live (active) values — start as base, updated by refreshParams()
+    this.fastPeriod = this._baseFastPeriod;
+    this.slowPeriod = this._baseSlowPeriod;
     this.minCandles = params.minCandles ?? Math.max(this.slowPeriod + 5, 25);
+
+    // Optional live settings provider
+    this._getLiveSetting = params.getLiveSetting || null;
+  }
+
+  /**
+   * Pull latest parameter overrides from Redis.
+   * Call once per scan cycle before analyze().
+   * Safe to call even if getLiveSetting is not configured — no-op in that case.
+   *
+   * @returns {Promise<void>}
+   */
+  async refreshParams() {
+    if (!this._getLiveSetting) return;
+
+    try {
+      this.fastPeriod = await this._getLiveSetting('EMA_FAST_PERIOD', this._baseFastPeriod);
+      this.slowPeriod = await this._getLiveSetting('EMA_SLOW_PERIOD', this._baseSlowPeriod);
+
+      // minCandles must always be >= slowPeriod + 5 to have enough data
+      const baseMinCandles = Math.max(this.slowPeriod + 5, 25);
+      this.minCandles = await this._getLiveSetting('EMA_MIN_CANDLES', baseMinCandles);
+
+      log.debug({
+        fastPeriod: this.fastPeriod,
+        slowPeriod: this.slowPeriod,
+        minCandles: this.minCandles,
+      }, 'EMA params refreshed');
+    } catch (err) {
+      log.warn({ err: err.message }, 'EMA refreshParams failed — keeping current values');
+    }
   }
 
   /**
@@ -58,6 +103,7 @@ export class EMACrossoverStrategy extends BaseStrategy {
     }
 
     // EMA library outputs same-length arrays; tail indexing is safe without offset
+
     const currentFast = fastEMA[fastEMA.length - 1];
     const previousFast = fastEMA[fastEMA.length - 2];
     const currentSlow = slowEMA[slowEMA.length - 1];
@@ -72,7 +118,7 @@ export class EMACrossoverStrategy extends BaseStrategy {
     const bearishCross = previousFast >= previousSlow && currentFast < currentSlow;
 
     // Trend strength: how far apart the EMAs are
-    const trendStrength = Math.min(gapPct * 20, 50); // cap at 50
+    const trendStrength = Math.min(gapPct * 20, 50);
 
     // Momentum confirmation: is price above/below both EMAs?
     const priceAboveBoth = currentPrice > currentFast && currentPrice > currentSlow;

@@ -8,36 +8,85 @@ const log = createLogger('strategy:rsi-reversion');
 /**
  * RSI-based Mean Reversion Strategy.
  *
- * Generates BUY when RSI drops below oversold threshold (< 30),
- * and SELL when RSI rises above overbought threshold (> 70).
- *
- * Confidence scales with how extreme the RSI reading is.
+ * LIVE SETTINGS SUPPORT:
+ *   Call await strategy.refreshParams() once per scan cycle before analyze().
+ *   Overridable via /api/live-settings or /set Telegram command:
+ *     RSI_PERIOD             (default: 14)
+ *     RSI_OVERSOLD           (default: 30)
+ *     RSI_OVERBOUGHT         (default: 70)
+ *     RSI_EXTREME_OVERSOLD   (default: 20)
+ *     RSI_EXTREME_OVERBOUGHT (default: 80)
  *
  * @extends BaseStrategy
  */
 export class RSIMeanReversionStrategy extends BaseStrategy {
   /**
    * @param {Object} [params]
-   * @param {number} [params.period=14] - RSI calculation period
-   * @param {number} [params.oversold=30] - Oversold threshold
-   * @param {number} [params.overbought=70] - Overbought threshold
-   * @param {number} [params.extremeOversold=20] - Extreme oversold level
-   * @param {number} [params.extremeOverbought=80] - Extreme overbought level
-   * @param {number} [params.minCandles=20] - Minimum candles required
+   * @param {number} [params.period=14]
+   * @param {number} [params.oversold=30]
+   * @param {number} [params.overbought=70]
+   * @param {number} [params.extremeOversold=20]
+   * @param {number} [params.extremeOverbought=80]
+   * @param {number} [params.minCandles=20]
+   * @param {Function} [params.getLiveSetting]
    */
   constructor(params = {}) {
     super(STRATEGY.RSI_MEAN_REVERSION, params);
-    this.period = params.period ?? 14;
-    this.oversold = params.oversold ?? 30;
-    this.overbought = params.overbought ?? 70;
-    this.extremeOversold = params.extremeOversold ?? 20;
-    this.extremeOverbought = params.extremeOverbought ?? 80;
+
+    this._basePeriod = params.period ?? 14;
+    this._baseOversold = params.oversold ?? 30;
+    this._baseOverbought = params.overbought ?? 70;
+    this._baseExtremeOversold = params.extremeOversold ?? 20;
+    this._baseExtremeOverbought = params.extremeOverbought ?? 80;
+
+    this.period = this._basePeriod;
+    this.oversold = this._baseOversold;
+    this.overbought = this._baseOverbought;
+    this.extremeOversold = this._baseExtremeOversold;
+    this.extremeOverbought = this._baseExtremeOverbought;
     this.minCandles = params.minCandles ?? 20;
+
+    this._getLiveSetting = params.getLiveSetting || null;
+  }
+
+  /**
+   * Pull latest parameter overrides from Redis.
+   * Call once per scan cycle before analyze().
+   * @returns {Promise<void>}
+   */
+  async refreshParams() {
+    if (!this._getLiveSetting) return;
+
+    try {
+      this.period = await this._getLiveSetting('RSI_PERIOD', this._basePeriod);
+      this.oversold = await this._getLiveSetting('RSI_OVERSOLD', this._baseOversold);
+      this.overbought = await this._getLiveSetting('RSI_OVERBOUGHT', this._baseOverbought);
+      this.extremeOversold = await this._getLiveSetting('RSI_EXTREME_OVERSOLD', this._baseExtremeOversold);
+      this.extremeOverbought = await this._getLiveSetting('RSI_EXTREME_OVERBOUGHT', this._baseExtremeOverbought);
+
+      // Guard: extreme levels must sit inside oversold/overbought range
+      if (this.extremeOversold >= this.oversold) {
+        log.warn({ extremeOversold: this.extremeOversold, oversold: this.oversold },
+          'RSI_EXTREME_OVERSOLD must be < RSI_OVERSOLD — clamping');
+        this.extremeOversold = this.oversold - 5;
+      }
+      if (this.extremeOverbought <= this.overbought) {
+        log.warn({ extremeOverbought: this.extremeOverbought, overbought: this.overbought },
+          'RSI_EXTREME_OVERBOUGHT must be > RSI_OVERBOUGHT — clamping');
+        this.extremeOverbought = this.overbought + 5;
+      }
+
+      log.debug({
+        period: this.period, oversold: this.oversold, overbought: this.overbought,
+        extremeOversold: this.extremeOversold, extremeOverbought: this.extremeOverbought,
+      }, 'RSI params refreshed');
+    } catch (err) {
+      log.warn({ err: err.message }, 'RSI refreshParams failed — keeping current values');
+    }
   }
 
   /**
    * Analyze candles for RSI-based mean reversion signals.
-   *
    * @param {import('../data/historical-data.js').Candle[]} candles
    * @returns {{ signal: 'BUY'|'SELL'|'HOLD', confidence: number, reason: string }}
    */
@@ -64,22 +113,12 @@ export class RSIMeanReversionStrategy extends BaseStrategy {
     const previousRSI = rsiValues[rsiValues.length - 2];
     const currentPrice = closes[closes.length - 1];
 
-    // ─── Oversold → BUY signal ───────────────────────────
+    // ─── Oversold → BUY ──────────────────────────────────
     if (currentRSI < this.oversold) {
-      // RSI turning up from oversold = stronger signal
       const isReversingUp = currentRSI > previousRSI;
-
-      // Confidence: deeper oversold = higher confidence
       let confidence = 50;
-
-      // Depth bonus: RSI 30→50, RSI 20→70, RSI 10→90
-      const depth = this.oversold - currentRSI;
-      confidence += depth * 1.5;
-
-      // Reversal confirmation bonus
+      confidence += (this.oversold - currentRSI) * 1.5;
       if (isReversingUp) confidence += 15;
-
-      // Extreme oversold bonus
       if (currentRSI < this.extremeOversold) confidence += 10;
 
       const reason =
@@ -91,14 +130,11 @@ export class RSIMeanReversionStrategy extends BaseStrategy {
       return this.buildSignal(SIGNAL.BUY, confidence, reason);
     }
 
-    // ─── Overbought → SELL signal ────────────────────────
+    // ─── Overbought → SELL ───────────────────────────────
     if (currentRSI > this.overbought) {
       const isReversingDown = currentRSI < previousRSI;
-
       let confidence = 50;
-      const depth = currentRSI - this.overbought;
-      confidence += depth * 1.5;
-
+      confidence += (currentRSI - this.overbought) * 1.5;
       if (isReversingDown) confidence += 15;
       if (currentRSI > this.extremeOverbought) confidence += 10;
 
@@ -111,7 +147,6 @@ export class RSIMeanReversionStrategy extends BaseStrategy {
       return this.buildSignal(SIGNAL.SELL, confidence, reason);
     }
 
-    // ─── Neutral zone ────────────────────────────────────
     return this.hold(
       `RSI neutral at ${currentRSI.toFixed(1)} ` +
       `(oversold: <${this.oversold}, overbought: >${this.overbought}). Price: ${currentPrice.toFixed(2)}`

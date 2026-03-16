@@ -1,3 +1,28 @@
+/**
+ * @fileoverview Market Scheduler for Alpha8
+ *
+ * FIXES APPLIED:
+ *
+ *   Fix 2/latestSignals — Two-phase strategy scan
+ *     Signal Reversal exit requires knowing what each strategy is currently
+ *     signalling for held symbols. Previously checkAll() was called with no
+ *     arguments (latestSignals={}), so reversal exit never fired.
+ *     Phase 1 now runs consensus.evaluate() for held symbols to build a
+ *     latestSignals map. Phase 2 passes that map to checkAll(). Phase 3
+ *     runs full processSignal() for non-held symbols.
+ *
+ *   Fix 22 — positionManager.checkAll() runs independently of _scanning flag
+ *     After _squareOffWarning() sets _scanning=false, _strategyScan() returns
+ *     early — skipping checkAll(). Positions were unmonitored 3:10–3:15 PM.
+ *     checkAll() is now called in its own dedicated job at 3:12 PM and also
+ *     unconditionally at the top of _strategyScan() (before the _scanning check).
+ *     The 3:12 PM job specifically handles the post-warning window.
+ *
+ *   Fix 27 — clearRecentExits() called before each scan
+ *     engine.clearRecentExits() is called at the start of Phase 3 so that
+ *     the re-entry cooldown set is fresh each scan cycle.
+ */
+
 import cron from 'node-cron';
 import { createLogger } from '../lib/logger.js';
 import { TIMEZONE } from '../config/constants.js';
@@ -6,70 +31,29 @@ import { executeSquareOff } from '../risk/square-off-job.js';
 
 const log = createLogger('scheduler');
 
-/**
- * Market Day Scheduler — the nervous system of Alpha8.
- *
- * Orchestrates the full daily trading cycle using node-cron
- * with Asia/Kolkata timezone. Each job:
- *   1. Checks kill switch before running
- *   2. Logs start/end with duration
- *   3. Handles errors without crashing other jobs
- *
- * Schedule:
- *   08:55 Sun — Weekly maintenance: update adaptive strategy weights
- *   09:00 — Pre-market: health checks + verifyIntegrity + pipeline warm-up
- *   09:15 — Market open: start feeds + activate scanning
- *   Every 5min 09:15–15:10 — Strategy scan loop
- *   15:10 — Square-off warning: log open positions
- *   15:15 — Square-off: close all positions + cancel pending
- *   15:35 — Post-market: daily summary + reset counters
- *   20:00 Mon-Fri — Nightly symbol scout: auto-update dynamic watchlist
- *
- * @module scheduler
- */
-
 export class MarketScheduler {
-  /**
-   * @param {Object} deps
-   * @param {import('../risk/kill-switch.js').KillSwitch}                             deps.killSwitch
-   * @param {import('../risk/risk-manager.js').RiskManager}                           deps.riskManager
-   * @param {import('../engine/execution-engine.js').ExecutionEngine}                 deps.engine
-   * @param {import('../intelligence/enhanced-pipeline.js').EnhancedSignalPipeline}  [deps.pipeline]
-   * @param {import('../intelligence/symbol-scout.js').SymbolScout}                  [deps.scout]
-   * @param {import('../intelligence/shadow-recorder.js').ShadowRecorder} [deps.shadowRecorder]
-   * @param {Object}   [deps.broker]
-   * @param {Object}   [deps.dataFeed]
-   * @param {Function} [deps.getWatchlist]      - Returns [{ symbol, candles, price, quantity }]
-   * @param {Function} [deps.getNiftyCandles]   - Returns daily Nifty 50 candles for regime detector
-   * @param {Function} [deps.getOpenPositions]
-   * @param {Function} [deps.sendReport]
-   * @param {Function} [deps.healthCheck]
-   */
   constructor(deps) {
     this.killSwitch = deps.killSwitch;
     this.riskManager = deps.riskManager;
     this.engine = deps.engine;
     this.pipeline = deps.pipeline || null;
-    this.scout = deps.scout || null;   // ← NEW
+    this.scout = deps.scout || null;
     this.shadowRecorder = deps.shadowRecorder || null;
     this.intradayDecay = deps.intradayDecay || null;
-    this.positionManager = deps.positionManager || null;  // Position management (stop/trail/time exits)
+    this.positionManager = deps.positionManager || null;
     this.broker = deps.broker || null;
     this.dataFeed = deps.dataFeed || null;
+
     this.getWatchlist = deps.getWatchlist || (async () => []);
     this.getNiftyCandles = deps.getNiftyCandles || (async () => []);
     this.getOpenPositions = deps.getOpenPositions || (async () => []);
     this.sendReport = deps.sendReport || (async () => { });
     this.healthCheck = deps.healthCheck || (async () => ({ broker: true, redis: true, db: true }));
 
-    /** @type {cron.ScheduledTask[]} */
     this._cronJobs = [];
-
-    /** @type {boolean} */
     this._scanning = false;
-
-    /** @type {boolean} Prevent overlapping scans */
     this._scanInProgress = false;
+    this._scanCount = 0;
 
     log.info('MarketScheduler created');
   }
@@ -81,77 +65,96 @@ export class MarketScheduler {
   start() {
     const opts = { timezone: TIMEZONE };
 
-    // 0. Weekly maintenance: Sunday 8:55 AM IST — update adaptive weights
+    // 0. Weekly maintenance: Sunday 8:55 AM IST
     this._cronJobs.push(
-      cron.schedule('55 8 * * 0', () => this._runJob('weekly-maintenance', () => this._weeklyMaintenance()), opts)
+      cron.schedule('55 8 * * 0', () =>
+        this._runJob('weekly-maintenance', () => this._weeklyMaintenance()), opts)
     );
 
     // 1. Pre-market: 9:00 AM IST
     this._cronJobs.push(
-      cron.schedule('0 9 * * 1-5', () => this._runJob('pre-market', () => this._preMarket()), opts)
+      cron.schedule('0 9 * * 1-5', () =>
+        this._runJob('pre-market', () => this._preMarket()), opts)
     );
 
     // 2. Market open: 9:15 AM IST
     this._cronJobs.push(
-      cron.schedule('15 9 * * 1-5', () => this._runJob('market-open', () => this._marketOpen()), opts)
+      cron.schedule('15 9 * * 1-5', () =>
+        this._runJob('market-open', () => this._marketOpen()), opts)
     );
 
-    // 3. Strategy scan: every 5 minutes, 9:15 AM – 3:10 PM IST (Mon–Fri)
+    // 3. Strategy scan: every 5 minutes, 9:15 AM – 3:10 PM IST
     this._cronJobs.push(
-      cron.schedule('15,20,25,30,35,40,45,50,55 9 * * 1-5', () => this._runJob('strategy-scan', () => this._strategyScan()), opts)
+      cron.schedule('15,20,25,30,35,40,45,50,55 9 * * 1-5', () =>
+        this._runJob('strategy-scan', () => this._strategyScan()), opts)
     );
     this._cronJobs.push(
-      cron.schedule('0,5,10,15,20,25,30,35,40,45,50,55 10-14 * * 1-5', () => this._runJob('strategy-scan', () => this._strategyScan()), opts)
+      cron.schedule('0,5,10,15,20,25,30,35,40,45,50,55 10-14 * * 1-5', () =>
+        this._runJob('strategy-scan', () => this._strategyScan()), opts)
     );
     this._cronJobs.push(
-      cron.schedule('0,5,10 15 * * 1-5', () => this._runJob('strategy-scan', () => this._strategyScan()), opts)
-    );
-
-    // 4. Square-off warning: 15:10 PM IST
-    this._cronJobs.push(
-      cron.schedule('10 15 * * 1-5', () => this._runJob('squareoff-warning', () => this._squareOffWarning()), opts)
+      cron.schedule('0,5,10 15 * * 1-5', () =>
+        this._runJob('strategy-scan', () => this._strategyScan()), opts)
     );
 
-    // 5. Square-off: 15:15 PM IST
+    // 4. Square-off warning: 15:10 IST — deactivates scanning
     this._cronJobs.push(
-      cron.schedule('15 15 * * 1-5', () => this._runJob('square-off', () => this._squareOff()), opts)
+      cron.schedule('10 15 * * 1-5', () =>
+        this._runJob('squareoff-warning', () => this._squareOffWarning()), opts)
     );
 
-    // 6. Post-market: 15:35 PM IST
+    // Fix 22: Position check runs at 3:12 PM to cover the post-warning window.
+    // _scanning is false after 3:10 PM so _strategyScan() would skip checkAll().
+    // This job ensures stop/trail exits still fire until square-off at 3:15 PM.
     this._cronJobs.push(
-      cron.schedule('35 15 * * 1-5', () => this._runJob('post-market', () => this._postMarket()), opts)
+      cron.schedule('12 15 * * 1-5', () =>
+        this._runJob('position-check-preclose', () => this._positionCheckPreClose()), opts)
     );
 
-    // 7. Nightly symbol scout: 8:00 PM IST Mon–Fri  ← NEW
-    //    Runs AFTER market close — safe to hit Yahoo Finance without disrupting live data
+    // 5. Square-off: 15:15 IST
     this._cronJobs.push(
-      cron.schedule('0 20 * * 1-5', () => this._runJob('symbol-scout', () => this._nightlyScout()), opts)
+      cron.schedule('15 15 * * 1-5', () =>
+        this._runJob('square-off', () => this._squareOff()), opts)
     );
 
-    // 8. Catch-up: Check if app was started mid-day during market hours
-    const status = getMarketStatus();
-    if (status.isOpen) {
-      log.info('App started mid-day during market runs. Trigerring market open routines now.');
-      this._runJob('market-open', () => this._marketOpen());
-    }
+    // 6. Post-market: 15:35 IST
+    this._cronJobs.push(
+      cron.schedule('35 15 * * 1-5', () =>
+        this._runJob('post-market', () => this._postMarket()), opts)
+    );
 
-    // 9. Shadow signal price fill — every 30min during market hours
-    //    Fills in price_after_15min / price_after_30min / price_after_60min
-    //    for shadow signals recorded in the last 60 minutes.
+    // 7. Nightly symbol scout: 8:00 PM IST Mon–Fri
+    this._cronJobs.push(
+      cron.schedule('0 20 * * 1-5', () =>
+        this._runJob('symbol-scout', () => this._nightlyScout()), opts)
+    );
+
+    // 8. Shadow signal price fill + regime update — every 30 min during market hours
     this._cronJobs.push(
       cron.schedule('*/30 9-15 * * 1-5', () =>
         this._runJob('shadow-fill', () => this._shadowFill()), opts)
     );
 
-    // 10. Shadow signal EOD fill — 4:00 PM IST
-    //    One final pass to capture end-of-day prices for all today's signals.
+    // 9. Shadow signal EOD fill — 4:00 PM IST
     this._cronJobs.push(
       cron.schedule('0 16 * * 1-5', () =>
         this._runJob('shadow-fill-eod', () => this._shadowFill()), opts)
     );
 
+    // 10. Regime detector update — every 30 min during trading hours
+    this._cronJobs.push(
+      cron.schedule('*/30 9-15 * * 1-5', () =>
+        this._runJob('regime-update', () => this._updateRegime()), opts)
+    );
+
     log.info({ jobs: this._cronJobs.length, timezone: TIMEZONE },
-      '🕐 MarketScheduler started — all jobs scheduled (shadow fill @ every 30min + 16:00 IST)');
+      '🕐 MarketScheduler started — 11 jobs scheduled');
+
+    const status = getMarketStatus();
+    if (status.isOpen) {
+      log.info('App started mid-day during market hours — triggering market open routines');
+      this._runJob('market-open', () => this._marketOpen());
+    }
   }
 
   stop() {
@@ -166,14 +169,19 @@ export class MarketScheduler {
   // ═══════════════════════════════════════════════════════
 
   async _runJob(jobName, fn) {
-    // Symbol scout and weekly-maintenance can run on non-trading days too
     const nonTradingAllowed = ['weekly-maintenance', 'symbol-scout'];
     if (!isTradingDay() && !nonTradingAllowed.includes(jobName)) {
       log.info({ job: jobName }, 'Job skipped — not a trading day');
       return { skipped: true, reason: 'not_trading_day' };
     }
 
-    const bypassJobs = ['post-market', 'square-off', 'squareoff-warning', 'weekly-maintenance', 'symbol-scout'];
+    // Fix 22: position-check-preclose and square-off bypass kill switch
+    // (we always want to exit positions and square off even if kill switch is on)
+    const bypassJobs = [
+      'post-market', 'square-off', 'squareoff-warning',
+      'weekly-maintenance', 'symbol-scout',
+      'position-check-preclose',  // Fix 22
+    ];
     if (this.killSwitch.isEngaged() && !bypassJobs.includes(jobName)) {
       log.warn({ job: jobName }, 'Job skipped — kill switch ENGAGED');
       return { skipped: true, reason: 'kill_switch_engaged' };
@@ -191,7 +199,7 @@ export class MarketScheduler {
     } catch (err) {
       const durationMs = Date.now() - startTime;
       log.error({ job: jobName, err: err.message, stack: err.stack, durationMs },
-        `❌ Job [${jobName}] FAILED after ${(durationMs / 1000).toFixed(2)}s: ${err.message}`);
+        `❌ Job [${jobName}] FAILED after ${(durationMs / 1000).toFixed(2)}s`);
       return { skipped: false, durationMs, error: err.message };
     }
   }
@@ -200,34 +208,19 @@ export class MarketScheduler {
   // JOB IMPLEMENTATIONS
   // ═══════════════════════════════════════════════════════
 
-  /**
-   * Job 0: Weekly maintenance (Sunday 8:55 AM IST)
-   * Updates adaptive strategy weights from last 2 weeks of signal outcomes.
-   * @private
-   */
   async _weeklyMaintenance() {
     log.info('═══ WEEKLY MAINTENANCE ═══');
-
     if (this.pipeline) {
       await this.pipeline.weeklyMaintenance();
       log.info('Adaptive strategy weights updated');
-    } else {
-      log.info('Pipeline not enabled — weekly maintenance skipped');
     }
-
     log.info('═══ WEEKLY MAINTENANCE COMPLETE ═══');
     return { done: true };
   }
 
-  /**
-   * Job 1: Pre-market (9:00 AM IST)
-   * Health checks, kill switch verification, pipeline warm-up.
-   * @private
-   */
   async _preMarket() {
     log.info('═══ PRE-MARKET CHECKS ═══');
 
-    // Health check
     const health = await this.healthCheck();
     log.info({ health }, 'Infrastructure health check');
 
@@ -239,27 +232,26 @@ export class MarketScheduler {
       return { healthy: false, health };
     }
 
-    // Kill switch integrity
+    if (health.broker && health.brokerTokenValid === false) {
+      log.error('⚠ Broker token is invalid or expired — run: npm run login');
+    }
+
     const integrity = await this.killSwitch.verifyIntegrity();
     log.info({ integrity }, 'Kill switch integrity verified');
 
-    // Initialize execution engine
     const engineResult = await this.engine.initialize();
     log.info({ engineReady: engineResult.ready }, 'Execution engine status');
 
-    // Pipeline warm-up: pre-fetch trend data + compute regime
     if (this.pipeline) {
       try {
         const watchlist = await this.getWatchlist();
         const symbols = watchlist.map(w => w.symbol).filter(Boolean);
         const niftyCandles = await this.getNiftyCandles().catch(err => {
-          log.warn({ err: err.message }, 'Failed to fetch Nifty candles for regime detector');
+          log.warn({ err: err.message }, 'Failed to fetch Nifty candles for warm-up');
           return [];
         });
-
         await this.pipeline.warmUp(symbols, niftyCandles);
-        log.info({ symbols: symbols.length, niftyCandles: niftyCandles.length },
-          '✅ Pipeline warm-up complete');
+        log.info({ symbols: symbols.length }, '✅ Pipeline warm-up complete');
       } catch (err) {
         log.warn({ err: err.message }, '⚠ Pipeline warm-up failed — continuing (fail-open)');
       }
@@ -267,19 +259,12 @@ export class MarketScheduler {
 
     const status = getMarketStatus();
     log.info({ status }, '═══ PRE-MARKET COMPLETE ═══');
-
     return { healthy: true, health, integrity, engineReady: engineResult.ready };
   }
 
-  /**
-   * Job 2: Market Open (9:15 AM IST)
-   * Start market data feeds, activate scanning.
-   * @private
-   */
   async _marketOpen() {
     log.info('═══ MARKET OPEN ═══');
 
-    // Feature 7: Reset intraday wrong-signal counters before first scan
     if (this.intradayDecay) {
       await this.intradayDecay.resetDay().catch(err =>
         log.warn({ err: err.message }, 'Intraday decay reset failed — continuing')
@@ -300,17 +285,40 @@ export class MarketScheduler {
     log.info('Strategy scanning ACTIVATED');
 
     if (this.engine.reconcilePositions) {
-      this.engine.reconcilePositions(this.broker).catch(err => log.warn({ err: err.message }, 'Reconciliation failed at market open'));
+      this.engine.reconcilePositions(this.broker).catch(err =>
+        log.warn({ err: err.message }, 'Reconciliation failed at market open')
+      );
     }
 
     return { scanning: true };
   }
 
   /**
-   * Job 3: Strategy Scan (every 5 minutes, 9:15 AM – 3:10 PM IST)
-   * @private
+   * Strategy Scan — every 5 minutes during market hours.
+   *
+   * Fix 2/latestSignals: Two-phase approach so signal reversal exits have
+   * current signal data:
+   *   Phase 1: For each HELD symbol, run consensus.evaluate() to collect
+   *            the current signal for that symbol's opening strategy.
+   *            Does NOT execute any orders — evaluation only.
+   *   Phase 2: Pass the collected latestSignals map to positionManager.checkAll()
+   *            so SIGNAL_REVERSAL exit can compare against live signals.
+   *   Phase 3: Run full processSignal() for non-held symbols (entry logic).
+   *
+   * Fix 22: positionManager.checkAll() is called unconditionally before the
+   * _scanning guard so it runs even after _squareOffWarning deactivates scanning.
+   * (The dedicated 3:12 PM job provides an additional safety net.)
+   *
+   * Fix 27: engine.clearRecentExits() is called before Phase 3 so that the
+   * re-entry cooldown is fresh each scan cycle (not carried between cycles).
    */
   async _strategyScan() {
+    // Fix 22: Run position management BEFORE checking _scanning flag.
+    // This ensures stop/trail exits still fire even after scanning is deactivated.
+    if (this.positionManager) {
+      await this._runPositionChecks();
+    }
+
     if (!this._scanning) {
       log.info('Strategy scan skipped — scanning not active');
       return { scanned: 0 };
@@ -321,23 +329,79 @@ export class MarketScheduler {
       return { scanned: 0, reason: 'overlap' };
     }
 
-    this._scanCount = (this._scanCount || 0) + 1;
-    if (this._scanCount % 6 === 0) {
-      if (this.engine.reconcilePositions) {
-        this.engine.reconcilePositions(this.broker).catch(err => log.warn({ err: err.message }, 'Reconciliation failed during scan'));
-      }
-    }
-
     this._scanInProgress = true;
+    this._scanCount++;
 
     try {
-      // ── Position Manager — runs BEFORE strategy scan, AWAITED ──────────────────────
-      // Checks stop loss, trailing stop, and time exit for all open positions.
-      // Must complete before the strategy scan so force-exited symbols are
-      // removed from _filledPositions before new signals are evaluated.
-      if (this.positionManager) {
-        const pmResult = await this.positionManager.checkAll().catch(err => {
-          log.error({ err: err.message }, 'Position manager check failed — continuing to strategy scan');
+      // Refresh live risk parameters
+      if (this.riskManager.refreshLiveSettings) {
+        const { changed, overrides } = await this.riskManager.refreshLiveSettings().catch(err => {
+          log.warn({ err: err.message }, 'refreshLiveSettings failed — using current values');
+          return { changed: false, overrides: {} };
+        });
+        if (changed) log.info({ overrides }, '⚙️  Risk params refreshed from live settings');
+      }
+
+      // Refresh strategy parameters
+      if (this.engine?.consensus?.strategies?.length > 0) {
+        await Promise.all(
+          this.engine.consensus.strategies
+            .filter(s => typeof s.refreshParams === 'function')
+            .map(s => s.refreshParams().catch(err =>
+              log.warn({ strategy: s.name, err: err.message }, 'Strategy refreshParams failed')
+            ))
+        );
+      }
+
+      // Per-scan reconciliation for held positions
+      if (this.engine._filledPositions?.size > 0 && this.broker) {
+        this.engine.reconcilePositions(this.broker).catch(err =>
+          log.warn({ err: err.message }, 'Reconciliation failed during scan')
+        );
+      }
+
+      const watchlist = await this.getWatchlist();
+      if (!watchlist || watchlist.length === 0) {
+        log.info('Strategy scan — empty watchlist');
+        return { scanned: 0 };
+      }
+
+      const heldSymbols = new Set([...this.engine._filledPositions.keys()]);
+      const heldItems = watchlist.filter(w => heldSymbols.has(w.symbol));
+      const nonHeldItems = watchlist.filter(w => !heldSymbols.has(w.symbol));
+
+      // ── Phase 1: Collect current signals for HELD symbols ────────────────
+      // Run consensus.evaluate() only — no orders placed.
+      // Builds latestSignals map: { [strategyName]: 'BUY'|'SELL'|'HOLD' }
+      const latestSignals = {};
+
+      for (const item of heldItems) {
+        try {
+          const consensusResult = this.engine.consensus.evaluate(item.candles);
+          // Extract per-strategy signal votes from details
+          for (const detail of (consensusResult.details || [])) {
+            if (detail.strategy && detail.signal) {
+              // Only record signals that met their floor and aren't time-suppressed
+              // (same filtering as evaluateExits uses internally)
+              if (detail.meetsFloor !== false && !detail.suppressedByTime) {
+                latestSignals[detail.strategy] = detail.signal;
+              }
+            }
+          }
+        } catch (err) {
+          log.warn({ symbol: item.symbol, err: err.message },
+            'Phase 1 signal collection failed for held symbol — skipping');
+        }
+      }
+
+      // ── Phase 2: Check exit conditions WITH current signals ──────────────
+      // positionManager already ran above via _runPositionChecks().
+      // We need to run it again here with the latestSignals map populated.
+      // The first run (without latestSignals) handles stop/trail/time exits.
+      // This run specifically enables SIGNAL_REVERSAL exits.
+      if (this.positionManager && Object.keys(latestSignals).length > 0) {
+        const pmResult = await this.positionManager.checkAll({ latestSignals }).catch(err => {
+          log.error({ err: err.message }, 'Position manager check (with signals) failed');
           return { checked: 0, exits: [] };
         });
 
@@ -345,30 +409,20 @@ export class MarketScheduler {
           log.info({
             exits: pmResult.exits.length,
             symbols: pmResult.exits.map(e => `${e.symbol}(${e.reason})`),
-          }, '🚨 Position manager exits completed before strategy scan');
+          }, '🚨 Signal-reversal exits completed');
         }
       }
 
-      const watchlist = await this.getWatchlist();
-
-      if (!watchlist || watchlist.length === 0) {
-        log.info('Strategy scan — empty watchlist');
-        return { scanned: 0 };
+      // ── Phase 3: Entry scan for non-held symbols ─────────────────────────
+      // Fix 27: Clear recent exits so re-entry cooldown applies only within
+      // the current scan cycle, not carried over from the previous one.
+      if (typeof this.engine.clearRecentExits === 'function') {
+        this.engine.clearRecentExits();
       }
 
       const results = [];
 
-      for (const item of watchlist) {
-        // ── Held-symbol skip guard ──────────────────────────────────────────
-        // Skip processSignal() for symbols the position manager is monitoring.
-        // Prevents BUY signal persistence, pipeline processing, and shadow_signal
-        // noise for symbols we already hold. The position manager's exit conditions
-        // (stop/trail/time) are the only valid exit path for held positions.
-        if (this.engine._filledPositions.has(item.symbol)) {
-          log.debug({ symbol: item.symbol }, 'Skipping strategy scan — position held (monitored by position manager)');
-          continue;
-        }
-
+      for (const item of nonHeldItems) {
         try {
           const result = await this.engine.processSignal(
             item.symbol,
@@ -385,17 +439,11 @@ export class MarketScheduler {
           });
 
           if (result.action === 'EXECUTED') {
-            log.info({
-              symbol: item.symbol,
-              signal: result.consensus?.signal,
-              orderId: result.order?.id,
-            }, `🔔 Trade executed: ${item.symbol}`);
+            log.info({ symbol: item.symbol, signal: result.consensus?.signal },
+              `🔔 Trade executed: ${item.symbol}`);
           } else if (result.action?.startsWith('BLOCKED:')) {
-            log.info({
-              symbol: item.symbol,
-              blockedBy: result.action.replace('BLOCKED:', ''),
-              pipelineLog: result.pipelineLog,
-            }, `🚫 Signal blocked: ${item.symbol}`);
+            log.info({ symbol: item.symbol, blockedBy: result.action.replace('BLOCKED:', '') },
+              `🚫 Signal blocked: ${item.symbol}`);
           }
         } catch (err) {
           log.error({ symbol: item.symbol, err: err.message },
@@ -406,21 +454,56 @@ export class MarketScheduler {
 
       log.info({
         scanned: watchlist.length,
-        held: watchlist.filter(w => this.engine._filledPositions.has(w.symbol)).length,
+        held: heldItems.length,
         executed: results.filter(r => r.action === 'EXECUTED').length,
         blocked: results.filter(r => r.action?.startsWith('BLOCKED:')).length,
       }, 'Strategy scan complete');
 
       return { scanned: watchlist.length, results };
+
     } finally {
       this._scanInProgress = false;
     }
   }
 
   /**
-   * Job 4: Square-off Warning (3:10 PM IST)
+   * Run positionManager.checkAll() without latestSignals.
+   * Handles stop-loss, trailing stop, time exits, and profit target.
+   * Called at the top of _strategyScan() before the _scanning guard,
+   * and separately at 3:12 PM via the dedicated pre-close job.
    * @private
    */
+  async _runPositionChecks() {
+    if (!this.positionManager) return { checked: 0, exits: [], partials: [] };
+
+    const pmResult = await this.positionManager.checkAll().catch(err => {
+      log.error({ err: err.message }, 'Position manager check failed — skipping');
+      return { checked: 0, exits: [], partials: [] };
+    });
+
+    if (pmResult.exits.length > 0) {
+      log.info({
+        exits: pmResult.exits.length,
+        symbols: pmResult.exits.map(e => `${e.symbol}(${e.reason})`),
+      }, '🚨 Position manager exits completed');
+    }
+
+    return pmResult;
+  }
+
+  /**
+   * Fix 22: Dedicated position check at 3:12 PM.
+   * After _squareOffWarning() sets _scanning=false, _strategyScan() is no
+   * longer called. This job ensures stop-loss and trailing stop exits still
+   * fire in the 3:10–3:15 PM window before square-off.
+   */
+  async _positionCheckPreClose() {
+    log.info('═══ POSITION CHECK PRE-CLOSE (3:12 PM) ═══');
+    const result = await this._runPositionChecks();
+    log.info({ exits: result.exits?.length ?? 0 }, '═══ PRE-CLOSE CHECK COMPLETE ═══');
+    return result;
+  }
+
   async _squareOffWarning() {
     log.warn('═══ ⚠ SQUARE-OFF WARNING — T-5 minutes ═══');
 
@@ -428,16 +511,16 @@ export class MarketScheduler {
     log.info('Strategy scanning DEACTIVATED — approaching square-off');
 
     const positions = await this.getOpenPositions();
+    const activeOrders = this.engine.getActiveOrders();
+
     log.warn({
       openCount: positions.length,
       positions: positions.map(p => ({
         symbol: p.symbol || p.tradingsymbol,
         qty: p.quantity || p.netQuantity,
-        side: (p.quantity || p.netQuantity || 0) > 0 ? 'LONG' : 'SHORT',
       })),
     }, 'Open positions entering square-off window');
 
-    const activeOrders = this.engine.getActiveOrders();
     if (activeOrders.length > 0) {
       log.warn({ pendingCount: activeOrders.length }, 'Active orders will be cancelled at 3:15 PM');
     }
@@ -445,21 +528,15 @@ export class MarketScheduler {
     return { positions: positions.length, activeOrders: activeOrders.length };
   }
 
-  /**
-   * Job 5: Square-off (3:15 PM IST)
-   * @private
-   */
   async _squareOff() {
     log.warn('═══ AUTO SQUARE-OFF TRIGGERED ═══');
 
     const activeOrders = this.engine.getActiveOrders();
     let cancelled = 0;
-
     for (const order of activeOrders) {
       const result = this.engine.cancelOrder(order.id);
       if (result && result.state === 'CANCELLED') cancelled++;
     }
-
     if (cancelled > 0) log.warn({ cancelled }, `Cancelled ${cancelled} active orders`);
 
     const squareOffResult = await executeSquareOff({
@@ -478,10 +555,6 @@ export class MarketScheduler {
     return { ...squareOffResult, cancelledOrders: cancelled };
   }
 
-  /**
-   * Job 6: Post-market (3:35 PM IST)
-   * @private
-   */
   async _postMarket() {
     log.info('═══ POST-MARKET PROCESSING ═══');
 
@@ -525,78 +598,42 @@ export class MarketScheduler {
     log.info('Risk manager and engine daily counters reset');
 
     this._scanning = false;
+    this._scanCount = 0;
 
-    log.info({ positionManagerEnabled: !!this.positionManager }, 'Position manager status at market close');
     log.info('═══ POST-MARKET COMPLETE ═══');
     return summary;
   }
 
-  /**
-   * Job 7: Nightly Symbol Scout (8:00 PM IST, Mon–Fri)  ← NEW
-   *
-   * Scans the full NSE universe, scores each symbol, and auto-updates
-   * the dynamic watchlist in the database. Sends Telegram summary.
-   * @private
-   */
   async _nightlyScout() {
     log.info('═══ NIGHTLY SYMBOL SCOUT ═══');
-
     if (!this.scout) {
       log.info('Symbol scout not configured — skipping');
       return { skipped: true, reason: 'scout_not_configured' };
     }
-
     try {
       const result = await this.scout.runNightly();
-
       log.info({
         scanned: result.scored?.length || 0,
         added: result.added?.length || 0,
         removed: result.removed?.length || 0,
         duration: `${((result.durationMs || 0) / 1000).toFixed(1)}s`,
       }, '✅ Nightly scout complete');
-
-      // Log watchlist changes to main log for visibility
-      if (result.added?.length > 0) {
-        log.info({ symbols: result.added.map(a => `${a.symbol}(${a.score})`) },
-          '➕ Scout added to watchlist');
-      }
-      if (result.removed?.length > 0) {
-        log.info({ symbols: result.removed.map(r => `${r.symbol}: ${r.reason}`) },
-          '➖ Scout removed from watchlist');
-      }
-
       return result;
     } catch (err) {
       log.error({ err: err.message }, '❌ Nightly symbol scout failed');
-      throw err; // Let _runJob handle and log it
+      throw err;
     }
   }
 
-  /**
-   * Job 9/10: Shadow Signal Price Fill
-   *
-   * Runs every 30 minutes during market hours, and once at 4:00 PM IST.
-   * Fetches current LTP for all shadow signals that still have NULL price-after
-   * columns and are old enough for the reading to be meaningful.
-   *
-   * This is what makes ShadowRecorder useful — without this job, signals are
-   * recorded but never evaluated for directional correctness.
-   *
-   * @private
-   */
   async _shadowFill() {
     if (!this.shadowRecorder) {
       log.debug('Shadow fill skipped — shadowRecorder not configured');
       return { skipped: true };
     }
-
     try {
       const result = await this.shadowRecorder.fillPriceOutcomes();
-      log.info({
-        updated: result.updated,
-        symbols: result.symbols,
-      }, `✅ Shadow fill complete — ${result.updated} rows updated`);
+      log.info({ updated: result.updated, symbols: result.symbols },
+        `✅ Shadow fill complete — ${result.updated} rows updated`);
       return result;
     } catch (err) {
       log.error({ err: err.message }, '❌ Shadow fill failed');
@@ -604,6 +641,32 @@ export class MarketScheduler {
     }
   }
 
+  async _updateRegime() {
+    if (!this.pipeline?.regimeDetector) {
+      log.debug('Regime update skipped — no regime detector configured');
+      return { skipped: true };
+    }
+    try {
+      const niftyCandles = await this.getNiftyCandles().catch(err => {
+        log.warn({ err: err.message }, 'Failed to fetch Nifty candles for regime update');
+        return [];
+      });
+      if (niftyCandles.length === 0) {
+        log.debug('Regime update skipped — no Nifty candles');
+        return { skipped: true, reason: 'no_candles' };
+      }
+      const regime = await this.pipeline.updateRegime(niftyCandles);
+      log.info({
+        regime: regime?.regime,
+        adx: regime?.adx,
+        sizeMultiplier: regime?.positionSizeMultiplier,
+      }, `✅ Regime updated: ${regime?.regime || 'unknown'}`);
+      return { regime: regime?.regime, done: true };
+    } catch (err) {
+      log.error({ err: err.message }, '❌ Regime update failed');
+      throw err;
+    }
+  }
 
   // ═══════════════════════════════════════════════════════
   // STATUS
@@ -613,11 +676,13 @@ export class MarketScheduler {
     return {
       activeJobs: this._cronJobs.length,
       scanning: this._scanning,
+      scanCount: this._scanCount,
       marketStatus: getMarketStatus(),
       killSwitchEngaged: this.killSwitch.isEngaged(),
       pipelineEnabled: !!this.pipeline,
       scoutEnabled: !!this.scout,
       shadowRecorderEnabled: !!this.shadowRecorder,
+      regimeDetectorEnabled: !!this.pipeline?.regimeDetector,
     };
   }
 }

@@ -131,7 +131,7 @@ describe('MetricsCalculator', () => {
 
   const makeTrade = (pnl, entryTime, exitTime) => ({
     symbol: 'TEST',
-    strategy: 'ema-crossover',
+    strategy: 'EMA_CROSSOVER',
     side: 'BUY',
     entryPrice: 100,
     exitPrice: 100 + pnl / 10,
@@ -390,7 +390,7 @@ describe('BacktestEngine', () => {
   async function createEngineWithMock(signalSequence, config = {}) {
     const engine = new BacktestEngine({
       symbol: 'TEST',
-      strategies: ['ema-crossover'],
+      strategies: ['EMA_CROSSOVER'],
       initialCapital: 100000,
       useConsensus: false,
       logger: () => { },
@@ -436,7 +436,7 @@ describe('BacktestEngine', () => {
     it('sets useConsensus to true when multiple strategies', () => {
       const engine = new BacktestEngine({
         symbol: 'TEST',
-        strategies: ['ema-crossover', 'rsi-reversion'],
+        strategies: ['EMA_CROSSOVER', 'RSI_MEAN_REVERSION'],
         initialCapital: 100000,
       });
       expect(engine.useConsensus).toBe(true);
@@ -445,7 +445,7 @@ describe('BacktestEngine', () => {
     it('sets useConsensus to false for single strategy', () => {
       const engine = new BacktestEngine({
         symbol: 'TEST',
-        strategies: ['ema-crossover'],
+        strategies: ['EMA_CROSSOVER'],
         initialCapital: 100000,
       });
       expect(engine.useConsensus).toBe(false);
@@ -578,13 +578,13 @@ describe('BacktestEngine', () => {
       // Even with tiny capital
       const engine = new BacktestEngine({
         symbol: 'TEST',
-        strategies: ['ema-crossover'],
+        strategies: ['EMA_CROSSOVER'],
         initialCapital: 100, // Very low capital
         useConsensus: false,
         logger: () => { },
       });
       engine._loadStrategies = async () => ({
-        'ema-crossover': mockStrategy([...Array(25).fill('HOLD'), 'BUY']),
+        'EMA_CROSSOVER': mockStrategy([...Array(25).fill('HOLD'), 'BUY']),
       });
       const candles = makeTradingDay('2024-01-15');
       const { trades } = await engine.run(candles);
@@ -608,7 +608,7 @@ describe('BacktestEngine', () => {
     it('fires trade when 2 strategies agree', async () => {
       const engine = new BacktestEngine({
         symbol: 'TEST',
-        strategies: ['ema-crossover', 'rsi-reversion'],
+        strategies: ['EMA_CROSSOVER', 'RSI_MEAN_REVERSION'],
         initialCapital: 100000,
         useConsensus: true,
         minConsensus: 2,
@@ -629,7 +629,7 @@ describe('BacktestEngine', () => {
     it('returns null when only 1 strategy agrees (minConsensus=2)', () => {
       const engine = new BacktestEngine({
         symbol: 'TEST',
-        strategies: ['ema-crossover', 'rsi-reversion'],
+        strategies: ['EMA_CROSSOVER', 'RSI_MEAN_REVERSION'],
         initialCapital: 100000,
         useConsensus: true,
         minConsensus: 2,
@@ -646,7 +646,7 @@ describe('BacktestEngine', () => {
     it('returns null when no signals', () => {
       const engine = new BacktestEngine({
         symbol: 'TEST',
-        strategies: ['ema-crossover'],
+        strategies: ['EMA_CROSSOVER'],
         initialCapital: 100000,
         logger: () => { },
       });
@@ -712,7 +712,7 @@ describe('ReportGenerator', () => {
   const sampleTrades = [
     {
       symbol: 'RELIANCE',
-      strategy: 'ema-crossover',
+      strategy: 'EMA_CROSSOVER',
       side: 'BUY',
       entryPrice: 2500,
       exitPrice: 2550,
@@ -727,7 +727,7 @@ describe('ReportGenerator', () => {
     },
     {
       symbol: 'RELIANCE',
-      strategy: 'ema-crossover',
+      strategy: 'EMA_CROSSOVER',
       side: 'BUY',
       entryPrice: 2560,
       exitPrice: 2534.4,
@@ -809,7 +809,7 @@ describe('Integration: full backtest pipeline', () => {
   it('produces valid metrics from a complete simulation run', async () => {
     const engine = new BacktestEngine({
       symbol: 'TEST',
-      strategies: ['ema-crossover'],
+      strategies: ['EMA_CROSSOVER'],
       initialCapital: 100000,
       useConsensus: false,
       logger: () => { },
@@ -823,7 +823,7 @@ describe('Integration: full backtest pipeline', () => {
       'BUY', ...Array(4).fill('HOLD'), 'SELL',
     ];
     engine._loadStrategies = async () => ({
-      'ema-crossover': mockStrategy(seq),
+      'EMA_CROSSOVER': mockStrategy(seq),
     });
 
     const candles = makeMultipleDays('2024-01-15', 14);
@@ -843,10 +843,10 @@ describe('Integration: full backtest pipeline', () => {
   });
 
   it('ALL_STRATEGIES exports correct list', () => {
-    expect(ALL_STRATEGIES).toContain('ema-crossover');
-    expect(ALL_STRATEGIES).toContain('rsi-reversion');
-    expect(ALL_STRATEGIES).toContain('vwap-momentum');
-    expect(ALL_STRATEGIES).toContain('breakout-volume');
+    expect(ALL_STRATEGIES).toContain('EMA_CROSSOVER');
+    expect(ALL_STRATEGIES).toContain('RSI_MEAN_REVERSION');
+    expect(ALL_STRATEGIES).toContain('VWAP_MOMENTUM');
+    expect(ALL_STRATEGIES).toContain('BREAKOUT_VOLUME');
     expect(ALL_STRATEGIES).toHaveLength(4);
   });
 });

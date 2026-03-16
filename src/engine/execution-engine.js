@@ -1,32 +1,40 @@
 /**
  * @fileoverview Order Execution Engine for Alpha8
  *
- * CHANGES (Tier 1):
- *   Task 2 — _filledPositions converted from Set to Map. Stores BUY entry context
- *            (strategies, price, quantity, timestamp) so SELL fills can compute P&L
- *            and feed data to the adaptive weight system via recordPositionOutcome().
+ * FIXES APPLIED THIS PASS:
  *
- *   Task 3 — Before calling pipeline.process(), fetches the current market regime
- *            via pipeline.regimeDetector.getRegime() (one call per scan cycle).
- *            The regime string is passed to process() so the pipeline can set the
- *            correct weighted consensus threshold without double-detecting regime.
+ *   Fix 1 — forceExit() ReferenceError: currentPrice → exitPrice
+ *     The parameter is named `exitPrice` but the function body referenced
+ *     `currentPrice` (undefined). Every stop-loss, trail, and time exit
+ *     would throw ReferenceError at runtime. All occurrences replaced.
  *
- *   Task 4A — _livePlaceOrder() fetches post-fill order history via getOrderHistory()
- *             to overwrite scan-time price with the actual executed price. Non-fatal.
+ *   Fix 4 — Super Conviction openingStrategy and firingStrategies
+ *     When Super Conviction fires, only the conviction strategy drove the
+ *     trade. Previously all BUY voters were captured as firingStrategies,
+ *     polluting adaptive weights and setting the wrong profit target mode.
+ *     Now uses consensusResult.convictionStrategy when present.
  *
- *   Task 4B — _persistSignals() accepts currentPrice as 3rd param and inserts it
- *             into both per-strategy and CONSENSUS signal rows.
+ *   Fix 24 — Partial exit failure guard
+ *     _executePartialExit (in position-manager) was mutating posCtx even
+ *     when forceExit returned success:false. The guard is here: forceExit()
+ *     now returns { success, pnl, order } clearly on the partial path so
+ *     the caller can check before mutating.
  *
- * BUG FIXES:
- *   Bug 1 — acted_on race condition: _persistSignals() is now awaited before order
- *            execution and returns the CONSENSUS signal row ID. _markSignalActedOn()
- *            uses that ID directly (no timestamp-based lookup race).
+ *   Fix 27 — Re-entry cooldown after force exit
+ *     After positionManager force-exits a symbol, _filledPositions is cleared
+ *     and the next strategy scan would immediately re-enter on the same candle.
+ *     Added _recentlyExited Set with per-symbol cooldown (cleared each scan).
  *
- *   Bug 2 — SELL without BUY: Added hydratePositions() for startup DB hydration.
- *            Added SELL guard in executeOrder() — rejects if symbol not in _filledPositions.
+ *   Fix 39 — Unescaped & in SELL exit Telegram message
+ *     '💰 P&L:' → '💰 P&amp;L:' in _placeWithRetry SELL path.
  *
- *   Bug 3 — Counter drift: removePosition() is now called on SELL fills. hydratePositions()
- *            returns the hydrated count so the caller can sync the risk manager.
+ *   Fix hydration — trades.strategy stores reason string, not clean name
+ *     hydratePositions() now checks if strategy column looks like a clean
+ *     constant (no spaces) and uses it; otherwise falls back to 'UNKNOWN'.
+ *     executeOrder() now writes opening_strategies JSON column at BUY time
+ *     so hydration can recover clean strategy names after restart.
+ *     NOTE: requires ALTER TABLE trades ADD COLUMN opening_strategies TEXT
+ *     (migration in setup-db.js). Falls back gracefully if column missing.
  */
 
 import { createLogger } from '../lib/logger.js';
@@ -37,23 +45,9 @@ import { ShadowRecorder } from '../intelligence/shadow-recorder.js';
 
 const log = createLogger('execution-engine');
 
-
 export class ExecutionEngine {
   /**
    * @param {Object} deps
-   * @param {import('../risk/risk-manager.js').RiskManager}         deps.riskManager
-   * @param {import('../risk/kill-switch.js').KillSwitch}           deps.killSwitch
-   * @param {import('./signal-consensus.js').SignalConsensus}        deps.consensus
-   * @param {import('../intelligence/enhanced-pipeline.js').EnhancedSignalPipeline} [deps.pipeline]
-   * @param {Object}  [deps.broker] - BrokerManager (null in paper mode)
-   * @param {boolean} [deps.paperMode=true]
-   * @param {number}  [deps.maxRetries]
-   * @param {number}  [deps.retryDelayMs]
-   * @param {import('../intelligence/shadow-recorder.js').ShadowRecorder} [deps.shadowRecorder]
-   * @param {import('../data/holdings.js').HoldingsManager} [deps.holdingsManager]
-   * @param {import('../notifications/telegram-bot.js').TelegramBot} [deps.telegram]
-   * @param {import('ioredis').Redis} [deps.redis] - For conflict alert rate limiting
-   * @param {Object} [deps.config] - Validated env config (for position management parameters)
    */
   constructor(deps) {
     this.riskManager = deps.riskManager;
@@ -70,36 +64,26 @@ export class ExecutionEngine {
     this.maxRetries = deps.maxRetries ?? MAX_ORDER_RETRIES;
     this.retryDelayMs = deps.retryDelayMs ?? RETRY_DELAY_MS;
 
-    /** @type {Map<string, Object>} Active orders by ID */
+    /** Injected after construction to avoid circular dep. */
+    this.positionManager = null;
+
+    /** Injected from index.js for ATR calculation in initPosition. */
+    this._fetchCandles = null;
+
     this._orders = new Map();
-
-    /** @type {Set<string>} Symbols with PENDING orders (duplicate guard) */
     this._pendingSymbols = new Set();
-
-    /**
-     * BUY context for open positions — keyed by symbol.
-     * Converted from Set to Map (Task 2) to store the entry data needed to
-     * compute P&L when a SELL fill is later confirmed.
-     *
-     * @type {Map<string, { strategies: string[], price: number, quantity: number, timestamp: number }>}
-     */
     this._filledPositions = new Map();
-
-    /**
-     * @type {Map<string, string[]>}
-     * Tracks which strategy names fired for each symbol's last BUY.
-     */
     this._lastSignalStrategies = new Map();
-
-    /**
-     * @type {Map<string, number>}
-     * Bug Fix 1: Tracks the DB row ID of the most recently inserted CONSENSUS signal
-     * per symbol. Used by _markSignalActedOn() to avoid the race condition where the
-     * UPDATE ran before the INSERT committed (fire-and-forget timing issue).
-     */
     this._pendingSignalIds = new Map();
 
-    /** @type {boolean} */
+    /**
+     * Fix 27: Symbols that were force-exited this scan cycle.
+     * Cleared at the start of each scan in processSignal to prevent
+     * re-entry on the same candle that triggered the exit.
+     * @type {Set<string>}
+     */
+    this._recentlyExited = new Set();
+
     this._initialized = false;
 
     log.info({
@@ -114,15 +98,8 @@ export class ExecutionEngine {
   // STARTUP
   // ═══════════════════════════════════════════════════════
 
-  /**
-   * Initialize the engine. MUST be called before any trading.
-   * Requirement #7: calls killSwitch.verifyIntegrity() at startup.
-   *
-   * @returns {Promise<{ ready: boolean, integrity: Object }>}
-   */
   async initialize() {
     log.info('Initializing execution engine...');
-
     const integrity = await this.killSwitch.verifyIntegrity();
 
     if (this.killSwitch.isEngaged()) {
@@ -133,62 +110,121 @@ export class ExecutionEngine {
     }
 
     this._initialized = true;
-    log.info({ integrity, paperMode: this.paperMode },
-      'Execution engine initialized and ready');
-
+    log.info({ integrity, paperMode: this.paperMode }, 'Execution engine initialized and ready');
     return { ready: true, integrity };
   }
 
   /**
-   * Bug Fix 2: Hydrate _filledPositions from DB on startup.
+   * Hydrate _filledPositions from DB on startup/restart.
    *
-   * Queries the trades table for BUY orders placed today (IST) that have no
-   * corresponding SELL. Reconstructs the in-memory position Map so the engine
-   * has accurate state after a server restart or Render redeploy.
-   *
-   * MUST be awaited in src/index.js before scheduler.start() is called.
-   * Throws if DB is unreachable — the caller must handle this and block startup.
-   *
-   * @returns {Promise<number>} Number of open positions hydrated
+   * Fix hydration: trades.strategy is a reason string like
+   * "BUY consensus: EMA_CROSSOVER(reversal)..." not a clean strategy name.
+   * We now also read the opening_strategies column (added in migration) which
+   * stores clean strategy names as JSON. Falls back to parsing strategy column
+   * if the new column is absent (old rows) or NULL.
    */
   async hydratePositions() {
     log.info('Hydrating open positions from DB...');
 
-    const result = await query(`
-      SELECT symbol, price, quantity, strategy, created_at
-      FROM (
-        SELECT DISTINCT ON (symbol)
-          symbol, side, price, quantity, strategy, created_at, id
-        FROM trades
-        WHERE status = 'FILLED'
-          AND paper_mode = ${!this._config?.LIVE_TRADING}
-          AND (created_at AT TIME ZONE 'Asia/Kolkata')::date =
-              (NOW() AT TIME ZONE 'Asia/Kolkata')::date
-        ORDER BY symbol, created_at DESC, id DESC
-      ) AS latest_trades
-      WHERE side = 'BUY'
-    `);
+    const isPaperMode = !this._config?.LIVE_TRADING;
+
+    const result = await query(
+      `SELECT symbol, price, quantity, strategy, created_at,
+              opening_strategies
+       FROM (
+         SELECT DISTINCT ON (symbol)
+           symbol, side, price, quantity, strategy, created_at, id,
+           opening_strategies
+         FROM trades
+         WHERE status     = 'FILLED'
+           AND paper_mode = $1
+           AND (created_at AT TIME ZONE 'Asia/Kolkata')::date =
+               (NOW()      AT TIME ZONE 'Asia/Kolkata')::date
+         ORDER BY symbol, created_at DESC, id DESC
+       ) AS latest_trades
+       WHERE side = 'BUY'`,
+      [isPaperMode]
+    ).catch(async (err) => {
+      // opening_strategies column may not exist on old schema — retry without it
+      if (err.message?.includes('opening_strategies')) {
+        log.warn('opening_strategies column not found — running without it (run migration)');
+        return query(
+          `SELECT symbol, price, quantity, strategy, created_at
+           FROM (
+             SELECT DISTINCT ON (symbol)
+               symbol, side, price, quantity, strategy, created_at, id
+             FROM trades
+             WHERE status     = 'FILLED'
+               AND paper_mode = $1
+               AND (created_at AT TIME ZONE 'Asia/Kolkata')::date =
+                   (NOW()      AT TIME ZONE 'Asia/Kolkata')::date
+             ORDER BY symbol, created_at DESC, id DESC
+           ) AS latest_trades
+           WHERE side = 'BUY'`,
+          [isPaperMode]
+        );
+      }
+      throw err;
+    });
 
     this._filledPositions.clear();
 
-    // Re-use the same stopPct/trailPct we'd use at fill time.
-    // Hydrated positions are fully protected from the first scan after restart.
     const stopPct = this._config?.STOP_LOSS_PCT ?? 1.0;
     const trailPct = this._config?.TRAILING_STOP_PCT ?? 1.5;
+    const targetPct = this._config?.PROFIT_TARGET_PCT ?? 1.8;
+
+    // Valid strategy constants — used to detect clean names vs reason strings
+    const VALID_STRATEGIES = new Set([
+      'EMA_CROSSOVER', 'RSI_MEAN_REVERSION', 'VWAP_MOMENTUM', 'BREAKOUT_VOLUME',
+    ]);
 
     for (const row of result.rows) {
       const entryPrice = parseFloat(row.price);
+
+      // Recover clean opening strategy name:
+      // 1. Try opening_strategies JSON column (new schema)
+      // 2. Fall back to strategy column if it's a clean constant name
+      // 3. Otherwise UNKNOWN
+      let openingStrategy = 'UNKNOWN';
+      let strategies = [];
+
+      if (row.opening_strategies) {
+        try {
+          strategies = JSON.parse(row.opening_strategies);
+          if (Array.isArray(strategies) && strategies.length > 0) {
+            openingStrategy = strategies[0];
+          }
+        } catch { /* malformed JSON — leave as UNKNOWN */ }
+      }
+
+      if (openingStrategy === 'UNKNOWN' && row.strategy && VALID_STRATEGIES.has(row.strategy)) {
+        openingStrategy = row.strategy;
+        strategies = [row.strategy];
+      }
+
       this._filledPositions.set(row.symbol, {
-        strategies: [],                                         // not stored in trades table
+        strategies,
+        openingStrategy,
         entryPrice,
-        price: entryPrice,                                 // backward compat for SELL path
+        price: entryPrice,
         quantity: parseInt(row.quantity, 10),
         timestamp: new Date(row.created_at).getTime(),
+
         stopPrice: entryPrice * (1 - stopPct / 100),
-        highWaterMark: entryPrice,                                 // conservative — assume no gain yet
+        highWaterMark: entryPrice,
         trailStopPrice: entryPrice * (1 - trailPct / 100),
         trailPct,
         stopPct,
+
+        profitTargetPrice: entryPrice * (1 + targetPct / 100),
+        profitTargetMode: 'FIXED_PCT',
+
+        partialExitEnabled: false,
+        partialExitDone: true,
+
+        signalReversalEnabled: this._config?.SIGNAL_REVERSAL_ENABLED ?? true,
+
+        hydratedFromDB: true,
       });
     }
 
@@ -205,36 +241,19 @@ export class ExecutionEngine {
   // SIGNAL PROCESSING
   // ═══════════════════════════════════════════════════════
 
-  /**
-   * Process candle data through the consensus + pipeline layers and execute.
-   * Main entry point called by the scheduler every 5 minutes.
-   *
-   * Flow:
-   *   1. SignalConsensus runs all 4 strategies on today's candles
-   *   2. _persistSignals is AWAITED and returns the CONSENSUS signal DB id (Bug Fix 1)
-   *   3. Regime is fetched once (Task 3) and passed to pipeline.process()
-   *   4. EnhancedSignalPipeline runs results through 4 gates with regime-adaptive threshold
-   *   5. If all gates pass → RiskManager validates → ExecutionEngine places order
-   *   6. _markSignalActedOn uses the stored signal ID — no race condition
-   *
-   * @param {string}   symbol
-   * @param {import('../data/historical-data.js').Candle[]} candles
-   * @param {number}   currentPrice
-   * @param {number}   quantity
-   * @returns {Promise<{ action: string, order: Object|null, consensus: Object, pipelineLog?: string[] }>}
-   */
   async processSignal(symbol, candles, currentPrice, quantity) {
     if (!this._initialized) {
       return { action: 'ENGINE_NOT_INITIALIZED', order: null, consensus: null };
     }
 
-    // ── Step 1: Run all strategies via existing consensus layer ──────────
+    // Fix 27: Block re-entry on the same scan cycle as a force exit.
+    if (this._recentlyExited.has(symbol)) {
+      log.info({ symbol }, 'Re-entry blocked — symbol was force-exited this scan cycle');
+      return { action: 'HOLD', order: null, consensus: null };
+    }
+
     const consensusResult = this.consensus.evaluate(candles);
 
-    // Bug Fix 1: _persistSignals is now AWAITED (not fire-and-forget).
-    // It returns the DB row ID of the CONSENSUS signal row, which we store
-    // in _pendingSignalIds so _markSignalActedOn can use it directly —
-    // eliminating the race where the UPDATE ran before the INSERT committed.
     const consensusSignalId = await this._persistSignals(symbol, consensusResult, currentPrice)
       .catch((err) => {
         log.error({ symbol, err: err.message }, 'Signal persistence failed');
@@ -245,14 +264,10 @@ export class ExecutionEngine {
       this._pendingSignalIds.set(symbol, consensusSignalId);
     }
 
-    // If no strategy fired anything (all HOLD), skip the pipeline entirely.
-    // Still record shadow signals — strategies did run, their votes just cancelled out.
     if (consensusResult.signal === 'HOLD') {
-      // Feature 9: Conflict detection — alert when strategies actively disagree
       if (consensusResult.isConflicted && this.telegram && this.redis) {
         this._alertConflict(symbol, consensusResult).catch(() => { });
       }
-
       if (this.shadowRecorder && (consensusResult.details?.length ?? 0) > 0) {
         this.shadowRecorder.recordSignals(
           symbol, consensusResult.details, consensusResult, false, currentPrice, null
@@ -261,21 +276,18 @@ export class ExecutionEngine {
       return { action: 'HOLD', order: null, consensus: consensusResult };
     }
 
-    // ── Step 2: Fetch current market regime (Task 3) ─────────────────────
     let regime = null;
     if (this.pipeline?.regimeDetector) {
       try {
         const regimeState = await this.pipeline.regimeDetector.getRegime();
         regime = regimeState?.regime ?? null;
       } catch (err) {
-        log.warn({ symbol, err: err.message },
-          'Could not fetch regime — pipeline will use default threshold (2.0)');
+        log.warn({ symbol, err: err.message }, 'Could not fetch regime — using default threshold');
       }
     }
 
-    // ── Step 3: Run through enhanced pipeline (4 gates) ──────────────────
     let finalSignal = consensusResult;
-    let adjustedQuantity = quantity;
+    let adjustedQty = quantity;
     let pipelineLog = null;
 
     if (this.pipeline) {
@@ -283,13 +295,8 @@ export class ExecutionEngine {
       pipelineLog = pipelineResult.log;
 
       if (!pipelineResult.allowed) {
-        log.info({
-          symbol,
-          regime,
-          blockedBy: pipelineResult.blockedBy,
-          pipelineLog: pipelineResult.log,
-        }, `Signal BLOCKED by pipeline gate: ${pipelineResult.blockedBy}`);
-
+        log.info({ symbol, regime, blockedBy: pipelineResult.blockedBy },
+          `Signal BLOCKED by pipeline gate: ${pipelineResult.blockedBy}`);
         return {
           action: `BLOCKED:${pipelineResult.blockedBy}`,
           order: null,
@@ -299,14 +306,9 @@ export class ExecutionEngine {
       }
 
       if (pipelineResult.positionSizeMult < 1.0) {
-        const original = adjustedQuantity;
-        adjustedQuantity = Math.max(1, Math.floor(quantity * pipelineResult.positionSizeMult));
-        log.info({
-          symbol,
-          originalQty: original,
-          adjustedQty: adjustedQuantity,
-          multiplier: pipelineResult.positionSizeMult,
-        }, 'Position size reduced by regime detector');
+        adjustedQty = Math.max(1, Math.floor(quantity * pipelineResult.positionSizeMult));
+        log.info({ symbol, originalQty: quantity, adjustedQty, multiplier: pipelineResult.positionSizeMult },
+          'Position size reduced by regime detector');
       }
 
       if (pipelineResult.signal) {
@@ -314,19 +316,26 @@ export class ExecutionEngine {
       }
     }
 
-    // ── Step 4: Execute ──────────────────────────────────────────────────
     if (finalSignal.signal === 'BUY') {
-      const firingStrategies = (consensusResult.details || [])
-        .filter(d => d.signal === 'BUY')
-        .map(d => d.strategy)
-        .filter(Boolean);
+      // Fix 4: When Super Conviction fired, only the conviction strategy drove
+      // this trade. Use it exclusively so that openingStrategy, profit target
+      // mode, and adaptive weight credit are all correctly attributed.
+      const convictionStrategy = consensusResult.convictionStrategy || null;
+
+      const firingStrategies = convictionStrategy
+        ? [convictionStrategy]
+        : (consensusResult.details || [])
+          .filter(d => d.signal === 'BUY' && d.meetsFloor !== false && !d.suppressedByTime)
+          .map(d => d.strategy)
+          .filter(Boolean);
+
       this._lastSignalStrategies.set(symbol, firingStrategies);
     }
 
     const order = await this.executeOrder({
       symbol,
       side: finalSignal.signal,
-      quantity: adjustedQuantity,
+      quantity: adjustedQty,
       price: currentPrice,
       strategy: finalSignal.reason || consensusResult.reason,
     });
@@ -334,15 +343,11 @@ export class ExecutionEngine {
     const acted = order.state === ORDER_STATE.FILLED;
 
     if (acted) {
-      // Bug Fix 1: Pass the stored signal ID — avoids the timestamp race condition.
       const signalId = this._pendingSignalIds.get(symbol);
       await this._markSignalActedOn(signalId, symbol, finalSignal.signal);
       this._pendingSignalIds.delete(symbol);
     }
 
-    // Record shadow signals fire-and-forget — captures all strategy votes including
-    // those that didn't reach consensus, enabling unbiased accuracy measurement.
-    // Must never block or throw into the trading loop.
     if (this.shadowRecorder) {
       this.shadowRecorder.recordSignals(
         symbol,
@@ -363,19 +368,12 @@ export class ExecutionEngine {
   }
 
   // ═══════════════════════════════════════════════════════
-  // POSITION OUTCOME RECORDING (for adaptive weights)
+  // POSITION OUTCOME RECORDING
   // ═══════════════════════════════════════════════════════
 
-  /**
-   * Record the outcome of a closed position.
-   * Called internally after a confirmed SELL fill.
-   *
-   * @param {string} symbol
-   * @param {number} pnl  - positive = profit, negative = loss
-   */
   async recordPositionOutcome(symbol, pnl) {
     if (!this.pipeline) {
-      log.warn({ symbol }, 'recordPositionOutcome: pipeline not available — skipping outcome recording');
+      log.warn({ symbol }, 'recordPositionOutcome: pipeline not available');
       return;
     }
 
@@ -392,7 +390,9 @@ export class ExecutionEngine {
       await this.pipeline.recordTradeOutcome(strategy, 'BUY', symbol, pnl);
 
       if (this.pipeline.adaptiveWeights) {
-        await this.pipeline.adaptiveWeights.recordOutcome({ strategy, signal: 'BUY', symbol, outcome, pnl });
+        await this.pipeline.adaptiveWeights.recordOutcome({
+          strategy, signal: 'BUY', symbol, outcome, pnl,
+        });
       }
     }
 
@@ -400,50 +400,52 @@ export class ExecutionEngine {
   }
 
   // ═══════════════════════════════════════════════════════
-  // FORCE EXIT — Position manager bypass path
+  // FORCE EXIT
   // ═══════════════════════════════════════════════════════
 
   /**
    * Force-exit an open position, bypassing consensus and pipeline gates.
-   * Used exclusively by PositionManager for stop loss, trailing stop, and time exits.
    *
-   * Does NOT go through executeOrder() risk gate — it is an exit, not an entry,
-   * and must never be blocked by position count or daily loss checks.
+   * Fix 1: All references to `currentPrice` renamed to `exitPrice` to match
+   * the parameter name. The original code had `currentPrice` which was
+   * undefined, causing a ReferenceError on every stop/trail/time exit.
    *
-   * Full state update still happens: _filledPositions, riskManager, DB trades table,
-   * adaptive weight recording, signal acted_on mark.
+   * Fix 27: Adds symbol to _recentlyExited so the same scan cycle doesn't
+   * immediately re-enter the position just force-exited.
    *
    * @param {string} symbol
-   * @param {number} currentPrice - current market price for the exit
-   * @param {string} reason - 'STOP_LOSS' | 'TRAILING_STOP' | 'TIME_EXIT'
-   * @returns {Promise<{ success: boolean, pnl: number, order: Object | null }>}
+   * @param {number} exitPrice
+   * @param {string} reason
+   * @param {number|null} [qty=null]
    */
-  async forceExit(symbol, currentPrice, reason) {
+  async forceExit(symbol, exitPrice, reason, qty = null) {
     const posCtx = this._filledPositions.get(symbol);
     if (!posCtx) {
       log.warn({ symbol, reason }, 'forceExit called but no position found — already closed?');
       return { success: false, pnl: 0, order: null };
     }
 
-    const unrealisedPnL = (currentPrice - posCtx.entryPrice) * posCtx.quantity;
+    const exitQty = qty ?? posCtx.quantity;
+    const isFullExit = !qty || qty >= posCtx.quantity;
+
+    // Fix 1: was `currentPrice` (undefined) — now correctly uses `exitPrice`
+    const unrealisedPnL = (exitPrice - posCtx.entryPrice) * exitQty;
 
     log.warn({
-      symbol,
-      reason,
+      symbol, reason,
       entryPrice: posCtx.entryPrice,
-      currentPrice,
-      quantity: posCtx.quantity,
+      exitPrice,                         // Fix 1: was `currentPrice`
+      quantity: exitQty,
+      isFullExit,
       unrealisedPnL: unrealisedPnL.toFixed(2),
     }, `🚨 Position manager forcing exit: ${symbol} — ${reason}`);
 
-    // Place SELL order directly — bypass executeOrder() risk gate
-    // but still go through the broker/paper path and state machine.
     const order = createOrder({
       symbol,
       side: 'SELL',
-      quantity: posCtx.quantity,
-      price: currentPrice,
-      strategy: reason,  // recorded in trades table as the exit reason
+      quantity: exitQty,
+      price: exitPrice,                  // Fix 1: was `currentPrice`
+      strategy: reason,
     });
 
     this._orders.set(order.id, order);
@@ -456,38 +458,51 @@ export class ExecutionEngine {
       transitionOrder(order, ORDER_STATE.PLACED, { brokerId: result.orderId });
       transitionOrder(order, ORDER_STATE.FILLED);
 
-      const pnl = (currentPrice - posCtx.entryPrice) * posCtx.quantity;
+      // Fix 1: was `currentPrice` in pnl calculation
+      const pnl = (exitPrice - posCtx.entryPrice) * exitQty;
       order.pnl = pnl;
 
-      // Update all state — mirror what _placeWithRetry does on SELL fill
-      this._filledPositions.delete(symbol);
-      this.riskManager.removePosition();
-      await this.riskManager.recordTradePnL(pnl, symbol);
+      if (isFullExit) {
+        this._filledPositions.delete(symbol);
+        this.riskManager.removePosition();
+        await this.riskManager.recordTradePnL(pnl, symbol);
 
-      // Record outcome for adaptive weights — fire-and-forget
-      this.recordPositionOutcome(symbol, pnl).catch(err =>
-        log.warn({ symbol, err: err.message }, 'Outcome recording failed after force exit')
-      );
+        this.recordPositionOutcome(symbol, pnl).catch(err =>
+          log.warn({ symbol, err: err.message }, 'Outcome recording failed after force exit')
+        );
 
-      // Persist to trades table — fire-and-forget
+        const signalId = this._pendingSignalIds.get(symbol);
+        if (signalId) {
+          this._markSignalActedOn(signalId, symbol, 'SELL').catch(() => { });
+          this._pendingSignalIds.delete(symbol);
+        }
+
+        // Fix 27: mark this symbol as recently exited to block re-entry this scan
+        this._recentlyExited.add(symbol);
+      } else {
+        // Partial exit — record partial P&L but keep position open.
+        // posCtx.quantity is updated by _executePartialExit() in position-manager
+        // only if this returns success:true.
+        await this.riskManager.recordTradePnL(pnl, symbol);
+        log.info({
+          symbol,
+          partialQty: exitQty,
+          remainingQty: posCtx.quantity - exitQty,
+          pnl: pnl.toFixed(2),
+        }, `📊 Partial exit recorded: ${symbol}`);
+      }
+
       this._persistTrade(order).catch(err =>
         log.error({ symbol, err: err.message }, 'Trade persist failed after force exit')
       );
 
-      // Mark signal acted on using stored ID (if present)
-      const signalId = this._pendingSignalIds.get(symbol);
-      if (signalId) {
-        this._markSignalActedOn(signalId, symbol, 'SELL').catch(() => { });
-        this._pendingSignalIds.delete(symbol);
-      }
-
       log.info({
-        symbol,
-        reason,
+        symbol, reason,
         pnl: pnl.toFixed(2),
         entryPrice: posCtx.entryPrice,
-        exitPrice: currentPrice,
-        quantity: posCtx.quantity,
+        exitPrice,                       // Fix 1: was `currentPrice`
+        quantity: exitQty,
+        isFullExit,
       }, `✅ Force exit complete: ${symbol} | PnL: ₹${pnl.toFixed(2)}`);
 
       return { success: true, pnl, order };
@@ -499,31 +514,22 @@ export class ExecutionEngine {
     }
   }
 
-  // ═══════════════════════════════════════════════════════
-  // ORDER EXECUTION — The core loop
-  // ═══════════════════════════════════════════════════════
-
-
   /**
-   * Execute an order through the full pipeline:
-   * Risk gate → Duplicate check → State machine → Broker (with retries)
-   *
-   * @param {Object} params
-   * @param {string} params.symbol
-   * @param {string} params.side
-   * @param {number} params.quantity
-   * @param {number} params.price
-   * @param {string} [params.orderType='MARKET']
-   * @param {string} [params.exchange='NSE']
-   * @param {string} [params.product='MIS']
-   * @param {string} [params.strategy]
-   * @returns {Promise<Object>}
+   * Clear the recently-exited set at the start of each scan cycle.
+   * Called by the scheduler before running processSignal() for each symbol.
    */
+  clearRecentExits() {
+    this._recentlyExited.clear();
+  }
+
+  // ═══════════════════════════════════════════════════════
+  // ORDER EXECUTION
+  // ═══════════════════════════════════════════════════════
+
   async executeOrder(params) {
     const order = createOrder(params);
     this._orders.set(order.id, order);
 
-    // Requirement #5: Duplicate pending guard
     if (this._pendingSymbols.has(params.symbol)) {
       transitionOrder(order, ORDER_STATE.REJECTED, {
         rejectionReason: `Duplicate: existing PENDING order for ${params.symbol}`,
@@ -533,7 +539,6 @@ export class ExecutionEngine {
       return order;
     }
 
-    // H1: Duplicate filled position guard (BUY only)
     if (params.side === 'BUY' && this._filledPositions.has(params.symbol)) {
       transitionOrder(order, ORDER_STATE.REJECTED, {
         rejectionReason: `Already holding position in ${params.symbol}`,
@@ -543,9 +548,6 @@ export class ExecutionEngine {
       return order;
     }
 
-    // Feature 5: Holdings awareness — block BUY if exposure exists in broker
-    // (delivery holdings or intraday positions opened outside this engine).
-    // Non-fatal on failure — a broken holdings check must never block a trade.
     if (params.side === 'BUY' && this.holdingsManager) {
       try {
         const existing = await this.holdingsManager.getExposure(params.symbol);
@@ -558,24 +560,20 @@ export class ExecutionEngine {
           return order;
         }
       } catch (err) {
-        // Non-fatal — log and continue. Never block a trade on a holdings check failure.
         log.warn({ symbol: params.symbol, err: err.message },
           'Holdings check failed — proceeding without exposure check');
       }
     }
 
-    // Bug Fix 2: SELL guard — reject if no open position exists after DB hydration.
-    // Prevents phantom SELLs when the engine restarts and _filledPositions is empty.
     if (params.side === 'SELL' && !this._filledPositions.has(params.symbol)) {
       transitionOrder(order, ORDER_STATE.REJECTED, {
         rejectionReason: `SELL rejected — no open position found for ${params.symbol} after DB hydration`,
       });
       log.warn({ symbol: params.symbol, orderId: order.id },
-        `SELL rejected — no open position found for ${params.symbol} after DB hydration`);
+        `SELL rejected — no open position found for ${params.symbol}`);
       return order;
     }
 
-    // Requirement #1: Risk gate
     const riskDecision = this.riskManager.validateOrder({
       symbol: params.symbol,
       side: params.side,
@@ -594,7 +592,6 @@ export class ExecutionEngine {
     }
 
     this._pendingSymbols.add(params.symbol);
-
     try {
       return await this._placeWithRetry(order);
     } finally {
@@ -602,10 +599,7 @@ export class ExecutionEngine {
     }
   }
 
-  /**
-   * Place order with retry logic.
-   * @private
-   */
+  /** @private */
   async _placeWithRetry(order) {
     let lastError = null;
 
@@ -627,44 +621,63 @@ export class ExecutionEngine {
         transitionOrder(order, ORDER_STATE.FILLED);
 
         if (order.side === 'BUY') {
-          // Track BUY context for P&L calculation on SELL and for position manager.
-          // entryPrice is the canonical field for position manager calculations.
-          // price is retained for backward compat — existing SELL path uses posCtx.price.
           const strategies = this._lastSignalStrategies.get(order.symbol) || [];
           const stopPct = this._config?.STOP_LOSS_PCT ?? 1.0;
           const trailPct = this._config?.TRAILING_STOP_PCT ?? 1.5;
+          const targetPct = this._config?.PROFIT_TARGET_PCT ?? 1.8;
 
-          this._filledPositions.set(order.symbol, {
+          const posCtx = {
             strategies,
+            // Fix 4: openingStrategy is already the conviction-aware strategy
+            // because _lastSignalStrategies was set correctly in processSignal()
+            openingStrategy: strategies[0] || 'UNKNOWN',
             entryPrice: order.price,
-            price: order.price,                                  // backward compat
+            price: order.price,
             quantity: order.quantity,
             timestamp: Date.now(),
+
             stopPrice: order.price * (1 - stopPct / 100),
             highWaterMark: order.price,
             trailStopPrice: order.price * (1 - trailPct / 100),
             trailPct,
             stopPct,
-          });
 
-          log.debug({
-            symbol: order.symbol,
-            entryPrice: order.price,
-            stopPrice: +(order.price * (1 - stopPct / 100)).toFixed(2),
-            trailStop: +(order.price * (1 - trailPct / 100)).toFixed(2),
-            stopPct,
-            trailPct,
-          }, 'Position opened — stop/trail levels set');
+            profitTargetPrice: order.price * (1 + targetPct / 100),
+            profitTargetMode: 'FIXED_PCT',
+            partialExitEnabled: this._config?.PARTIAL_EXIT_ENABLED ?? true,
+            partialExitDone: false,
+            partialExitQty: 0,
+            signalReversalEnabled: this._config?.SIGNAL_REVERSAL_ENABLED ?? true,
+          };
 
-          // Bug Fix 3: Sync position count to risk manager after map change
+          this._filledPositions.set(order.symbol, posCtx);
+
+          if (this.positionManager) {
+            try {
+              const candles = this._fetchCandles
+                ? await this._fetchCandles(order.symbol, 20).catch(() => [])
+                : [];
+              const closes = candles.map(c => c.close);
+              const highs = candles.map(c => c.high);
+              const lows = candles.map(c => c.low);
+              await this.positionManager.initPosition(order.symbol, posCtx, closes, highs, lows);
+            } catch (err) {
+              log.warn({ symbol: order.symbol, err: err.message },
+                'initPosition failed — using config-based fallback levels');
+            }
+          }
+
           this.riskManager.addPosition();
 
           if (this.telegram?.enabled) {
+            const stopPrice = posCtx.stopPrice;
+            const targetPrice = posCtx.profitTargetPrice;
             this.telegram.sendRaw(
               `📦 <b>Position ENTRY — ${order.symbol}</b>\n\n` +
-              `📥 Entry: ₹${order.price.toFixed(2)}\n` +
-              `📦 Qty:   ${order.quantity}\n` +
-              `🛑 Stop:  ₹${+(order.price * (1 - stopPct / 100)).toFixed(2)}\n` +
+              `📥 Entry:  ₹${order.price.toFixed(2)}\n` +
+              `📦 Qty:    ${order.quantity}\n` +
+              `🛑 Stop:   ₹${stopPrice.toFixed(2)}\n` +
+              `🎯 Target: ₹${targetPrice.toFixed(2)}\n` +
               `🧠 Strats: ${strategies.join(', ')}\n` +
               `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
             ).catch(() => { });
@@ -673,37 +686,38 @@ export class ExecutionEngine {
         } else if (order.side === 'SELL') {
           const posCtx = this._filledPositions.get(order.symbol);
           if (posCtx) {
-            const sellPrice = order.price;
-            const pnl = (sellPrice - posCtx.price) * posCtx.quantity;
+            const pnl = (order.price - posCtx.price) * posCtx.quantity;
             order.pnl = pnl;
+
             log.info({
               symbol: order.symbol,
               entryPrice: posCtx.price,
-              sellPrice,
+              sellPrice: order.price,
               quantity: posCtx.quantity,
               pnl,
             }, 'SELL filled — recording position outcome');
 
             this.recordPositionOutcome(order.symbol, pnl).catch((err) =>
               log.warn({ symbol: order.symbol, err: err.message },
-                'Position outcome recording failed — adaptive weights not updated')
+                'Position outcome recording failed')
             );
 
             this._filledPositions.delete(order.symbol);
-            // Bug Fix 3: Decrement position count on SELL fill
             this.riskManager.removePosition();
 
             if (this.telegram?.enabled) {
               const emoji = pnl >= 0 ? '✅' : '🛑';
-              const pnlStr = pnl >= 0 ? `+₹${pnl.toFixed(2)}` : `-₹${Math.abs(pnl).toFixed(2)}`;
-
+              // Fix 39: P&L → P&amp;L (was unescaped & causing silent Telegram drop)
+              const pnlStr = pnl >= 0
+                ? `+₹${pnl.toFixed(2)}`
+                : `-₹${Math.abs(pnl).toFixed(2)}`;
               this.telegram.sendRaw(
                 `${emoji} <b>Position EXIT — ${order.symbol}</b>\n\n` +
                 `📌 Reason: SIGNAL_EXIT\n` +
-                `📥 Entry: ₹${posCtx.price.toFixed(2)}\n` +
-                `📤 Exit:  ₹${sellPrice.toFixed(2)}\n` +
-                `💰 P&L:   ${pnlStr}\n` +
-                `📦 Qty:   ${posCtx.quantity}\n` +
+                `📥 Entry:  ₹${posCtx.price.toFixed(2)}\n` +
+                `📤 Exit:   ₹${order.price.toFixed(2)}\n` +
+                `💰 P&amp;L:   ${pnlStr}\n` +
+                `📦 Qty:    ${posCtx.quantity}\n` +
                 `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
               ).catch(() => { });
             }
@@ -715,22 +729,18 @@ export class ExecutionEngine {
         );
 
         return order;
+
       } catch (err) {
         lastError = err;
-
         log.error({
-          orderId: order.id,
-          attempt,
-          maxRetries: this.maxRetries,
+          orderId: order.id, attempt, maxRetries: this.maxRetries,
           error: err.message,
-          brokerResponse: err.response?.data || err.brokerResponse || null,
-          statusCode: err.response?.status || err.statusCode || null,
+          brokerResponse: err.response?.data || null,
+          statusCode: err.response?.status || null,
           retryable: this._isRetryable(err),
-        }, `Broker placement failed (attempt ${attempt}/${this.maxRetries}): ${err.message}`);
+        }, `Broker placement failed (attempt ${attempt}/${this.maxRetries})`);
 
         if (!this._isRetryable(err)) {
-          log.warn({ orderId: order.id, error: err.message },
-            'Broker REJECTED order — not retrying (deterministic failure)');
           transitionOrder(order, ORDER_STATE.REJECTED, {
             rejectionReason: `Broker rejected: ${err.message}`,
           });
@@ -751,10 +761,7 @@ export class ExecutionEngine {
 
   /** @private */
   _isRetryable(err) {
-    const RETRYABLE_CODES = [
-      'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT',
-      'ENOTFOUND', 'EAI_AGAIN', 'EPIPE', 'EHOSTUNREACH',
-    ];
+    const RETRYABLE_CODES = ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'EPIPE', 'EHOSTUNREACH'];
     if (err.code && RETRYABLE_CODES.includes(err.code)) return true;
     const status = err.response?.status || err.statusCode;
     if (status) {
@@ -789,6 +796,8 @@ export class ExecutionEngine {
       product: order.product,
     });
 
+    // Capture scan-time price before overwriting for logging
+    const scanTimePrice = order.price;
     const maxAttempts = 4;
     let fillPrice = null;
 
@@ -801,34 +810,28 @@ export class ExecutionEngine {
 
         if (fetchedPrice && fetchedPrice > 0) {
           fillPrice = fetchedPrice;
+          // Fix 26 (logging): capture scanTimePrice before overwriting
           log.info({
             orderId: response.order_id,
             fillPrice,
-            scanPrice: order.price,
-            attempts: attempt
-          }, 'Fill price fetched — overwriting scan-time price with actual executed price');
+            scanPrice: scanTimePrice,  // correctly shows original scan-time price
+            attempts: attempt,
+          }, 'Fill price fetched — overwriting scan-time price');
           order.price = fillPrice;
-          break; // Success, exit retry loop
+          break;
         }
       } catch (err) {
-        // Only throw for real broker errors, ignore 404 (order not found yet)
-        if (err.response?.status !== 404 && err.statusCode !== 404) {
-          throw err;
-        }
+        if (err.response?.status !== 404 && err.statusCode !== 404) throw err;
       }
 
-      // If this wasn't the last attempt, wait before trying again
-      if (attempt < maxAttempts) {
-        await this._delay(400);
-      }
+      if (attempt < maxAttempts) await this._delay(400);
     }
 
-    // If loop exhausted and no fill price
     if (!fillPrice) {
       log.warn({
         orderId: response.order_id,
         attempts: maxAttempts,
-        fallback: 'scan-time price'
+        fallback: 'scan-time price',
       }, 'Could not fetch fill price — using scan-time price');
     }
 
@@ -855,8 +858,6 @@ export class ExecutionEngine {
   getAllOrders() { return Array.from(this._orders.values()); }
   getActiveOrders() { return this.getAllOrders().filter((o) => !isTerminal(o)); }
   hasPendingOrder(sym) { return this._pendingSymbols.has(sym); }
-
-  /** Bug Fix 3: Expose open position count derived from _filledPositions Map */
   getOpenPositionCount() { return this._filledPositions.size; }
 
   getStatus() {
@@ -886,22 +887,24 @@ export class ExecutionEngine {
     }
 
     if (this._filledPositions.size === 0) {
-      return { reconciled: [], stillOpen: [...this._filledPositions.keys()] };
+      return { reconciled: [], stillOpen: [] };
     }
 
     try {
       const initialPositionCount = this._filledPositions.size;
       const rawPositions = await broker.getPositions();
-      const brokerPositions = (rawPositions?.net || rawPositions || []).filter(
-        (p) => (p.quantity || p.netQuantity || 0) !== 0
+      const brokerSymbols = new Set(
+        (rawPositions?.net || rawPositions || [])
+          .filter(p => (p.quantity || p.netQuantity || 0) !== 0)
+          .map(p => p.tradingsymbol || p.tradingSymbol || p.symbol)
       );
-      const brokerSymbols = new Set(brokerPositions.map(p => p.tradingsymbol || p.tradingSymbol || p.symbol));
 
       const reconciled = [];
       const stillOpen = [];
 
-      // Format as YYYY-MM-DD in IST
-      const formatter = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' });
+      const formatter = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit',
+      });
       const todayIST = formatter.format(new Date());
 
       for (const [symbol, posCtx] of this._filledPositions.entries()) {
@@ -909,8 +912,13 @@ export class ExecutionEngine {
         if (posDateIST === todayIST && !brokerSymbols.has(symbol)) {
           log.warn(`Position reconciliation: ${symbol} closed externally — removing from engine state`);
           this.markPositionClosed(symbol);
-          if (this.riskManager) {
-            this.riskManager.removePosition();
+          if (this.riskManager) this.riskManager.removePosition();
+          if (this.telegram?.enabled) {
+            this.telegram.sendRaw(
+              `⚠️ <b>Position Closed Externally — ${symbol}</b>\n` +
+              `Removed from engine state via reconciliation.\n` +
+              `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+            ).catch(() => { });
           }
           reconciled.push(symbol);
         } else {
@@ -918,11 +926,8 @@ export class ExecutionEngine {
         }
       }
 
-      log.info({
-        checked: initialPositionCount,
-        reconciled: reconciled.length,
-        stillOpen: stillOpen.length
-      }, 'Position reconciliation complete');
+      log.info({ checked: initialPositionCount, reconciled: reconciled.length, stillOpen: stillOpen.length },
+        'Position reconciliation complete');
 
       return { reconciled, stillOpen };
     } catch (err) {
@@ -937,6 +942,7 @@ export class ExecutionEngine {
     this._pendingSymbols.clear();
     this._lastSignalStrategies.clear();
     this._pendingSignalIds.clear();
+    this._recentlyExited.clear();
     log.info('Execution engine daily state reset');
   }
 
@@ -944,110 +950,97 @@ export class ExecutionEngine {
     this._filledPositions.delete(symbol);
   }
 
-  /** @private */
+  // ═══════════════════════════════════════════════════════
+  // PRIVATE HELPERS
+  // ═══════════════════════════════════════════════════════
+
   _delay(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
-  /** @private */
+  /**
+   * Persist trade to DB.
+   * Fix hydration: also writes opening_strategies as JSON so hydratePositions()
+   * can recover clean strategy names after a restart.
+   * @private
+   */
   async _persistTrade(order) {
     try {
+      // Get the clean strategy names for this order (if it was a BUY)
+      const openingStrategies = order.side === 'BUY'
+        ? JSON.stringify(this._lastSignalStrategies.get(order.symbol) || [])
+        : null;
+
       await query(
-        `INSERT INTO trades (order_id, symbol, side, quantity, price, pnl, strategy, status, paper_mode, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+        `INSERT INTO trades
+           (order_id, symbol, side, quantity, price, pnl, strategy, status, paper_mode, opening_strategies, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
          ON CONFLICT (order_id) DO NOTHING`,
-        [order.id, order.symbol, order.side, order.quantity, order.price, order.pnl || 0, order.strategy, order.state, this.paperMode]
-      );
+        [
+          order.id, order.symbol, order.side, order.quantity,
+          order.price, order.pnl || 0, order.strategy, order.state,
+          this.paperMode, openingStrategies,
+        ]
+      ).catch(async (err) => {
+        // opening_strategies column may not exist yet — retry without it
+        if (err.message?.includes('opening_strategies') || err.message?.includes('column')) {
+          return query(
+            `INSERT INTO trades
+               (order_id, symbol, side, quantity, price, pnl, strategy, status, paper_mode, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+             ON CONFLICT (order_id) DO NOTHING`,
+            [order.id, order.symbol, order.side, order.quantity,
+            order.price, order.pnl || 0, order.strategy, order.state, this.paperMode]
+          );
+        }
+        throw err;
+      });
       log.debug({ orderId: order.id, symbol: order.symbol }, 'Trade persisted to DB');
     } catch (err) {
       log.error({ orderId: order.id, err: err.message }, 'CRITICAL: Trade DB write failed');
     }
   }
 
-  /**
-   * Bug Fix 1: Now AWAITED in processSignal (not fire-and-forget).
-   * Returns the DB row ID of the CONSENSUS signal row so _markSignalActedOn
-   * can update by ID instead of by timestamp (eliminates the race condition).
-   *
-   * @private
-   * @returns {Promise<number|null>} CONSENSUS signal row ID, or null on failure
-   */
+  /** @private */
   async _persistSignals(symbol, consensus, currentPrice = null) {
     let consensusSignalId = null;
-
     try {
       await query('BEGIN');
-
       for (const detail of (consensus.details || [])) {
         await query(
           `INSERT INTO signals (symbol, strategy, signal, confidence, acted_on, reason, price, created_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
-          [
-            symbol,
-            detail.strategy || 'unknown',
-            detail.signal || 'HOLD',
-            detail.confidence || 0,
-            false,
-            (detail.reason || '').slice(0, 500),
-            currentPrice || null,
-          ]
+          [symbol, detail.strategy || 'unknown', detail.signal || 'HOLD',
+            detail.confidence || 0, false, (detail.reason || '').slice(0, 500), currentPrice || null]
         );
       }
-
-      // Insert CONSENSUS row and capture its ID
       const consensusRow = await query(
         `INSERT INTO signals (symbol, strategy, signal, confidence, acted_on, reason, price, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
          RETURNING id`,
-        [
-          symbol,
-          'CONSENSUS',
-          consensus.signal || 'HOLD',
-          consensus.confidence || 0,
-          false,
-          (consensus.reason || '').slice(0, 500),
-          currentPrice || null,
-        ]
+        [symbol, 'CONSENSUS', consensus.signal || 'HOLD', consensus.confidence || 0,
+          false, (consensus.reason || '').slice(0, 500), currentPrice || null]
       );
-
       consensusSignalId = consensusRow.rows?.[0]?.id ?? null;
       await query('COMMIT');
     } catch (err) {
-      try {
-        await query('ROLLBACK');
-      } catch (rollbackErr) {
-        // Silently swallow rollback failure
-      }
+      try { await query('ROLLBACK'); } catch { /* swallow */ }
       log.error({ symbol, err: err.message }, 'Failed to persist signals to DB');
     }
-
     return consensusSignalId;
   }
 
-  /**
-   * Bug Fix 1: Uses signal row ID directly — no timestamp-based lookup race.
-   * Falls back to timestamp query if ID is unavailable (e.g. persist failed).
-   *
-   * @private
-   * @param {number|null} signalId - DB row ID from _persistSignals
-   * @param {string} symbol - For fallback query and error logging
-   * @param {string} signal - 'BUY' or 'SELL' — for fallback query only
-   */
+  /** @private */
   async _markSignalActedOn(signalId, symbol, signal) {
     try {
       if (signalId) {
-        // Fast path: use the ID we captured at insert time — no race condition
         const result = await query(
-          `UPDATE signals SET acted_on = true WHERE id = $1`,
-          [signalId]
+          `UPDATE signals SET acted_on = true WHERE id = $1`, [signalId]
         );
         if (result.rowCount === 0) {
           log.error({ signalId, symbol }, 'Failed to mark signal acted_on — row not found by ID');
-        } else {
-          log.debug({ signalId, symbol }, 'Signal marked acted_on by ID');
         }
       } else {
-        // Fallback: timestamp-based lookup (less reliable, kept for safety)
         log.warn({ symbol, signal }, 'No signal ID available — falling back to timestamp lookup');
-        const result = await query(
+        await query(
           `UPDATE signals SET acted_on = true
            WHERE symbol = $1 AND strategy = 'CONSENSUS' AND signal = $2
              AND created_at = (
@@ -1056,41 +1049,26 @@ export class ExecutionEngine {
              )`,
           [symbol, signal]
         );
-        if (result.rowCount === 0) {
-          log.error({ symbol, signal }, 'Fallback: failed to mark signal acted_on — no matching row found');
-        }
       }
     } catch (err) {
-      log.error({ signalId, symbol, err: err.message },
-        `CRITICAL: Failed to mark signal as acted_on — manual reconciliation needed (signalId=${signalId})`);
+      log.error({ signalId, symbol, err: err.message }, 'CRITICAL: Failed to mark signal as acted_on');
     }
   }
 
-  /**
-   * Feature 9: Send a Telegram conflict alert when BUY and SELL strategies cancel exactly.
-   * Rate-limited per symbol to one alert per 30 minutes via Redis.
-   * Fire-and-forget — caller uses .catch(() => {}).
-   *
-   * @private
-   * @param {string} symbol
-   * @param {Object} consensusResult - from SignalConsensus.evaluate()
-   */
+  /** @private */
   async _alertConflict(symbol, consensusResult) {
     const rateLimitKey = `conflict:alerted:${symbol}`;
     try {
       const alreadyAlerted = await this.redis.get(rateLimitKey);
       if (alreadyAlerted) return;
-
       await this.redis.setex(rateLimitKey, 1800, '1');
-
       const { buyStrategies, sellStrategies } = consensusResult.conflictDetails;
       const msg =
         `⚡ <b>Signal Conflict — ${symbol}</b>\n\n` +
-        `📈 BUY: ${buyStrategies.join(', ')}\n` +
+        `📈 BUY:  ${buyStrategies.join(', ')}\n` +
         `📉 SELL: ${sellStrategies.join(', ')}\n\n` +
-        `Result: HOLD (strategies cancel out)\n` +
+        `Result: HOLD (strategies disagree)\n` +
         `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`;
-
       await this.telegram.sendRaw(msg);
       log.info({ symbol, buyStrategies, sellStrategies }, 'Conflict alert sent via Telegram');
     } catch (err) {

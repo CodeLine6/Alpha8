@@ -6,24 +6,30 @@ const log = createLogger('instruments');
 /**
  * NSE/BSE Instrument Manager.
  *
- * Fetches, caches, and provides lookup for all tradeable instruments.
- * Instruments are cached in Redis for the full trading day (refreshed daily).
+ * FIX: _buildMaps() now prefers NSE over BSE when the same tradingsymbol
+ *      exists on both exchanges. Previously BSE overwrote NSE in the bare
+ *      symbol map because BSE is loaded second, meaning getToken('RELIANCE')
+ *      returned the BSE instrument token. All Alpha8 orders are placed on NSE
+ *      so bare symbol lookups must resolve to NSE tokens.
  *
  * @module instruments
  */
 
 /**
  * @typedef {Object} Instrument
- * @property {number} instrumentToken - Kite instrument token
- * @property {string} tradingSymbol - e.g. 'RELIANCE'
- * @property {string} name - Full company/instrument name
- * @property {string} exchange - NSE, BSE, NFO
- * @property {string} segment - NSE, BSE, NFO-FUT, NFO-OPT
- * @property {string} instrumentType - EQ, FUT, CE, PE
- * @property {number} lotSize - Lot size for F&O
- * @property {number} tickSize - Minimum price movement
- * @property {string} expiry - Expiry date for derivatives
+ * @property {number} instrumentToken
+ * @property {string} tradingSymbol
+ * @property {string} name
+ * @property {string} exchange
+ * @property {string} segment
+ * @property {string} instrumentType
+ * @property {number} lotSize
+ * @property {number} tickSize
+ * @property {string} expiry
  */
+
+// Exchange preference order for bare symbol lookup (first match wins)
+const EXCHANGE_PREFERENCE = ['NSE', 'NFO', 'BSE'];
 
 export class InstrumentManager {
   /**
@@ -46,14 +52,12 @@ export class InstrumentManager {
 
   /**
    * Load instruments from broker API or Redis cache.
-   * Should be called once at startup (pre-market).
-   * @param {string[]} [exchanges=['NSE', 'BSE']] - Exchanges to load
+   * @param {string[]} [exchanges=['NSE', 'BSE']]
    * @returns {Promise<number>} Count of instruments loaded
    */
   async load(exchanges = ['NSE', 'BSE']) {
     const cacheKey = `instruments:${exchanges.join(',')}`;
 
-    // Try cache first (instruments refresh daily)
     try {
       const cached = await cacheGet(cacheKey);
       if (cached) {
@@ -65,7 +69,6 @@ export class InstrumentManager {
       log.warn({ err: err.message }, 'Cache read failed for instruments');
     }
 
-    // Fetch from broker
     let allInstruments = [];
     for (const exchange of exchanges) {
       try {
@@ -81,8 +84,6 @@ export class InstrumentManager {
 
     if (allInstruments.length > 0) {
       this._buildMaps(allInstruments);
-
-      // Cache for 24 hours (instruments don't change intraday)
       try {
         await cacheSet(cacheKey, allInstruments, 86400);
         log.info({ count: allInstruments.length }, 'Instruments cached for 24h');
@@ -96,10 +97,7 @@ export class InstrumentManager {
     return allInstruments.length;
   }
 
-  /**
-   * Normalize a raw Kite instrument to our standard shape.
-   * @private
-   */
+  /** @private */
   _normalizeInstrument(raw, exchange) {
     return {
       instrumentToken: raw.instrument_token || raw.instrumentToken,
@@ -116,6 +114,14 @@ export class InstrumentManager {
 
   /**
    * Build lookup maps from instrument array.
+   *
+   * FIX: Bare symbol map (without exchange prefix) now uses EXCHANGE_PREFERENCE
+   * order (NSE > NFO > BSE) instead of last-write-wins. This ensures that
+   * getToken('RELIANCE') always returns the NSE token, not BSE, regardless of
+   * the order instruments are loaded.
+   *
+   * Exchange-qualified lookups (e.g. 'BSE:RELIANCE') are always exact.
+   *
    * @private
    * @param {Instrument[]} instruments
    */
@@ -124,17 +130,57 @@ export class InstrumentManager {
     this._byToken.clear();
     this._byExchange.clear();
 
-    instruments.forEach((inst) => {
-      const key = `${inst.exchange}:${inst.tradingSymbol}`;
-      this._bySymbol.set(key, inst);
-      this._bySymbol.set(inst.tradingSymbol, inst); // Also map by symbol alone (last wins for dupes)
+    // First pass: build token map and exchange-qualified symbol map
+    // These are always exact — no preference logic needed
+    for (const inst of instruments) {
+      // Always map by token (unique)
       this._byToken.set(inst.instrumentToken, inst);
 
+      // Always map by exchange-qualified key (exact lookup)
+      const qualifiedKey = `${inst.exchange}:${inst.tradingSymbol}`;
+      this._bySymbol.set(qualifiedKey, inst);
+
+      // Build exchange buckets
       if (!this._byExchange.has(inst.exchange)) {
         this._byExchange.set(inst.exchange, []);
       }
       this._byExchange.get(inst.exchange).push(inst);
-    });
+    }
+
+    // Second pass: build bare symbol map with exchange preference
+    // Group instruments by tradingSymbol, then pick winner by EXCHANGE_PREFERENCE
+    const byTradingSymbol = new Map();
+    for (const inst of instruments) {
+      const sym = inst.tradingSymbol;
+      if (!byTradingSymbol.has(sym)) {
+        byTradingSymbol.set(sym, []);
+      }
+      byTradingSymbol.get(sym).push(inst);
+    }
+
+    for (const [sym, candidates] of byTradingSymbol.entries()) {
+      if (candidates.length === 1) {
+        // Only one exchange — no preference needed
+        this._bySymbol.set(sym, candidates[0]);
+        continue;
+      }
+
+      // Multiple exchanges — pick by preference order
+      let winner = null;
+      for (const preferredExchange of EXCHANGE_PREFERENCE) {
+        winner = candidates.find(c => c.exchange === preferredExchange) || null;
+        if (winner) break;
+      }
+
+      // Fallback: first in list if none matched preference
+      this._bySymbol.set(sym, winner || candidates[0]);
+
+      log.debug({
+        symbol: sym,
+        exchanges: candidates.map(c => c.exchange),
+        selected: (winner || candidates[0]).exchange,
+      }, 'Bare symbol lookup resolved via exchange preference');
+    }
 
     this._loaded = true;
   }
@@ -150,7 +196,7 @@ export class InstrumentManager {
 
   /**
    * Look up an instrument by token.
-   * @param {number} token - Kite instrument token
+   * @param {number} token
    * @returns {Instrument|null}
    */
   getByToken(token) {
@@ -159,6 +205,8 @@ export class InstrumentManager {
 
   /**
    * Get the instrument token for a symbol.
+   * Always returns NSE token for bare symbols (e.g. 'RELIANCE').
+   * Returns exchange-specific token for qualified symbols (e.g. 'BSE:RELIANCE').
    * @param {string} symbol
    * @returns {number|null}
    */
@@ -169,18 +217,13 @@ export class InstrumentManager {
 
   /**
    * Search instruments by partial name/symbol match.
-   * @param {string} query - Search query
-   * @param {string} [exchange] - Optional exchange filter
-   * @param {number} [limit=20] - Max results
-   * @returns {Instrument[]}
    */
   search(query, exchange, limit = 20) {
     const q = query.toUpperCase();
     let results = [];
-
     const source = exchange
       ? this._byExchange.get(exchange) || []
-      : [...this._bySymbol.values()];
+      : [...this._byToken.values()]; // use token map to avoid duplicates
 
     for (const inst of source) {
       if (
@@ -196,9 +239,7 @@ export class InstrumentManager {
   }
 
   /**
-   * Get all equity instruments (instrumentType = 'EQ') for an exchange.
-   * @param {string} [exchange='NSE']
-   * @returns {Instrument[]}
+   * Get all equity instruments for an exchange.
    */
   getEquities(exchange = 'NSE') {
     const instruments = this._byExchange.get(exchange) || [];
@@ -206,9 +247,8 @@ export class InstrumentManager {
   }
 
   /**
-   * Build a symbol→token map for a list of symbols. Useful for TickFeed.
-   * @param {string[]} symbols - e.g. ['RELIANCE', 'TCS', 'INFY']
-   * @returns {{ tokens: number[], symbolMap: Record<number, string> }}
+   * Build a symbol→token map for a list of symbols.
+   * Bare symbols resolve to NSE tokens via exchange preference.
    */
   resolveSymbols(symbols) {
     const tokens = [];
@@ -227,10 +267,6 @@ export class InstrumentManager {
     return { tokens, symbolMap };
   }
 
-  /**
-   * Get loader status.
-   * @returns {{ loaded: boolean, symbolCount: number, tokenCount: number, exchanges: string[] }}
-   */
   getStatus() {
     return {
       loaded: this._loaded,

@@ -7,6 +7,15 @@ const log = createLogger('risk-manager');
 /**
  * Risk Manager — synchronous, blocking risk gate for all order decisions.
  *
+ * LIVE SETTINGS SUPPORT:
+ *   Risk parameters can now be overridden at runtime via Redis (no restart needed).
+ *   Call refreshLiveSettings() once per scan cycle to pull latest overrides.
+ *   Falls back to config values if Redis is unavailable or no override is set.
+ *
+ *   Overridable params (via /api/live-settings or /set Telegram command):
+ *     MAX_POSITION_COUNT, MAX_DAILY_LOSS_PCT, PER_TRADE_STOP_LOSS_PCT,
+ *     KILL_SWITCH_DRAWDOWN_PCT, TRADING_CAPITAL
+ *
  * DESIGN PRINCIPLES (per user requirements):
  *   1. All checks are SYNCHRONOUS — no async gaps
  *   2. Rejects orders when daily loss limit is breached
@@ -35,15 +44,26 @@ export class RiskManager {
    * @param {number} [config.killSwitchDrawdownPct] - Kill switch trigger % (default 5)
    * @param {Function} [config.cacheGet] - Redis cacheGet for persistence
    * @param {Function} [config.cacheSet] - Redis cacheSet for persistence
+   * @param {Function} [config.getLiveSetting] - Optional live settings reader fn(key, fallback)
    */
   constructor(config) {
     this.capital = config.capital;
     this.killSwitch = config.killSwitch;
 
-    this.maxDailyLossPct = config.maxDailyLossPct ?? RISK_DEFAULTS.MAX_DAILY_LOSS_PCT;
-    this.perTradeStopLossPct = config.perTradeStopLossPct ?? RISK_DEFAULTS.PER_TRADE_STOP_LOSS_PCT;
-    this.maxPositionCount = config.maxPositionCount ?? RISK_DEFAULTS.MAX_POSITION_COUNT;
-    this.killSwitchDrawdownPct = config.killSwitchDrawdownPct ?? RISK_DEFAULTS.KILL_SWITCH_DRAWDOWN_PCT;
+    // Base values from config/env — used as fallback when no live override is set
+    this._baseMaxDailyLossPct = config.maxDailyLossPct ?? RISK_DEFAULTS.MAX_DAILY_LOSS_PCT;
+    this._basePerTradeStopLossPct = config.perTradeStopLossPct ?? RISK_DEFAULTS.PER_TRADE_STOP_LOSS_PCT;
+    this._baseMaxPositionCount = config.maxPositionCount ?? RISK_DEFAULTS.MAX_POSITION_COUNT;
+    this._baseKillSwitchDrawdownPct = config.killSwitchDrawdownPct ?? RISK_DEFAULTS.KILL_SWITCH_DRAWDOWN_PCT;
+
+    // Live (active) values — start as base values, updated by refreshLiveSettings()
+    this.maxDailyLossPct = this._baseMaxDailyLossPct;
+    this.perTradeStopLossPct = this._basePerTradeStopLossPct;
+    this.maxPositionCount = this._baseMaxPositionCount;
+    this.killSwitchDrawdownPct = this._baseKillSwitchDrawdownPct;
+
+    // Optional live settings provider (injected from index.js)
+    this._getLiveSetting = config.getLiveSetting || null;
 
     // C2: Redis persistence functions
     this._cacheGet = config.cacheGet || null;
@@ -59,10 +79,8 @@ export class RiskManager {
     /** @type {number} Number of trades executed today */
     this._tradeCount = 0;
 
-    // Derived limits
-    this._maxDailyLossAmount = this.capital * (this.maxDailyLossPct / 100);
-    this._killSwitchAmount = this.capital * (this.killSwitchDrawdownPct / 100);
-    this._perTradeMaxLoss = this.capital * (this.perTradeStopLossPct / 100);
+    // Derived limits — recomputed on every refreshLiveSettings() call
+    this._recomputeLimits();
 
     log.info({
       capital: this.capital,
@@ -72,6 +90,82 @@ export class RiskManager {
       killSwitchAt: `${this.killSwitchDrawdownPct}% (₹${this._killSwitchAmount})`,
     }, 'RiskManager initialized');
   }
+
+  // ═══════════════════════════════════════════════════════
+  // LIVE SETTINGS — called once per scan cycle
+  // ═══════════════════════════════════════════════════════
+
+  /**
+   * Pull latest risk parameter overrides from Redis.
+   * Call this at the start of each scan cycle (in getWatchlist or _strategyScan).
+   *
+   * If no live override is set for a key, the .env/config value is used.
+   * If Redis is unavailable, silently falls back to current values.
+   *
+   * @returns {Promise<{ changed: boolean, overrides: Object }>}
+   */
+  async refreshLiveSettings() {
+    if (!this._getLiveSetting) {
+      return { changed: false, overrides: {} };
+    }
+
+    const prev = {
+      maxDailyLossPct: this.maxDailyLossPct,
+      perTradeStopLossPct: this.perTradeStopLossPct,
+      maxPositionCount: this.maxPositionCount,
+      killSwitchDrawdownPct: this.killSwitchDrawdownPct,
+    };
+
+    try {
+      this.maxDailyLossPct = await this._getLiveSetting('MAX_DAILY_LOSS_PCT', this._baseMaxDailyLossPct);
+      this.perTradeStopLossPct = await this._getLiveSetting('PER_TRADE_STOP_LOSS_PCT', this._basePerTradeStopLossPct);
+      this.maxPositionCount = await this._getLiveSetting('MAX_POSITION_COUNT', this._baseMaxPositionCount);
+      this.killSwitchDrawdownPct = await this._getLiveSetting('KILL_SWITCH_DRAWDOWN_PCT', this._baseKillSwitchDrawdownPct);
+
+      // Capital override — only affects position sizing, NOT today's P&L tracking
+      const liveCapital = await this._getLiveSetting('TRADING_CAPITAL', this.capital);
+      if (liveCapital !== this.capital) {
+        log.info({ prev: this.capital, next: liveCapital }, 'Capital overridden via live settings');
+        this.capital = liveCapital;
+      }
+
+      this._recomputeLimits();
+
+      const overrides = {};
+      let changed = false;
+
+      for (const [key, val] of Object.entries(prev)) {
+        if (val !== this[key]) {
+          overrides[key] = { from: val, to: this[key] };
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        log.info({ overrides }, '⚙️  Risk params updated from live settings');
+      }
+
+      return { changed, overrides };
+    } catch (err) {
+      log.warn({ err: err.message }, 'refreshLiveSettings failed — keeping current values');
+      return { changed: false, overrides: {} };
+    }
+  }
+
+  /**
+   * Recompute derived monetary limits from current percentage values.
+   * Called after every live settings refresh and on construction.
+   * @private
+   */
+  _recomputeLimits() {
+    this._maxDailyLossAmount = this.capital * (this.maxDailyLossPct / 100);
+    this._killSwitchAmount = this.capital * (this.killSwitchDrawdownPct / 100);
+    this._perTradeMaxLoss = this.capital * (this.perTradeStopLossPct / 100);
+  }
+
+  // ═══════════════════════════════════════════════════════
+  // PERSISTENCE — Redis state across restarts
+  // ═══════════════════════════════════════════════════════
 
   /**
    * C2: Load persisted daily state from Redis on startup.
@@ -111,8 +205,7 @@ export class RiskManager {
    * Bug Fix 3: Sync open position count from the engine's authoritative _filledPositions Map.
    *
    * Call this AFTER engine.hydratePositions() completes. This overrides whatever
-   * openPositionCount was stored in Redis, which may have drifted (e.g. if a SELL
-   * executed on a phantom position, incrementing Redis incorrectly).
+   * openPositionCount was stored in Redis, which may have drifted.
    *
    * @param {number} count - engine._filledPositions.size after hydration
    */
@@ -120,10 +213,8 @@ export class RiskManager {
     const previous = this._openPositionCount;
     this._openPositionCount = count;
     if (previous !== count) {
-      log.warn({
-        previous,
-        synced: count,
-      }, `Position count synced from engine hydration: ${previous} → ${count}`);
+      log.warn({ previous, synced: count },
+        `Position count synced from engine hydration: ${previous} → ${count}`);
     } else {
       log.info({ count }, 'Position count confirmed in sync with engine');
     }
@@ -160,10 +251,8 @@ export class RiskManager {
       this._tradeCount = dbCount;
 
       if (previous !== dbCount) {
-        log.warn({
-          previous,
-          synced: dbCount,
-        }, `Trade count synced from DB: ${previous} → ${dbCount}`);
+        log.warn({ previous, synced: dbCount },
+          `Trade count synced from DB: ${previous} → ${dbCount}`);
       } else {
         log.info({ tradeCount: dbCount }, 'Trade count confirmed in sync with DB');
       }
@@ -204,6 +293,9 @@ export class RiskManager {
    * Returns a decision object — NEVER throws.
    * ALL checks are synchronous.
    *
+   * NOTE: Call refreshLiveSettings() once per scan cycle BEFORE calling validateOrder.
+   * This keeps validateOrder synchronous while still respecting live overrides.
+   *
    * @param {Object} order
    * @param {string} order.symbol - Trading symbol
    * @param {string} order.side - 'BUY' or 'SELL'
@@ -222,6 +314,13 @@ export class RiskManager {
       dailyPnL: this._dailyPnL,
       openPositions: this._openPositionCount,
       tradeCount: this._tradeCount,
+      // Include active param values in context for full audit trail
+      activeParams: {
+        maxDailyLossPct: this.maxDailyLossPct,
+        perTradeStopLossPct: this.perTradeStopLossPct,
+        maxPositionCount: this.maxPositionCount,
+        killSwitchDrawdownPct: this.killSwitchDrawdownPct,
+      },
     };
 
     // ─── Check 1: Kill Switch (highest priority) ─────────
@@ -266,7 +365,8 @@ export class RiskManager {
     }
 
     // ─── All checks passed ───────────────────────────────
-    log.info({ ...context, tradeRisk: tradeRisk.toFixed(2) }, 'ORDER APPROVED — all risk checks passed');
+    log.info({ ...context, tradeRisk: tradeRisk.toFixed(2) },
+      'ORDER APPROVED — all risk checks passed');
     return { allowed: true, reason: 'All risk checks passed', context };
   }
 
@@ -300,6 +400,9 @@ export class RiskManager {
 
     this._persistToRedis().catch(() => { });
 
+    // Re-fetch kill switch threshold in case it was live-overridden
+    // _killSwitchAmount is always in sync because _recomputeLimits() is called
+    // in refreshLiveSettings() which runs before each scan cycle.
     if (this._dailyPnL <= -this._killSwitchAmount) {
       await this.killSwitch.engage(
         `Drawdown ${drawdownPct.toFixed(2)}% hit kill switch threshold ` +
@@ -351,6 +454,7 @@ export class RiskManager {
 
   /**
    * Get comprehensive risk status for monitoring/dashboard.
+   * Includes both active (possibly live-overridden) and base (.env) param values.
    * @returns {Object}
    */
   getStatus() {
@@ -370,6 +474,20 @@ export class RiskManager {
       maxPositions: this.maxPositionCount,
       tradeCount: this._tradeCount,
       killSwitch: this.killSwitch.getStatus(),
+      // Active params (live overrides applied)
+      activeParams: {
+        maxDailyLossPct: this.maxDailyLossPct,
+        perTradeStopLossPct: this.perTradeStopLossPct,
+        maxPositionCount: this.maxPositionCount,
+        killSwitchDrawdownPct: this.killSwitchDrawdownPct,
+      },
+      // Base params (.env fallbacks)
+      baseParams: {
+        maxDailyLossPct: this._baseMaxDailyLossPct,
+        perTradeStopLossPct: this._basePerTradeStopLossPct,
+        maxPositionCount: this._baseMaxPositionCount,
+        killSwitchDrawdownPct: this._baseKillSwitchDrawdownPct,
+      },
     };
   }
 }

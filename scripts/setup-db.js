@@ -175,6 +175,8 @@ const MIGRATIONS = [
 
   `CREATE INDEX IF NOT EXISTS idx_shadow_strategy_accuracy
      ON shadow_signals(strategy, was_correct_30min, created_at DESC);`,
+  `ALTER TABLE trades ADD COLUMN IF NOT EXISTS opening_strategies TEXT;`,
+
 ];
 
 // ─── Seed data ──────────────────────────────────────────────────────────────
