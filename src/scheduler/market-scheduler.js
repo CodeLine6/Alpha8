@@ -474,7 +474,7 @@ export class MarketScheduler {
       wins: riskStatus.wins || 0,
       losses: riskStatus.losses || 0,
       openPositions: this.engine.getOpenPositionCount(),
-      mode: config.LIVE_TRADING ? 'LIVE' : 'PAPER',
+      mode: this.engine.paperMode ? 'PAPER' : 'LIVE',
     };
 
     await this.sendReport(summary).catch(err =>

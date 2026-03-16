@@ -12,6 +12,12 @@ import { KillSwitch } from '../src/risk/kill-switch.js';
 import { RiskManager } from '../src/risk/risk-manager.js';
 import { ExecutionEngine } from '../src/engine/execution-engine.js';
 import { SignalConsensus } from '../src/engine/signal-consensus.js';
+import { query } from '../src/lib/db.js';
+
+// ─── Mocks ────────────────────────────────────────────────
+jest.mock('../src/lib/db.js', () => ({
+  query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+}));
 
 // ─── Helpers ──────────────────────────────────────────────
 
@@ -322,7 +328,9 @@ describe('Post-market job', () => {
     const summary = await scheduler._postMarket();
 
     expect(summary.pnl).toBe(-300);
-    expect(summary.tradeCount).toBe(2);
+    expect(summary.trades).toBe(2);
+    expect(summary.wins).toBe(1);
+    expect(summary.losses).toBe(1);
     expect(summary.date).toBeDefined();
     expect(sendReport).toHaveBeenCalledWith(summary);
   });
@@ -337,6 +345,8 @@ describe('Post-market job', () => {
     // After reset
     expect(rm.getStatus().dailyPnL).toBe(0);
     expect(rm.getStatus().tradeCount).toBe(0);
+    expect(rm.getStatus().wins).toBe(0);
+    expect(rm.getStatus().losses).toBe(0);
   });
 
   test('should deactivate scanning', async () => {

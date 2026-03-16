@@ -76,49 +76,24 @@ export async function executeSquareOff({ broker, riskManager, engine, getOpenPos
     if (!symbol) continue;
 
     const qty = Math.abs(pos.quantity || pos.netQuantity || 0);
-    const posCtx = engine._filledPositions.get(symbol);
-
     if (qty === 0) continue;
 
     try {
-      let squareOffPrice = 0;
-      let squareOffResult = null;
-
-      if (!isPaperMode && broker) {
-        // ... (live mode logic unchanged)
-        squareOffResult = await broker.placeOrder({
-          symbol,
-          exchange: 'NSE',
-          side: 'SELL',
-          quantity: qty,
-          orderType: 'MARKET',
-          product: 'MIS',
-        }).catch(err => {
-          throw new Error(`Broker order failed: ${err.message}`);
-        });
-
-        squareOffPrice =
-          squareOffResult?.price ||
-          squareOffResult?.average_price ||
-          squareOffResult?.raw?.average_price ||
-          squareOffResult?.raw?.price ||
-          pos.last_price ||
-          pos.close_price ||
-          0;
-      } else {
-        // Paper mode: Get the freshest price possible
-        let freshPrice = 0;
-        if (broker) {
-          try {
-            const ltp = await broker.getLTP(`NSE:${symbol}`);
-            if (ltp && ltp.last_price) freshPrice = ltp.last_price;
-          } catch (e) {
-            log.warn({ symbol, err: e.message }, 'Failed to fetch LTP for paper square-off fallback');
-          }
+      // 1. Determine exit price (freshest LTP possible)
+      let exitPrice = 0;
+      if (broker) {
+        try {
+          const ltp = await broker.getLTP(`NSE:${symbol}`);
+          if (ltp && ltp.last_price) exitPrice = ltp.last_price;
+        } catch (e) {
+          log.warn({ symbol, err: e.message }, 'Failed to fetch LTP for square-off fallback');
         }
+      }
 
-        squareOffPrice =
-          freshPrice ||
+      if (!exitPrice) {
+        // Fallback to position data or engine context
+        const posCtx = engine._filledPositions.get(symbol);
+        exitPrice =
           pos.last_price ||
           pos.close_price ||
           pos.average_price ||
@@ -126,34 +101,43 @@ export async function executeSquareOff({ broker, riskManager, engine, getOpenPos
           0;
       }
 
-      const entryPrice = posCtx?.price ?? pos.average_price ?? pos.buyPrice ?? 0;
-      const pnl = squareOffPrice > 0 ? (squareOffPrice - entryPrice) * qty : 0;
+      // 2. Execute exit via engine.forceExit()
+      // This handles: Order creation, Broker placement (live), State update, 
+      // Risk Manager P&L logging, Outcome recording, and DB Persistence.
+      const result = await engine.forceExit(symbol, exitPrice, 'SQUARE_OFF', true);
 
-      log.warn({
-        symbol,
-        qty,
-        entryPrice,
-        squareOffPrice,
-        pnl: pnl.toFixed(2),
-        isPaperMode,
-      }, `Squared off: ${symbol}`);
+      if (result.success) {
+        squaredOff.push({
+          symbol,
+          qty,
+          pnl: result.pnl,
+          squareOffPrice: result.order?.price || exitPrice
+        });
+      } else {
+        // Fallback for live mode if engine is out-of-sync with broker
+        if (!isPaperMode && broker) {
+          log.warn({ symbol }, 'Engine out-of-sync: forceExit failed, attempting manual broker exit');
+          const squareOffResult = await broker.placeOrder({
+            symbol,
+            exchange: 'NSE',
+            side: 'SELL',
+            quantity: qty,
+            orderType: 'MARKET',
+            product: 'MIS',
+          });
+          
+          const finalPrice = squareOffResult?.price || squareOffResult?.average_price || exitPrice;
+          const entryPrice = pos.average_price || pos.buyPrice || 0;
+          const pnl = (finalPrice - entryPrice) * qty;
 
-      // Fix C1: Record P&L so risk manager tracks drawdown from square-off exits.
-      // recordTradePnL() is the ONLY mechanism that can auto-engage the kill switch.
-      await riskManager.recordTradePnL(pnl, symbol).catch(err =>
-        log.error({ symbol, err: err.message }, 'CRITICAL: recordTradePnL failed in square-off')
-      );
-
-      await engine.markPositionClosed(symbol);
-      await riskManager.removePosition();
-
-      if (posCtx) {
-        await engine.recordPositionOutcome(symbol, pnl).catch(err =>
-          log.warn({ symbol, err: err.message }, 'Outcome recording failed during square-off')
-        );
+          await riskManager.recordTradePnL(pnl, symbol).catch(() => {});
+          await riskManager.removePosition();
+          
+          squaredOff.push({ symbol, qty, pnl, squareOffPrice: finalPrice });
+        } else {
+          throw new Error('Square-off rejected by engine (no position context?)');
+        }
       }
-
-      squaredOff.push({ symbol, qty, pnl, squareOffPrice });
     } catch (err) {
       log.error({ symbol, err: err.message }, `Square-off FAILED for ${symbol}`);
       errors.push({ symbol, error: err.message });
