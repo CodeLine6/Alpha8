@@ -812,6 +812,51 @@ async function main() {
   scheduler.start();
   log.info('✅ Market scheduler started (8 daily jobs registered)');
 
+  // ─── Manual Control Commands ───────────────────────────
+  if (telegram.enabled) {
+    telegram.onCommand('/status', async () => {
+      try {
+        const sStatus = scheduler.getStatus();
+        const rStatus = riskManager.getStatus();
+        const eStatus = engine.getStatus();
+
+        const msg = 
+          `🖥️ <b>System Status</b>\n` +
+          `━━━━━━━━━━━━━━━━━━━━\n` +
+          `🛰️ <b>Scanning:</b> ${sStatus.scanning ? '🟢 ACTIVE' : '⚪ INACTIVE'}\n` +
+          `📊 <b>PnL:</b> ₹${rStatus.dailyPnL.toLocaleString('en-IN')}\n` +
+          `📉 <b>Drawdown:</b> ${rStatus.drawdownPct.toFixed(2)}%\n` +
+          `📦 <b>Positions:</b> ${eStatus.openPositions}\n` +
+          `⚡ <b>Kill Switch:</b> ${rStatus.killSwitch.engaged ? '🔴 ENGAGED' : '🟢 NORMAL'}\n` +
+          `━━━━━━━━━━━━━━━━━━━━\n` +
+          `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`;
+        
+        telegram.sendRaw(msg);
+      } catch (err) {
+        telegram.sendRaw(`❌ <b>Status Error:</b> ${err.message}`);
+      }
+    });
+
+    telegram.onCommand('/market_open', async () => {
+      log.info('Manual market open triggered via Telegram');
+      telegram.sendRaw('⏳ <b>Manual Market Open</b>\nInitializing market-day routines...');
+      
+      try {
+        const result = await scheduler._marketOpen();
+        if (result.scanning) {
+          telegram.sendRaw('✅ <b>Market Open Complete</b>\nStrategy scanning is now ACTIVE.');
+        } else {
+          telegram.sendRaw('⚠️ <b>Market Open Partial</b>\nRoutines completed but focus scanning state is unclear.');
+        }
+      } catch (err) {
+        log.error({ err: err.message }, 'Manual market open failed');
+        telegram.sendRaw(`❌ <b>Market Open Failed:</b> ${err.message}`);
+      }
+    });
+
+    log.info('✅ Telegram /status and /market_open commands registered');
+  }
+
   registerShutdown('scheduler', async () => {
     scheduler.stop();
     log.info('Market scheduler stopped');
