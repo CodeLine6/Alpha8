@@ -97,8 +97,7 @@ export class KiteClient {
   async placeOrder(params) {
     return this.breaker.execute(async () => {
       log.info({ params }, 'Placing Kite order');
-      const variety = params.trigger_price ? 'regular' : 'regular';
-      const response = await this.kite.placeOrder(variety, {
+      const response = await this.kite.placeOrder('regular', {
         exchange: params.exchange || 'NSE',
         tradingsymbol: params.tradingsymbol,
         transaction_type: params.transaction_type,
@@ -112,6 +111,29 @@ export class KiteClient {
       log.info({ orderId: response.order_id }, 'Kite order placed');
       return response;
     });
+  }
+
+  /**
+   * Place an emergency order that bypasses the circuit breaker OPEN state.
+   * ONLY for use in stop-loss / force-exit paths.
+   */
+  async placeEmergencyOrder(params) {
+    return this.breaker.execute(async () => {
+      log.info({ params }, 'Placing emergency Kite order (circuit bypass)');
+      const response = await this.kite.placeOrder('regular', {
+        exchange: params.exchange || 'NSE',
+        tradingsymbol: params.tradingsymbol,
+        transaction_type: params.transaction_type,
+        quantity: params.quantity,
+        order_type: params.order_type || 'MARKET',
+        product: params.product || 'MIS',
+        price: params.price,
+        trigger_price: params.trigger_price,
+        validity: params.validity || 'DAY',
+      });
+      log.info({ orderId: response.order_id }, 'Emergency Kite order placed');
+      return response;
+    }, { force: true }); // C3 FIX: bypass OPEN circuit
   }
 
   /**
@@ -187,11 +209,23 @@ export class KiteClient {
 
   /**
    * Get Last Traded Price for instruments.
-   * @param {string[]} instruments
-   * @returns {Promise<Object>}
+   * Wrapped in Promise.resolve() because KiteConnect SDK versions differ:
+   *   v4+: returns Promise<{ 'NSE:RELIANCE': { last_price: ... } }>
+   *   v3:  returns synchronously: { data: { 'NSE:RELIANCE': { last_price: ... } } }
+   * M2 FIX: normalise both shapes to always return the instrument-keyed object.
    */
   async getLTP(instruments) {
-    return this.breaker.execute(() => this.kite.getLTP(instruments));
+    return this.breaker.execute(async () => {
+      const raw = await Promise.resolve(this.kite.getLTP(instruments));
+      // M2 FIX: KiteConnect v3 wraps response in { data: {...} }
+      if (raw && typeof raw === 'object' && raw.data && typeof raw.data === 'object') {
+        const topKeys = Object.keys(raw);
+        if (topKeys.length === 1 && topKeys[0] === 'data') {
+          return raw.data;
+        }
+      }
+      return raw;
+    });
   }
 
   /**

@@ -264,15 +264,12 @@ async function browserLogin() {
     console.log('🔘 Clicking login...');
     await page.click('button[type="submit"]');
 
-    // ─── Step 5: Wait for TOTP page ──────────────────
+    // ─── Step 5: Wait for TOTP page ──────────────────────────────
     console.log('⏳ Waiting for TOTP input...');
 
-    // Wait for either TOTP input or an error message
     await page.waitForFunction(
       () => {
-        // Check for TOTP input fields
         const inputs = document.querySelectorAll('input[type="text"], input[type="number"], input[autocomplete="one-time-code"]');
-        // Only count inputs that are visible and likely TOTP (not the user_id field)
         for (const inp of inputs) {
           if (inp.offsetParent !== null && !inp.value) return true;
         }
@@ -281,15 +278,15 @@ async function browserLogin() {
       { timeout: 15000 }
     );
 
-    // Delay for page transition
-    await new Promise((r) => setTimeout(r, 1500));
+    // Short structural delay — just enough for the input to be interactive
+    await new Promise((r) => setTimeout(r, 500));
 
-    // ─── Step 6: Generate and enter TOTP ─────────────
-    const totpGenerator = new TOTP({ secret: ZERODHA_TOTP_SECRET });
-    const totp = totpGenerator.generate();
-    console.log(`🔐 Generated TOTP: ${totp.slice(0, 2)}****`);
-
-    // Find the visible, empty TOTP input
+    // ─── Step 6: Find TOTP input FIRST, then generate code ───────
+    // S3 FIX: find the input element before generating the TOTP code.
+    // On cold startups, page.waitForFunction passes early but the input
+    // is not yet interactive. We locate it here, then generate the code
+    // immediately before typing to minimize the time between generation
+    // and submission (TOTP window = 30s, generation + typing < 5s).
     const totpInputs = await page.$$('input[type="text"], input[type="number"], input[autocomplete="one-time-code"]');
     let totpInput = null;
     for (const inp of totpInputs) {
@@ -306,11 +303,43 @@ async function browserLogin() {
       throw new Error('Could not find TOTP input field (screenshot saved to scripts/debug-totp-not-found.png)');
     }
 
+    // S3 FIX: generate TOTP HERE, immediately before typing.
+    // At this point the page is fully loaded and the input is found.
+    const totpGenerator = new TOTP({ secret: ZERODHA_TOTP_SECRET });
+    const totp = totpGenerator.generate();
+    console.log(`🔐 Generated TOTP: ${totp.slice(0, 2)}****`);
+
     await totpInput.type(totp, { delay: 80 });
 
-    // ─── Step 7: Submit TOTP ─────────────────────────
-    // Zerodha often auto-submits after 6 digits; also try button
-    await new Promise((r) => setTimeout(r, 1000));
+    // ─── Step 7: Submit TOTP ─────────────────────────────────────
+    // Wait for potential auto-submit before clicking button
+    await new Promise((r) => setTimeout(r, 800));
+
+    // S3 FIX: check if there's an error before clicking submit.
+    // If the code expired (unlikely now but possible), we'll see an error.
+    const pageError = await page.evaluate(() => {
+      const errorSelectors = ['.error-message', '.alert-danger', '[class*="error"]'];
+      for (const sel of errorSelectors) {
+        const el = document.querySelector(sel);
+        if (el && el.textContent.trim()) return el.textContent.trim();
+      }
+      return null;
+    });
+
+    if (pageError && pageError.toLowerCase().includes('otp')) {
+      // S3 FIX: TOTP error detected — regenerate and retry once
+      console.log(`⚠️ TOTP error detected ("${pageError.slice(0, 50)}") — regenerating and retrying`);
+      await new Promise((r) => setTimeout(r, 2000)); // wait for next 30s window
+
+      // Clear the input
+      await totpInput.evaluate(el => { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); });
+
+      const retryTotp = totpGenerator.generate();
+      console.log(`🔐 Retry TOTP: ${retryTotp.slice(0, 2)}****`);
+      await totpInput.type(retryTotp, { delay: 80 });
+      await new Promise((r) => setTimeout(r, 800));
+    }
+
     try {
       const submitBtn = await page.$('button[type="submit"]');
       if (submitBtn) await submitBtn.click();

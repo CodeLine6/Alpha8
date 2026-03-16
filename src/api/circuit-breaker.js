@@ -52,11 +52,27 @@ export class CircuitBreaker {
    * Execute a function through the circuit breaker.
    * @template T
    * @param {() => Promise<T>} fn - Async function to execute
+   * @param {Object} [opts]
+   * @param {boolean} [opts.force=false] - Bypass OPEN state for emergency exits.
+   *   Failures still count, but successes do NOT close the circuit.
    * @returns {Promise<T>}
    * @throws {Error} If circuit is OPEN or the function fails
    */
-  async execute(fn) {
+  async execute(fn, { force = false } = {}) {
     if (this.state === CIRCUIT_STATE.OPEN) {
+      if (force) {
+        // C3 FIX: attempt emergency request despite open circuit.
+        log.warn({ breaker: this.name }, 'Circuit OPEN — forcing emergency execution (stop/trail exit)');
+        try {
+          const result = await this._executeWithTimeout(fn);
+          // Intentionally do NOT call _onSuccess() — don't let emergency closes reopen circuit.
+          return result;
+        } catch (err) {
+          this._onFailure(err); // failures still count
+          throw err;
+        }
+      }
+
       if (this._shouldAttemptReset()) {
         this.state = CIRCUIT_STATE.HALF_OPEN;
         log.info({ breaker: this.name }, 'Circuit → HALF_OPEN (probing)');

@@ -82,13 +82,9 @@ export function createApiHandler(deps) {
       default: config.KILL_SWITCH_DRAWDOWN_PCT,
       category: 'risk',
     },
-    TRADING_CAPITAL: {
-      label: 'Trading Capital (₹)',
-      description: 'Active capital used for position sizing',
-      type: 'number', min: 10000, max: 10000000, step: 10000,
-      default: config.TRADING_CAPITAL,
-      category: 'risk',
-    },
+    /* NOTE: TRADING_CAPITAL is intentionally NOT in this schema (Fix S5).
+       Changing it via live settings inflates/deflates all risk thresholds
+       relative to actual deployed capital. Change in .env and restart instead. */
     STOP_LOSS_PCT: {
       label: 'Stop Loss %',
       description: 'Hard stop loss % below entry price — triggers immediate exit',
@@ -428,7 +424,20 @@ export function createApiHandler(deps) {
     }
   }
 
+  /**
+   * GET /health — Public minimal health check.
+   * Only signals process liveness. Safe to expose publicly.
+   */
+  async function handlePublicHealth(req, res) {
+    const engaged = killSwitch?.isEngaged?.() ?? false;
+    json(res, {
+      status: engaged ? 'halted' : 'ok',
+      ts: new Date().toISOString(),
+    });
+  }
+
   async function handleHealth(req, res) {
+    if (!checkAuth(req, res)) return;
     try {
       let dbOk = false;
       let redisOk = false;
@@ -805,6 +814,24 @@ export function createApiHandler(deps) {
 
       // ── Cross-param guards ─────────────────────────────────────────────────
 
+      // EMA fast < slow guard (Fix N7)
+      if (key === 'EMA_FAST_PERIOD') {
+        const slow = getLiveSetting ? await getLiveSetting('EMA_SLOW_PERIOD', 21) : 21;
+        if (numValue >= slow) {
+          return json(res, {
+            error: `EMA_FAST_PERIOD (${numValue}) must be less than EMA_SLOW_PERIOD (${slow}).`,
+          }, 400);
+        }
+      }
+      if (key === 'EMA_SLOW_PERIOD') {
+        const fast = getLiveSetting ? await getLiveSetting('EMA_FAST_PERIOD', 9) : 9;
+        if (numValue <= fast) {
+          return json(res, {
+            error: `EMA_SLOW_PERIOD (${numValue}) must be greater than EMA_FAST_PERIOD (${fast}).`,
+          }, 400);
+        }
+      }
+
       // RSI: oversold < overbought
       if (key === 'RSI_OVERSOLD') {
         const ob = getLiveSetting ? await getLiveSetting('RSI_OVERBOUGHT', 70) : 70;
@@ -945,7 +972,7 @@ export function createApiHandler(deps) {
     try {
       if (req.method === 'GET') {
         switch (url) {
-          case '/health':
+          case '/health': return handlePublicHealth(req, res);
           case '/api/health': return handleHealth(req, res);
           case '/api/summary': return handleSummary(req, res);
           case '/api/positions': return handlePositions(req, res);

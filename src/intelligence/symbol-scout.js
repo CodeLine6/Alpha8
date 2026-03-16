@@ -314,7 +314,13 @@ export class SymbolScout {
      */
     async getActiveWatchlist() {
         const dynamic = await this._loadDynamic();
-        const combined = [...new Set([...this.pinnedSymbols, ...dynamic])];
+
+        // S4 FIX: cap dynamic symbols at maxDynamic (already controlled by
+        // _computeChanges slice, but defensive cap here in case DB state drifts)
+        const cappedDynamic = dynamic.slice(0, this.maxDynamic);
+
+        // Dedupe pinned + dynamic. Pinned always wins (never removed by scout).
+        const combined = [...new Set([...this.pinnedSymbols, ...cappedDynamic])];
         return combined;
     }
 
@@ -564,15 +570,15 @@ export class SymbolScout {
         try {
             // FIX: Removed the erroneous outer SELECT DISTINCT ON (symbol) wrapper.
             // The inner query already produces one row per symbol via GROUP BY symbol.
-            // DISTINCT ON without a matching ORDER BY was selecting an arbitrary row.
+            // S4 FIX: Ensure deterministic order by recorded_at DESC.
             const result = await query(
                 `SELECT
-         symbol,
-         ARRAY_AGG(outcome ORDER BY recorded_at DESC) AS outcomes
-       FROM signal_outcomes
-       WHERE symbol = ANY($1)
-         AND recorded_at > NOW() - INTERVAL '14 days'
-       GROUP BY symbol`,
+          symbol,
+          ARRAY_AGG(outcome ORDER BY recorded_at DESC) AS outcomes
+        FROM signal_outcomes
+        WHERE symbol = ANY($1)
+          AND recorded_at > NOW() - INTERVAL '14 days'
+        GROUP BY symbol`,
                 [symbols]
             );
 

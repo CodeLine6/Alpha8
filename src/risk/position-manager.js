@@ -48,6 +48,8 @@ export class PositionManager {
         this._active = { ...this._base };
         this._getLiveSetting = getLiveSetting || null;
 
+        this._checkAllInProgress = false; // M1 FIX: concurrency guard
+
         log.info({ enabled: this.enabled, ...this._active }, 'PositionManager initialized');
     }
 
@@ -91,58 +93,69 @@ export class PositionManager {
     async checkAll({ latestSignals = {} } = {}) {
         if (!this.enabled) return { checked: 0, exits: [], partials: [] };
 
-        await this._refreshParams();
+        // M1 FIX: prevent concurrent checkAll() calls from racing on the same posCtx.
+        if (this._checkAllInProgress) {
+            log.warn('checkAll() called while already in progress — skipping to prevent race condition');
+            return { checked: 0, exits: [], partials: [], skipped: true };
+        }
+        this._checkAllInProgress = true;
 
-        const positions = this.engine._filledPositions;
-        if (positions.size === 0) return { checked: 0, exits: [], partials: [] };
+        try {
+            await this._refreshParams();
 
-        const symbols = Array.from(positions.keys());
-        const priceMap = await this._fetchPricesAndCandles(symbols);
-        const exits = [];
-        const partials = [];
-        const regime = await this._getCurrentRegime();
+            const positions = this.engine._filledPositions;
+            if (positions.size === 0) return { checked: 0, exits: [], partials: [] };
 
-        for (const [symbol, posCtx] of positions) {
-            try {
-                const data = priceMap[symbol];
-                if (!data?.price || data.price <= 0) {
-                    log.warn({ symbol }, 'Position check skipped — no price available');
-                    continue;
+            const symbols = Array.from(positions.keys());
+            const priceMap = await this._fetchPricesAndCandles(symbols);
+            const exits = [];
+            const partials = [];
+            const regime = await this._getCurrentRegime();
+
+            for (const [symbol, posCtx] of positions) {
+                try {
+                    const data = priceMap[symbol];
+                    if (!data?.price || data.price <= 0) {
+                        log.warn({ symbol }, 'Position check skipped — no price available');
+                        continue;
+                    }
+
+                    const result = evaluateExits({
+                        symbol,
+                        posCtx,
+                        currentPrice: data.price,
+                        recentCloses: data.closes || [],
+                        recentHighs: data.highs || [],
+                        recentLows: data.lows || [],
+                        regime,
+                        latestSignals,
+                        config: this._active,
+                    });
+
+                    if (result.partial) {
+                        await this._executePartialExit(symbol, posCtx, data.price, result);
+                        partials.push({ symbol, ...result });
+                    } else if (result.exit) {
+                        const exitResult = await this.engine.forceExit(symbol, data.price, result.reason);
+                        exits.push({ symbol, reason: result.reason, meta: result.meta, ...exitResult });
+                        await this._notifyExit(symbol, posCtx, data.price, result.reason, result.meta, exitResult);
+                    }
+                } catch (err) {
+                    log.error({ symbol, err: err.message }, 'Position check failed — skipping');
                 }
-
-                const result = evaluateExits({
-                    symbol,
-                    posCtx,
-                    currentPrice: data.price,
-                    recentCloses: data.closes || [],
-                    recentHighs: data.highs || [],
-                    recentLows: data.lows || [],
-                    regime,
-                    latestSignals,
-                    config: this._active,
-                });
-
-                if (result.partial) {
-                    await this._executePartialExit(symbol, posCtx, data.price, result);
-                    partials.push({ symbol, ...result });
-                } else if (result.exit) {
-                    const exitResult = await this.engine.forceExit(symbol, data.price, result.reason);
-                    exits.push({ symbol, reason: result.reason, meta: result.meta, ...exitResult });
-                    await this._notifyExit(symbol, posCtx, data.price, result.reason, result.meta, exitResult);
-                }
-            } catch (err) {
-                log.error({ symbol, err: err.message }, 'Position check failed — skipping');
             }
-        }
 
-        if (exits.length > 0 || partials.length > 0) {
-            log.info({
-                exits: exits.map(e => `${e.symbol}(${e.reason})`),
-                partials: partials.map(p => `${p.symbol}(${p.qty})`),
-            }, `PositionManager: ${exits.length} exit(s), ${partials.length} partial(s)`);
-        }
+            if (exits.length > 0 || partials.length > 0) {
+                log.info({
+                    exits: exits.map(e => `${e.symbol}(${e.reason})`),
+                    partials: partials.map(p => `${p.symbol}(${p.qty})`),
+                }, `PositionManager: ${exits.length} exit(s), ${partials.length} partial(s)`);
+            }
 
-        return { checked: symbols.length, exits, partials };
+            return { checked: symbols.length, exits, partials };
+        } finally {
+            this._checkAllInProgress = false; // M1 FIX: always release
+        }
     }
 
     async initPosition(symbol, posCtx, recentCloses = [], recentHighs = [], recentLows = []) {
@@ -285,7 +298,18 @@ export class PositionManager {
         if (this.broker) {
             try {
                 const keys = symbols.map(s => `NSE:${s}`);
-                const ltp = await this.broker.getLTP(keys);
+                // C5 FIX: hard 10-second timeout on LTP fetch to prevent unbounded blocking.
+                const LTP_TIMEOUT_MS = 10000;
+                const ltp = await Promise.race([
+                  this.broker.getLTP(keys),
+                  new Promise((_, reject) =>
+                    setTimeout(
+                      () => reject(new Error(`LTP fetch timed out after ${LTP_TIMEOUT_MS}ms`)),
+                      LTP_TIMEOUT_MS
+                    )
+                  ),
+                ]);
+
                 for (const sym of symbols) {
                     const price = ltp?.[`NSE:${sym}`]?.last_price;
                     if (price && price > 0) {
@@ -293,7 +317,8 @@ export class PositionManager {
                     }
                 }
             } catch (err) {
-                log.error({ err: err.message }, 'LTP fetch failed in position manager');
+                log.error({ err: err.message, symbols },
+                  'LTP fetch failed/timed out in position manager — positions skipped this cycle');
                 return result;
             }
         }
@@ -304,7 +329,15 @@ export class PositionManager {
                     .filter(s => result[s])
                     .map(async (sym) => {
                         try {
-                            const candles = await this.engine._fetchCandles(sym, 20);
+                            // C5 FIX: Also apply timeout to candle fetches
+                            const CANDLE_TIMEOUT_MS = 8000;
+                            const candles = await Promise.race([
+                              this.engine._fetchCandles(sym, 20),
+                              new Promise((_, reject) =>
+                                setTimeout(() => reject(new Error('Candle fetch timed out')), CANDLE_TIMEOUT_MS)
+                              ),
+                            ]);
+
                             if (candles?.length >= 15) {
                                 result[sym].closes = candles.map(c => c.close);
                                 result[sym].highs = candles.map(c => c.high);

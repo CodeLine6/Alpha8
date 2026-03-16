@@ -149,9 +149,6 @@ export class BrokerManager {
 
   // ─── Order Operations (Normalized) ──────────────────────────────────────────
 
-  /**
-   * Place an order through the broker abstraction.
-   */
   async placeOrder(params) {
     log.info({ symbol: params.symbol, side: params.side, qty: params.quantity },
       'BrokerManager: placeOrder');
@@ -187,6 +184,28 @@ export class BrokerManager {
         }
         : null
     );
+  }
+
+  /**
+   * Place an emergency order bypassing the circuit breaker.
+   * Does NOT fall back to secondary broker — speed over resilience for exits.
+   */
+  async placeEmergencyOrder(params) {
+    log.warn({ symbol: params.symbol, side: params.side, qty: params.quantity },
+      'BrokerManager: placeEmergencyOrder (circuit bypass)');
+
+    const response = await this.primary.placeEmergencyOrder({
+      exchange: params.exchange || 'NSE',
+      tradingsymbol: params.symbol,
+      transaction_type: params.side,
+      quantity: params.quantity,
+      order_type: params.orderType || 'MARKET',
+      product: params.product || 'MIS',
+      price: params.price,
+      trigger_price: params.triggerPrice,
+    });
+
+    return this._normalizeOrderResponse(response, 'kite', params);
   }
 
   async cancelOrder(orderId) {

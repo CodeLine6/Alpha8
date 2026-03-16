@@ -10,6 +10,10 @@ import { describe, test, expect, beforeEach, jest } from '@jest/globals';
 import { KillSwitch } from '../src/risk/kill-switch.js';
 import { RiskManager } from '../src/risk/risk-manager.js';
 import { calculatePositionSize } from '../src/risk/position-sizer.js';
+import { existsSync, unlinkSync } from 'node:fs';
+import { join } from 'node:path';
+
+const KILL_SWITCH_FILE = join(process.cwd(), '.kill_switch_state');
 
 // ═══════════════════════════════════════════════════════════
 // KILL SWITCH
@@ -20,6 +24,9 @@ describe('KillSwitch', () => {
   let mockRedis;
 
   beforeEach(() => {
+    if (existsSync(KILL_SWITCH_FILE)) {
+      try { unlinkSync(KILL_SWITCH_FILE); } catch (e) { }
+    }
     mockRedis = { stored: null };
     ks = new KillSwitch({
       cacheGet: jest.fn(async () => mockRedis.stored),

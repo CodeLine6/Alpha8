@@ -9,6 +9,12 @@ import { createOrder, transitionOrder, isTerminal } from '../src/engine/order-st
 import { ExecutionEngine } from '../src/engine/execution-engine.js';
 import { KillSwitch } from '../src/risk/kill-switch.js';
 import { RiskManager } from '../src/risk/risk-manager.js';
+import { query } from '../src/lib/db.js';
+
+// ─── Mocks ────────────────────────────────────────────────
+jest.mock('../src/lib/db.js', () => ({
+  query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+}));
 
 // ─── Mock Strategy Helper ─────────────────────────────────
 

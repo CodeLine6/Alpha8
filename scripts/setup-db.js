@@ -176,6 +176,14 @@ const MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS idx_shadow_strategy_accuracy
      ON shadow_signals(strategy, was_correct_30min, created_at DESC);`,
   `ALTER TABLE trades ADD COLUMN IF NOT EXISTS opening_strategies TEXT;`,
+  
+  // S6: add paper_mode to signal_outcomes so weight training can filter
+  `ALTER TABLE signal_outcomes ADD COLUMN IF NOT EXISTS paper_mode BOOLEAN NOT NULL DEFAULT false;`,
+  `CREATE INDEX IF NOT EXISTS idx_signal_outcomes_paper_mode ON signal_outcomes(paper_mode, strategy, recorded_at);`,
+
+  // S6: add paper_mode to shadow_signals for same reason
+  `ALTER TABLE shadow_signals ADD COLUMN IF NOT EXISTS paper_mode BOOLEAN NOT NULL DEFAULT false;`,
+  `CREATE INDEX IF NOT EXISTS idx_shadow_paper_mode ON shadow_signals(paper_mode, strategy, created_at DESC);`,
 
 ];
 

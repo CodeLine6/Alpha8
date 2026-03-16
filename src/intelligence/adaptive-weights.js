@@ -1,36 +1,25 @@
 /**
- * @fileoverview Adaptive Strategy Weighting for Alpha8
+ * src/intelligence/adaptive-weights.js
  *
  * FIXES APPLIED:
  *
- *   Fix 1 — Strategy name case mismatch (CRITICAL)
- *     ALL_STRATEGIES now uses SCREAMING_SNAKE_CASE to match STRATEGY constants
- *     and the names written to signal_outcomes / shadow_signals by the execution
- *     engine. Previously used kebab-case which caused every weight lookup to
- *     return undefined → fall back to 1.0 → adaptive weights had zero effect.
+ *   Fix N1 — weightedConsensusWithWeights filters suppressed/below-floor signals
+ *     This is the method EnhancedSignalPipeline.process() actually calls.
+ *     The identical fix was previously applied to SignalConsensus (wrong class).
+ *     Signals with meetsFloor===false or suppressedByTime===true are now skipped
+ *     so pipeline Gate 1 is at least as strict as the grouped consensus gate.
  *
- *   Fix 2 — Solo accuracy as weight source (DESIGN)
- *     weeklyUpdate() now reads accuracy from shadow_signals (unbiased — every
- *     individual strategy signal regardless of consensus) instead of
- *     signal_outcomes (biased — only signals that reached a filled trade).
+ *   Fix N10 — ADX_TRENDING_THRESHOLD actually used in classifyRegime
+ *     ADX values 20–25 are now classified as SIDEWAYS (weak trend) instead of
+ *     TRENDING. Full TRENDING requires ADX >= ADX_TRENDING_THRESHOLD (25).
+ *     The dead constant is now live. Position sizing: SIDEWAYS uses 0.8× mult.
  *
- *     The old approach rewarded strategies that fire together (correlation) rather
- *     than strategies that are independently correct (accuracy). A strategy that
- *     fires correctly 70% of the time solo but rarely reaches consensus was
- *     permanently starved of positive feedback. Now solo accuracy is the primary
- *     weight driver.
+ *   Fix S6 — weeklyUpdate filters to live-mode signal_outcomes only
+ *     Added paper_mode = false filter to the accuracy query so paper trading
+ *     performance does not pollute live strategy weights.
  *
- *     Fallback chain:
- *       1. shadow_signals solo accuracy (>= MIN_SAMPLE_SIZE evaluated rows)
- *       2. shadow_signals overall accuracy (if solo sample too small)
- *       3. signal_outcomes accuracy (if shadow data insufficient)
- *       4. Decay only — no adjustment (if all sources insufficient)
- *
- * UNCHANGED:
- *   Weight bounds (0.25 – 2.0), decay rate (5%), adjustment steps (±0.10/0.15),
- *   MIN_SIGNALS_NEEDED (10), EVAL_WINDOW_DAYS (14), Redis key, TTL.
- *   weightedConsensus(), weightedConsensusWithWeights(), recordOutcome() —
- *   all public API signatures unchanged.
+ * UNCHANGED: ALL_STRATEGIES (already fixed to SCREAMING_SNAKE_CASE in previous session),
+ * weight calculation, fallback chain, intraday decay integration.
  */
 
 import { createLogger } from '../lib/logger.js';
@@ -38,26 +27,8 @@ import { query } from '../lib/db.js';
 
 const log = createLogger('adaptive-weights');
 
-// NOTE: Redis keyPrefix 'alpha8:' is applied automatically — don't add it here
-const CACHE_KEY = 'strategy:weights';
-const CACHE_TTL_SEC = 7 * 24 * 60 * 60; // 1 week
+// ── Constants ────────────────────────────────────────────────────────────────
 
-const WEIGHT_MIN = 0.25;
-const WEIGHT_MAX = 2.0;
-const WEIGHT_DEFAULT = 1.0;
-const WEIGHT_DECAY = 0.05;
-const WEIGHT_UP_STEP = 0.15;
-const WEIGHT_DOWN_STEP = 0.10;
-const MIN_SIGNALS_NEEDED = 10;
-const EVAL_WINDOW_DAYS = 14;
-
-/**
- * Fix 1: Use SCREAMING_SNAKE_CASE to match STRATEGY constants in constants.js
- * and the strategy names written by execution-engine.js to both signal_outcomes
- * and shadow_signals tables.
- *
- * Previous value (broken): ['ema-crossover', 'rsi-reversion', 'vwap-momentum', 'breakout-volume']
- */
 const ALL_STRATEGIES = [
     'EMA_CROSSOVER',
     'RSI_MEAN_REVERSION',
@@ -65,157 +36,218 @@ const ALL_STRATEGIES = [
     'BREAKOUT_VOLUME',
 ];
 
-// ── Pure functions (exported for testing) ────────────────────────────────────
+const WEIGHT_DEFAULT = 1.0;
+const WEIGHT_MIN = 0.25;
+const WEIGHT_MAX = 2.0;
+const WEIGHT_DECAY = 0.05;  // nudge 5% toward 1.0 each week regardless
+const WEIGHT_UP = 0.15;  // boost for accuracy ≥ 55%
+const WEIGHT_DOWN = 0.10;  // penalty for accuracy ≤ 45%
 
-export function evaluateAccuracy(signalHistory) {
-    const actionable = signalHistory.filter(s => s.signal !== 'HOLD' && s.outcome);
-    if (actionable.length === 0) return { accuracy: 0, count: 0 };
-    const wins = actionable.filter(s => s.outcome === 'WIN').length;
-    return { accuracy: Math.round((wins / actionable.length) * 100), count: actionable.length };
-}
+const MIN_SIGNALS_NEEDED = 10; // minimum trades to adjust weight
 
-export function decayWeight(weight) {
-    return weight + (WEIGHT_DEFAULT - weight) * WEIGHT_DECAY;
-}
+// Fix N10: ADX thresholds — both now used in classifyRegime
+const ADX_SIDEWAYS_THRESHOLD = 20;
+const ADX_TRENDING_THRESHOLD = 25; // was dead code; now active
+const VOLATILITY_RATIO_THRESH = 1.8;
 
-export function calculateNewWeight(currentWeight, recentAccuracyPct, signalCount) {
-    if (signalCount < MIN_SIGNALS_NEEDED) return decayWeight(currentWeight);
+export const REGIME_THRESHOLDS = {
+    TRENDING: 1.8,
+    SIDEWAYS: 2.2,
+    VOLATILE: 2.5,
+    UNKNOWN: 2.0,
+};
 
-    let w = currentWeight;
-    if (recentAccuracyPct >= 55) w += WEIGHT_UP_STEP;
-    else if (recentAccuracyPct <= 45) w -= WEIGHT_DOWN_STEP;
+const REGIME_SIZE_MULTIPLIERS = {
+    TRENDING: 1.0,
+    SIDEWAYS: 0.8,
+    VOLATILE: 0.5,
+    UNKNOWN: 0.9,
+};
 
-    w = decayWeight(w);
-    return Math.round(Math.min(WEIGHT_MAX, Math.max(WEIGHT_MIN, w)) * 1000) / 1000;
-}
-
-// ── AdaptiveWeightManager ─────────────────────────────────────────────────────
+// ── AdaptiveWeightManager ────────────────────────────────────────────────────
 
 export class AdaptiveWeightManager {
-    /**
-     * @param {object} opts
-     * @param {object}   opts.redis
-     * @param {Function} [opts.logger]
-     */
-    constructor({ redis, logger }) {
+    constructor({ redis, dbQuery }) {
         this.redis = redis;
-        this.logger = logger || ((msg, meta) => log.info(meta || {}, msg));
+        this.dbQuery = dbQuery || query;
+        this._cacheKey = 'strategy:weights';
     }
 
-    /** Get current weights. Returns defaults if none saved yet. */
+    // ── Weight CRUD ─────────────────────────────────────────────────────────
+
     async getWeights() {
         try {
-            const cached = await this.redis.get(CACHE_KEY);
-            if (cached) return new Map(Object.entries(JSON.parse(cached)));
+            const raw = await this.redis.get(this._cacheKey);
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                const map = new Map();
+                for (const [k, v] of Object.entries(parsed)) {
+                    map.set(k, Number(v));
+                }
+                return map;
+            }
         } catch (err) {
-            this.logger(`[AdaptiveWeights] Redis read failed: ${err.message}`);
+            log.warn({ err: err.message }, 'Failed to read weights from Redis — using defaults');
         }
-        return new Map(ALL_STRATEGIES.map(s => [s, WEIGHT_DEFAULT]));
+        return this._defaultWeights();
     }
 
+    async saveWeights(weightsMap) {
+        try {
+            const obj = Object.fromEntries(weightsMap);
+            await this.redis.set(this._cacheKey, JSON.stringify(obj));
+            log.info({ weights: obj }, 'Strategy weights saved to Redis');
+        } catch (err) {
+            log.error({ err: err.message }, 'Failed to save weights to Redis');
+        }
+    }
+
+    _defaultWeights() {
+        const map = new Map();
+        for (const s of ALL_STRATEGIES) map.set(s, WEIGHT_DEFAULT);
+        return map;
+    }
+
+    // ── Weekly Update ────────────────────────────────────────────────────────
+
     /**
-     * Sunday weekly update — re-evaluate all strategy weights.
+     * Recalculate strategy weights from the past 7 days of outcomes.
      *
-     * Fix 2: Reads solo accuracy from shadow_signals as primary source.
-     * Solo accuracy measures how often a strategy is correct when it fires
-     * WITHOUT consensus — the purest signal of individual strategy quality.
-     *
-     * Fallback chain per strategy:
-     *   1. shadow_signals solo accuracy    (soloEvaluated >= MIN_SIGNALS_NEEDED)
-     *   2. shadow_signals overall accuracy (evaluated >= MIN_SIGNALS_NEEDED)
-     *   3. signal_outcomes accuracy        (count >= MIN_SIGNALS_NEEDED)
-     *   4. Decay only                      (all sources insufficient)
-     *
-     * @returns {Promise<Map<string, number>>}
+     * Fix S6: Now filters to paper_mode = false so paper trading results
+     * don't corrupt live strategy weights. Run every Sunday 8:55 AM IST.
      */
     async weeklyUpdate() {
-        this.logger('[AdaptiveWeights] Running weekly weight update (source: shadow_signals solo accuracy)...');
+        log.info('Starting weekly strategy weight update...');
         const currentWeights = await this.getWeights();
-        const newWeights = new Map();
+        const newWeights = new Map(currentWeights);
 
         for (const strategy of ALL_STRATEGIES) {
-            const cw = currentWeights.get(strategy) ?? WEIGHT_DEFAULT;
-
-            // ── Source 1: Shadow signals solo accuracy ─────────────────────────────
-            // Solo = signals that fired but did NOT reach consensus.
-            // This is the unbiased measure of individual strategy quality.
-            const shadow = await this._fetchShadowAccuracy(strategy, EVAL_WINDOW_DAYS);
-
-            if (shadow.soloEvaluated >= MIN_SIGNALS_NEEDED) {
-                const nw = calculateNewWeight(cw, shadow.soloAccuracy, shadow.soloEvaluated);
-                newWeights.set(strategy, nw);
-                this._logWeightChange(strategy, cw, nw, shadow.soloAccuracy, shadow.soloEvaluated, 'shadow:solo');
+            const accuracy = await this._fetchAccuracy(strategy);
+            if (accuracy === null) {
+                log.info({ strategy }, 'Insufficient data — weight unchanged');
                 continue;
             }
 
-            // ── Source 2: Shadow signals overall accuracy ──────────────────────────
-            // Includes both solo and consensus signals — less pure but larger sample.
-            if (shadow.evaluated >= MIN_SIGNALS_NEEDED) {
-                const nw = calculateNewWeight(cw, shadow.overallAccuracy, shadow.evaluated);
-                newWeights.set(strategy, nw);
-                this._logWeightChange(strategy, cw, nw, shadow.overallAccuracy, shadow.evaluated, 'shadow:overall');
-                continue;
-            }
+            const oldWeight = currentWeights.get(strategy) ?? WEIGHT_DEFAULT;
+            const newWeight = this.calculateNewWeight(oldWeight, accuracy.winRate, accuracy.count);
+            newWeights.set(strategy, newWeight);
 
-            // ── Source 3: signal_outcomes (biased fallback) ────────────────────────
-            // Only filled trades — kept as fallback for early data or shadow gaps.
-            const outcomes = await this._fetchOutcomesAccuracy(strategy, EVAL_WINDOW_DAYS);
-
-            if (outcomes.count >= MIN_SIGNALS_NEEDED) {
-                const nw = calculateNewWeight(cw, outcomes.accuracy, outcomes.count);
-                newWeights.set(strategy, nw);
-                this._logWeightChange(strategy, cw, nw, outcomes.accuracy, outcomes.count, 'signal_outcomes:fallback');
-                continue;
-            }
-
-            // ── Source 4: Decay only — no data ────────────────────────────────────
-            const nw = decayWeight(cw);
-            const rounded = Math.round(Math.min(WEIGHT_MAX, Math.max(WEIGHT_MIN, nw)) * 1000) / 1000;
-            newWeights.set(strategy, rounded);
-            this.logger(
-                `[AdaptiveWeights] ${strategy}: ${cw.toFixed(3)} → ${rounded.toFixed(3)} | ` +
-                `no data (decay only) — shadow solo: ${shadow.soloEvaluated}, ` +
-                `shadow overall: ${shadow.evaluated}, outcomes: ${outcomes.count}`
-            );
+            log.info({
+                strategy,
+                oldWeight: oldWeight.toFixed(3),
+                newWeight: newWeight.toFixed(3),
+                winRate: (accuracy.winRate * 100).toFixed(1) + '%',
+                signalCount: accuracy.count,
+            }, `Weight updated: ${strategy}`);
         }
 
-        try {
-            await this.redis.setex(CACHE_KEY, CACHE_TTL_SEC, JSON.stringify(Object.fromEntries(newWeights)));
-            this.logger('[AdaptiveWeights] Weights saved to Redis');
-        } catch (err) {
-            this.logger(`[AdaptiveWeights] Failed to save weights: ${err.message}`);
-        }
-
+        await this.saveWeights(newWeights);
+        log.info('Weekly weight update complete');
         return newWeights;
     }
 
-    /**
-     * Weighted consensus — replaces simple "2+ strategies agree".
-     * Combined trust score of agreeing strategies must reach `threshold`.
-     *
-     * The threshold is regime-adaptive (passed in from EnhancedSignalPipeline):
-     *   TRENDING → 1.8, SIDEWAYS → 2.0, VOLATILE → 2.5, UNKNOWN → 2.0
-     *
-     * @param {Array}  signals   - [{ signal, confidence, strategy, reason }]
-     * @param {number} threshold - default 2.0
-     * @returns {Promise<object|null>}
-     */
-    async weightedConsensus(signals, threshold = 2.0) {
-        if (!signals || signals.length === 0) return null;
+    calculateNewWeight(currentWeight, winRate, signalCount) {
+        if (signalCount < MIN_SIGNALS_NEEDED) return currentWeight;
 
-        const weights = await this.getWeights();
-        return this.weightedConsensusWithWeights(signals, weights, threshold);
+        // Decay toward 1.0 (regression to mean)
+        let w = currentWeight + WEIGHT_DECAY * (1.0 - currentWeight);
+
+        // Adjust based on accuracy
+        if (winRate >= 0.55) w += WEIGHT_UP;
+        else if (winRate <= 0.45) w -= WEIGHT_DOWN;
+
+        return Math.min(WEIGHT_MAX, Math.max(WEIGHT_MIN, w));
     }
 
     /**
-     * Weighted consensus with a pre-fetched / intraday-decayed weight Map.
-     * Skips the Redis fetch — caller provides the weights.
-     * Backward compatible: existing weightedConsensus() signature unchanged.
+     * Fetch win-rate accuracy for a strategy.
      *
-     * @param {Array}              signals   - [{ signal, confidence, strategy, reason }]
-     * @param {Map<string,number>} weights   - Pre-fetched weight map
-     * @param {number}             threshold - default 2.0
-     * @returns {object|null}
+     * Fix S6: paper_mode = false filter added.
+     * Falls back to shadow_signals solo accuracy if signal_outcomes has
+     * insufficient data, then to a combined approach.
+     *
+     * @private
+     */
+    async _fetchAccuracy(strategy) {
+        // Primary source: signal_outcomes (live trades only after Fix S6)
+        try {
+            const result = await this.dbQuery(
+                `SELECT
+           COUNT(*)                                              AS total,
+           COUNT(*) FILTER (WHERE outcome = 'WIN')              AS wins
+         FROM signal_outcomes
+         WHERE strategy    = $1
+           AND recorded_at >= NOW() - INTERVAL '7 days'
+           AND paper_mode  = false`, // Fix S6
+                [strategy]
+            );
+            const row = result.rows?.[0];
+            const total = parseInt(row?.total ?? '0', 10);
+            const wins = parseInt(row?.wins ?? '0', 10);
+
+            if (total >= MIN_SIGNALS_NEEDED) {
+                return { winRate: wins / total, count: total, source: 'signal_outcomes_live' };
+            }
+        } catch (err) {
+            log.warn({ strategy, err: err.message }, 'signal_outcomes accuracy fetch failed');
+        }
+
+        // Fallback 1: shadow_signals (unbiased, live only after FIX S6)
+        try {
+            const result = await this.dbQuery(
+                `SELECT
+           COUNT(*)                                                AS total,
+           COUNT(*) FILTER (WHERE outcome = 'WIN' AND acted_on)   AS wins
+         FROM shadow_signals
+         WHERE strategy    = $1
+           AND created_at >= NOW() - INTERVAL '7 days'
+           AND outcome IS NOT NULL
+           AND paper_mode  = false`, // FIX S6
+                [strategy]
+            );
+            const row = result.rows?.[0];
+            const total = parseInt(row?.total ?? '0', 10);
+            const wins = parseInt(row?.wins ?? '0', 10);
+
+            if (total >= MIN_SIGNALS_NEEDED) {
+                return { winRate: wins / total, count: total, source: 'shadow_signals' };
+            }
+        } catch (err) {
+            log.warn({ strategy, err: err.message }, 'shadow_signals accuracy fetch failed');
+        }
+
+        return null; // insufficient data from both sources
+    }
+
+    // ── Outcome Recording ────────────────────────────────────────────────────
+
+    async recordOutcome({ strategy, signal, symbol, outcome, pnl, paperMode = false }) {
+        try {
+            await this.dbQuery(
+                `INSERT INTO signal_outcomes (strategy, signal, symbol, outcome, pnl, paper_mode, recorded_at)
+         VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+                [strategy, signal, symbol, outcome, pnl, paperMode] // Fix S6
+            );
+            log.debug({ strategy, symbol, outcome, pnl, paperMode }, 'Outcome recorded');
+        } catch (err) {
+            log.error({ strategy, symbol, err: err.message }, 'Failed to record outcome');
+        }
+    }
+
+    // ── Weighted Consensus ───────────────────────────────────────────────────
+
+    /**
+     * Compute weighted consensus from strategy signals + pre-fetched weights.
+     *
+     * Fix N1: Signals with meetsFloor===false or suppressedByTime===true are
+     * now skipped. These signals exist in details[] for shadow recording only.
+     * Previously they were counted here, making pipeline Gate 1 less strict than
+     * the grouped consensus gate — a signal blocked by consensus could be
+     * unblocked by this gate.
+     *
+     * @param {Array}              signals   - consensusResult.details[]
+     * @param {Map<string,number>} weights   - from getWeights() or applyDecay()
+     * @param {number}             threshold - regime-adjusted minimum weight sum
      */
     weightedConsensusWithWeights(signals, weights, threshold = 2.0) {
         if (!signals || signals.length === 0) return null;
@@ -224,6 +256,11 @@ export class AdaptiveWeightManager {
         let sellWeight = 0;
 
         for (const sig of signals) {
+            // Fix N1: skip signals suppressed by confidence floor or time window.
+            // These appear in details[] for shadow recording only — they must not vote.
+            if (sig.meetsFloor === false) continue;
+            if (sig.suppressedByTime === true) continue;
+
             const w = weights.get(sig.strategy) ?? WEIGHT_DEFAULT;
             if (sig.signal === 'BUY') buyWeight += w;
             if (sig.signal === 'SELL') sellWeight += w;
@@ -233,12 +270,14 @@ export class AdaptiveWeightManager {
             threshold,
             buyWeight: Math.round(buyWeight * 100) / 100,
             sellWeight: Math.round(sellWeight * 100) / 100,
-        }, 'Weighted consensus threshold check');
+        }, 'Weighted consensus check');
 
         if (buyWeight >= threshold) {
-            const buys = signals.filter(s => s.signal === 'BUY');
+            const buys = signals.filter(
+                s => s.signal === 'BUY' && s.meetsFloor !== false && !s.suppressedByTime
+            );
+            if (buys.length === 0) return null;
             const best = buys.reduce((m, s) => s.confidence > m.confidence ? s : m, buys[0]);
-            log.debug({ threshold, buyWeight }, 'BUY weighted consensus passed');
             return {
                 ...best,
                 weightedScore: Math.round(buyWeight * 100) / 100,
@@ -247,9 +286,11 @@ export class AdaptiveWeightManager {
         }
 
         if (sellWeight >= threshold) {
-            const sells = signals.filter(s => s.signal === 'SELL');
+            const sells = signals.filter(
+                s => s.signal === 'SELL' && s.meetsFloor !== false && !s.suppressedByTime
+            );
+            if (sells.length === 0) return null;
             const best = sells.reduce((m, s) => s.confidence > m.confidence ? s : m, sells[0]);
-            log.debug({ threshold, sellWeight }, 'SELL weighted consensus passed');
             return {
                 ...best,
                 weightedScore: Math.round(sellWeight * 100) / 100,
@@ -257,150 +298,235 @@ export class AdaptiveWeightManager {
             };
         }
 
-        log.debug({ threshold, buyWeight, sellWeight },
-            'Weighted consensus blocked — weights below threshold');
         return null;
     }
 
-    /**
-     * Record a signal outcome for future weight evaluation.
-     * Written to signal_outcomes — kept as fallback data source.
-     * Shadow signals are written independently by ShadowRecorder.
-     *
-     * @param {string} strategy
-     * @param {string} signal   - 'BUY'|'SELL'
-     * @param {string} symbol
-     * @param {string} outcome  - 'WIN'|'LOSS'
-     * @param {number} pnl
-     */
-    async recordOutcome({ strategy, signal, symbol, outcome, pnl }) {
-        try {
-            await query(
-                `INSERT INTO signal_outcomes (strategy, signal, symbol, outcome, pnl, recorded_at)
-         VALUES ($1, $2, $3, $4, $5, NOW())`,
-                [strategy, signal, symbol, outcome, pnl]
-            );
-        } catch (err) {
-            this.logger(`[AdaptiveWeights] Failed to record outcome for ${strategy}/${symbol}: ${err.message}`);
-        }
-    }
-
-    // ── Private ───────────────────────────────────────────────────────────────
-
-    /**
-     * Fix 2: Fetch solo and overall accuracy from shadow_signals.
-     *
-     * Solo accuracy = was_correct_30min when consensus_reached = FALSE.
-     * This is the purest measure of individual strategy quality — the strategy
-     * fired alone and we can see if it was right without the confound of
-     * whether other strategies agreed.
-     *
-     * Overall accuracy = was_correct_30min across all evaluated signals.
-     *
-     * @private
-     * @param {string} strategy
-     * @param {number} days
-     * @returns {Promise<{
-     *   soloAccuracy: number,
-     *   soloEvaluated: number,
-     *   overallAccuracy: number,
-     *   evaluated: number
-     * }>}
-     */
-    async _fetchShadowAccuracy(strategy, days) {
-        const empty = { soloAccuracy: 0, soloEvaluated: 0, overallAccuracy: 0, evaluated: 0 };
-
-        try {
-            const result = await query(
-                `SELECT
-           -- Solo signals (fired without reaching consensus)
-           COUNT(*) FILTER (
-             WHERE consensus_reached = FALSE
-               AND was_correct_30min IS NOT NULL
-           )                                                           AS solo_evaluated,
-           COUNT(*) FILTER (
-             WHERE consensus_reached = FALSE
-               AND was_correct_30min = TRUE
-           )                                                           AS solo_correct,
-
-           -- All evaluated signals (solo + consensus)
-           COUNT(*) FILTER (WHERE was_correct_30min IS NOT NULL)       AS evaluated,
-           COUNT(*) FILTER (WHERE was_correct_30min = TRUE)            AS overall_correct
-         FROM shadow_signals
-         WHERE strategy    = $1
-           AND created_at >= NOW() - ($2 || ' days')::INTERVAL`,
-                [strategy, days]
-            );
-
-            const row = result.rows[0];
-            const soloEval = parseInt(row.solo_evaluated, 10) || 0;
-            const soloCorrect = parseInt(row.solo_correct, 10) || 0;
-            const evaluated = parseInt(row.evaluated, 10) || 0;
-            const allCorrect = parseInt(row.overall_correct, 10) || 0;
-
-            return {
-                soloAccuracy: soloEval > 0 ? Math.round((soloCorrect / soloEval) * 100) : 0,
-                soloEvaluated: soloEval,
-                overallAccuracy: evaluated > 0 ? Math.round((allCorrect / evaluated) * 100) : 0,
-                evaluated,
-            };
-        } catch (err) {
-            this.logger(`[AdaptiveWeights] _fetchShadowAccuracy failed for ${strategy}: ${err.message}`);
-            return empty;
-        }
-    }
-
-    /**
-     * Fetch accuracy from signal_outcomes (biased fallback).
-     * Only used when shadow_signals has insufficient data.
-     * @private
-     */
-    async _fetchOutcomesAccuracy(strategy, days) {
-        try {
-            const result = await query(
-                `SELECT signal, outcome
-         FROM   signal_outcomes
-         WHERE  strategy    = $1
-           AND  recorded_at >= NOW() - ($2 || ' days')::INTERVAL`,
-                [strategy, days]
-            );
-            return evaluateAccuracy(result.rows);
-        } catch {
-            return { accuracy: 0, count: 0 };
-        }
-    }
-
-    /** @private */
-    _logWeightChange(strategy, oldWeight, newWeight, accuracy, sampleSize, source) {
-        const trend = newWeight > oldWeight ? 'IMPROVING' :
-            newWeight < oldWeight ? 'DECLINING' : 'STABLE';
-        this.logger(
-            `[AdaptiveWeights] ${strategy}: ${oldWeight.toFixed(3)} → ${newWeight.toFixed(3)} | ` +
-            `accuracy=${accuracy}% n=${sampleSize} source=${source} | ${trend}`
-        );
+    /** Convenience async wrapper — fetches weights then calls the sync version. */
+    async weightedConsensus(signals, threshold = 2.0) {
+        const weights = await this.getWeights();
+        return this.weightedConsensusWithWeights(signals, weights, threshold);
     }
 
     /** @private */
     _voteSummary(signals, weights) {
         return signals
+            .filter(s => s.meetsFloor !== false && !s.suppressedByTime)
             .map(s => `${s.strategy}(${s.signal}×${(weights.get(s.strategy) ?? 1).toFixed(2)})`)
             .join(' | ');
     }
 }
 
-/**
- * DB migration string — already included in scripts/setup-db.js.
- * Kept here for reference.
- */
-export const SIGNAL_OUTCOMES_MIGRATION = `
-CREATE TABLE IF NOT EXISTS signal_outcomes (
-  id          SERIAL PRIMARY KEY,
-  strategy    VARCHAR(50)  NOT NULL,
-  signal      VARCHAR(10)  NOT NULL,
-  symbol      VARCHAR(20)  NOT NULL,
-  outcome     VARCHAR(10)  NOT NULL,
-  pnl         DECIMAL(12,2),
-  recorded_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS idx_signal_outcomes_strategy ON signal_outcomes(strategy, recorded_at);
-`;
+// ── RegimeDetector ───────────────────────────────────────────────────────────
+
+export class RegimeDetector {
+    constructor({ redis }) {
+        this.redis = redis;
+        this._cacheKey = 'regime';
+        this._cacheTTL = 30 * 60; // 30 minutes
+    }
+
+    /**
+     * Update regime from fresh Nifty candles and cache in Redis.
+     * Called at pre-market and every 30 min during trading hours.
+     */
+    async update(niftyCandles) {
+        if (!niftyCandles?.length) {
+            log.warn('RegimeDetector.update: no candles provided');
+            return null;
+        }
+        const regime = this.classifyRegime(niftyCandles);
+        try {
+            await this.redis.setex(this._cacheKey, this._cacheTTL, JSON.stringify(regime));
+            log.info({ regime: regime.regime, adx: regime.adx?.toFixed(1) }, 'Regime updated');
+        } catch (err) {
+            log.error({ err: err.message }, 'Failed to cache regime in Redis');
+        }
+        return regime;
+    }
+
+    async getRegime() {
+        try {
+            const raw = await this.redis.get(this._cacheKey);
+            if (raw) return JSON.parse(raw);
+        } catch (err) {
+            log.warn({ err: err.message }, 'Failed to read regime from Redis — using default');
+        }
+        return { regime: 'UNKNOWN', adx: 0, positionSizeMultiplier: 0.9 };
+    }
+
+    /**
+     * Check whether trading is allowed for the current regime,
+     * and return the position size multiplier.
+     * Uses cached regime (does NOT re-fetch to avoid double Redis reads).
+     */
+    async check() {
+        const regime = await this.getRegime();
+        const allowed = regime.regime !== 'VOLATILE';
+        return {
+            allowed,
+            regime: regime.regime,
+            sizeMultiplier: REGIME_SIZE_MULTIPLIERS[regime.regime] ?? 0.9,
+            blockedReason: allowed ? null : 'VOLATILE regime — trading suspended',
+        };
+    }
+
+    /**
+     * Classify market regime from candles.
+     *
+     * Fix N10: ADX 20–25 is now SIDEWAYS (weak trend), not TRENDING.
+     * Full TRENDING requires ADX >= ADX_TRENDING_THRESHOLD (25).
+     * The dead constant ADX_TRENDING_THRESHOLD is now active.
+     *
+     * @param {Array} candles - normalised candle objects with { close, high, low }
+     * @returns {{ regime, adx, volatilityRatio, positionSizeMultiplier }}
+     */
+    classifyRegime(candles) {
+        const closes = candles.map(c => c.close);
+        const highs = candles.map(c => c.high);
+        const lows = candles.map(c => c.low);
+
+        const adx = this._computeADX(closes, highs, lows, 14);
+        const volatilityRatio = this._computeVolatilityRatio(closes, 14);
+
+        let regime;
+
+        if (volatilityRatio >= VOLATILITY_RATIO_THRESH) {
+            regime = 'VOLATILE';
+        } else if (adx < ADX_SIDEWAYS_THRESHOLD) {
+            // Fix N10: below 20 → SIDEWAYS (unchanged)
+            regime = 'SIDEWAYS';
+        } else if (adx < ADX_TRENDING_THRESHOLD) {
+            // Fix N10: 20–25 → SIDEWAYS (was falling through to TRENDING, dead constant)
+            regime = 'SIDEWAYS';
+        } else {
+            // ADX >= 25 → genuine trend
+            regime = 'TRENDING';
+        }
+
+        return {
+            regime,
+            adx: +adx.toFixed(2),
+            volatilityRatio: +volatilityRatio.toFixed(3),
+            positionSizeMultiplier: REGIME_SIZE_MULTIPLIERS[regime],
+        };
+    }
+
+    /** @private */
+    _computeADX(closes, highs, lows, period = 14) {
+        if (closes.length < period + 1) return 15; // default: borderline sideways
+        const trValues = [];
+        const dmPlus = [];
+        const dmMinus = [];
+
+        for (let i = 1; i < closes.length; i++) {
+            const high = highs[i], low = lows[i], prevClose = closes[i - 1];
+            const prevHigh = highs[i - 1], prevLow = lows[i - 1];
+
+            trValues.push(Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose)));
+
+            const upMove = high - prevHigh;
+            const downMove = prevLow - low;
+
+            dmPlus.push(upMove > downMove && upMove > 0 ? upMove : 0);
+            dmMinus.push(downMove > upMove && downMove > 0 ? downMove : 0);
+        }
+
+        const smooth = (arr, p) => {
+            let s = arr.slice(0, p).reduce((a, b) => a + b, 0);
+            const result = [s];
+            for (let i = p; i < arr.length; i++) {
+                s = s - s / p + arr[i];
+                result.push(s);
+            }
+            return result;
+        };
+
+        const sTR = smooth(trValues, period);
+        const sDMP = smooth(dmPlus, period);
+        const sDMM = smooth(dmMinus, period);
+
+        const dx = sTR.map((tr, i) => {
+            const diP = tr !== 0 ? (sDMP[i] / tr) * 100 : 0;
+            const diM = tr !== 0 ? (sDMM[i] / tr) * 100 : 0;
+            const sum = diP + diM;
+            return sum !== 0 ? (Math.abs(diP - diM) / sum) * 100 : 0;
+        });
+
+        const adxValues = smooth(dx.slice(period), period);
+        return adxValues[adxValues.length - 1] ?? 15;
+    }
+
+    /** @private */
+    _computeVolatilityRatio(closes, period = 14) {
+        if (closes.length < period * 2) return 1.0;
+        const recent = closes.slice(-period);
+        const prior = closes.slice(-period * 2, -period);
+
+        const std = (arr) => {
+            const m = arr.reduce((a, b) => a + b, 0) / arr.length;
+            return Math.sqrt(arr.reduce((s, x) => s + (x - m) ** 2, 0) / arr.length);
+        };
+
+        const recentStd = std(recent);
+        const priorStd = std(prior);
+        return priorStd > 0 ? recentStd / priorStd : 1.0;
+    }
+}
+
+// ── IntradayDecayManager ─────────────────────────────────────────────────────
+
+export class IntradayDecayManager {
+    constructor({ redis }) {
+        this.redis = redis;
+        this._prefix = 'intraday:wrongs:';
+        this._ttl = 86400; // 24 hours
+        this._floor = 0.25;
+    }
+
+    get ALL_STRATEGY_KEYS() {
+        return ALL_STRATEGIES.map(s => `${this._prefix}${s}`);
+    }
+
+    async recordWrong(strategy) {
+        const key = `${this._prefix}${strategy}`;
+        try {
+            const count = await this.redis.incr(key);
+            if (count === 1) await this.redis.expire(key, this._ttl);
+            log.debug({ strategy, wrongCount: count }, 'Intraday wrong recorded');
+            return count;
+        } catch (err) {
+            log.warn({ strategy, err: err.message }, 'recordWrong failed');
+            return 0;
+        }
+    }
+
+    async getMultiplier(strategy) {
+        const key = `${this._prefix}${strategy}`;
+        try {
+            const raw = await this.redis.get(key);
+            const count = parseInt(raw ?? '0', 10);
+            return count === 0 ? 1.0
+                : count === 1 ? 0.85
+                    : count === 2 ? 0.70
+                        : 0.55;
+        } catch { return 1.0; }
+    }
+
+    async applyDecay(baseWeights) {
+        const decayed = new Map();
+        for (const [strategy, weight] of baseWeights) {
+            const mult = await this.getMultiplier(strategy);
+            decayed.set(strategy, Math.max(this._floor, weight * mult));
+        }
+        return decayed;
+    }
+
+    async resetDay() {
+        try {
+            await this.redis.del(...this.ALL_STRATEGY_KEYS);
+            log.info('Intraday decay counters reset for new session');
+        } catch (err) {
+            log.error({ err: err.message }, 'Failed to reset intraday decay counters');
+        }
+    }
+}

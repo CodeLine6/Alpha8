@@ -51,37 +51,48 @@ export function calculatePositionSize({
     };
   }
 
-  // ─── Kelly Criterion ──────────────────────────────────
   let kellyPct = 0;
   const reasons = [];
 
   if (winRate > 0 && winRate < 1 && avgWin > 0 && avgLoss > 0) {
-    // Kelly requires dimensionless return fractions, not absolute rupee amounts
-    const avgWinFrac = avgWin / capital;
-    const avgLossFrac = avgLoss / capital;
+    // S1 FIX: guard against division by zero and NaN propagation.
+    if (!Number.isFinite(avgWin) || !Number.isFinite(avgLoss) ||
+        avgWin <= 0 || avgLoss <= 0) {
+      kellyPct = maxRiskPct / 100;
+      reasons.push(`Invalid win/loss inputs (avgWin=${avgWin}, avgLoss=${avgLoss}) — using fixed ${maxRiskPct}% risk`);
+    } else {
+      const avgWinFrac = avgWin / capital;
+      const avgLossFrac = avgLoss / capital;
+      const b = avgWinFrac / avgLossFrac; // Odds ratio (risk-reward)
+      const p = winRate;
+      const q = 1 - p;
 
-    const b = avgWinFrac / avgLossFrac; // Odds ratio (risk-reward)
-    const p = winRate;
-    const q = 1 - p;
+      const fullKelly = ((b * p) - q) / b;
 
-    const fullKelly = ((b * p) - q) / b;
-    kellyPct = fullKelly * kellyFraction; // Half Kelly for safety
+      // S1 FIX: explicit NaN/Infinity guard after Kelly formula
+      if (!Number.isFinite(fullKelly)) {
+        kellyPct = maxRiskPct / 100;
+        reasons.push(`Kelly produced non-finite result (${fullKelly}) — using fixed ${maxRiskPct}% risk`);
+      } else {
+        kellyPct = fullKelly * kellyFraction; // Half Kelly for safety
+        reasons.push(
+          `Kelly: b=${b.toFixed(2)}, p=${p.toFixed(2)}, f*=${fullKelly.toFixed(4)}, ` +
+          `${kellyFraction}×Kelly=${kellyPct.toFixed(4)}`
+        );
 
-    reasons.push(
-      `Kelly: b=${b.toFixed(2)}, p=${p.toFixed(2)}, f*=${fullKelly.toFixed(4)}, ` +
-      `${kellyFraction}×Kelly=${kellyPct.toFixed(4)}`
-    );
-
-    // Kelly can go negative (meaning don't trade)
-    if (kellyPct <= 0) {
-      log.info({ kellyPct, winRate, avgWin, avgLoss }, 'Kelly suggests no trade');
-      return {
-        quantity: 0,
-        riskAmount: 0,
-        kellyPct: +(kellyPct * 100).toFixed(2),
-        positionValue: 0,
-        reasoning: `Kelly negative (${(kellyPct * 100).toFixed(2)}%) — edge is insufficient`,
-      };
+        // Kelly can go negative (meaning don't trade)
+        if (kellyPct <= 0) {
+          log.info({ kellyPct, winRate, avgWin, avgLoss }, 'Kelly suggests no trade — negative or zero edge');
+          return {
+            quantity: 0,
+            riskAmount: 0,
+            kellyPct: +(kellyPct * 100).toFixed(2),
+            positionValue: 0,
+            kellyNegative: true, // L2 FIX: explicit flag for callers
+            reasoning: `Kelly negative (${(kellyPct * 100).toFixed(2)}%) — edge is insufficient. Do not override with minimum quantity.`,
+          };
+        }
+      }
     }
   } else {
     // No historical data — fall back to fixed fractional

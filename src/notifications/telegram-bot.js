@@ -127,16 +127,35 @@ export class TelegramBot {
     if (!this.enabled || this._isPolling) return;
     this._isPolling = true;
 
-    try {
-      // Discard previous messages by requesting the latest update without processing it
+    // N6 FIX: Discard the backlog with one retry. If both attempts fail,
+    // do NOT start polling — replaying /reset_kill_switch is more dangerous
+    // than missing new commands. The operator can restart to pick up commands.
+    const discardBacklog = async () => {
       const url = `https://api.telegram.org/bot${this.token}/getUpdates`;
-      const response = await axios.get(url, { params: { timeout: 0 }, timeout: 5000 });
+      const response = await axios.get(url, { params: { timeout: 0 }, timeout: 8000 });
       if (response.data?.ok && response.data.result.length > 0) {
-        const updates = response.data.result;
-        this._lastUpdateId = updates[updates.length - 1].update_id;
+        this._lastUpdateId = response.data.result.at(-1).update_id;
+        log.info({ discardedUpTo: this._lastUpdateId }, 'Telegram backlog discarded');
       }
-    } catch (err) {
-      log.debug('Initial getUpdates failed to discard backlog (normal if no internet)');
+    };
+
+    try {
+      await discardBacklog();
+    } catch (firstErr) {
+      log.warn({ err: firstErr.message }, 'Telegram backlog discard failed — retrying once');
+      try {
+        await new Promise(r => setTimeout(r, 3000));
+        await discardBacklog();
+      } catch (retryErr) {
+        log.error(
+          { err: retryErr.message },
+          'Could not discard Telegram backlog after retry. ' +
+          'Polling will NOT start to prevent command replay (e.g. /reset_kill_switch). ' +
+          'Restart the process once network is stable.'
+        );
+        this._isPolling = false;
+        return; // explicitly do not start polling
+      }
     }
 
     log.info('Telegram polling started');

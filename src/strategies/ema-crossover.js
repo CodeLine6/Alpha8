@@ -61,6 +61,14 @@ export class EMACrossoverStrategy extends BaseStrategy {
       this.fastPeriod = await this._getLiveSetting('EMA_FAST_PERIOD', this._baseFastPeriod);
       this.slowPeriod = await this._getLiveSetting('EMA_SLOW_PERIOD', this._baseSlowPeriod);
 
+      // N7 FIX: prevent inverted periods. fast >= slow produces permanent HOLD
+      // (equal periods) or mirrored signals (fast > slow) with no warning.
+      if (this.fastPeriod >= this.slowPeriod) {
+        log.warn({ fastPeriod: this.fastPeriod, slowPeriod: this.slowPeriod },
+          'EMA fastPeriod must be < slowPeriod — clamping fast to slow - 1. Fix via /set EMA_FAST_PERIOD.');
+        this.fastPeriod = this.slowPeriod - 1;
+      }
+
       // minCandles must always be >= slowPeriod + 5 to have enough data
       const baseMinCandles = Math.max(this.slowPeriod + 5, 25);
       this.minCandles = await this._getLiveSetting('EMA_MIN_CANDLES', baseMinCandles);

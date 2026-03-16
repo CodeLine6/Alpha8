@@ -264,18 +264,7 @@ export class ExecutionEngine {
       this._pendingSignalIds.set(symbol, consensusSignalId);
     }
 
-    if (consensusResult.signal === 'HOLD') {
-      if (consensusResult.isConflicted && this.telegram && this.redis) {
-        this._alertConflict(symbol, consensusResult).catch(() => { });
-      }
-      if (this.shadowRecorder && (consensusResult.details?.length ?? 0) > 0) {
-        this.shadowRecorder.recordSignals(
-          symbol, consensusResult.details, consensusResult, false, currentPrice, null
-        ).catch(err => log.warn({ symbol, err: err.message }, 'Shadow signal (HOLD) recording failed'));
-      }
-      return { action: 'HOLD', order: null, consensus: consensusResult };
-    }
-
+    // N3 FIX: fetch regime BEFORE the HOLD check so shadow signals always have regime metadata.
     let regime = null;
     if (this.pipeline?.regimeDetector) {
       try {
@@ -285,6 +274,20 @@ export class ExecutionEngine {
         log.warn({ symbol, err: err.message }, 'Could not fetch regime — using default threshold');
       }
     }
+
+    if (consensusResult.signal === 'HOLD') {
+      if (consensusResult.isConflicted && this.telegram && this.redis) {
+        this._alertConflict(symbol, consensusResult).catch(() => { });
+      }
+      if (this.shadowRecorder && (consensusResult.details?.length ?? 0) > 0) {
+        this.shadowRecorder.recordSignals(
+          symbol, consensusResult.details, consensusResult, false, currentPrice, regime, this.paperMode
+        ).catch(err => log.warn({ symbol, err: err.message }, 'Shadow signal (HOLD) recording failed'));
+      }
+      return { action: 'HOLD', order: null, consensus: consensusResult };
+    }
+
+
 
     let finalSignal = consensusResult;
     let adjustedQty = quantity;
@@ -356,6 +359,7 @@ export class ExecutionEngine {
         acted,
         currentPrice,
         regime,
+        this.paperMode, // S6 FIX: pass paperMode
       ).catch(err => log.warn({ symbol, err: err.message }, 'Shadow signal recording failed'));
     }
 
@@ -392,6 +396,7 @@ export class ExecutionEngine {
       if (this.pipeline.adaptiveWeights) {
         await this.pipeline.adaptiveWeights.recordOutcome({
           strategy, signal: 'BUY', symbol, outcome, pnl,
+          paperMode: this.paperMode, // S6 FIX: pass paper mode flag
         });
       }
     }
@@ -453,7 +458,7 @@ export class ExecutionEngine {
     try {
       const result = this.paperMode
         ? await this._paperPlaceOrder(order)
-        : await this._livePlaceOrder(order);
+        : await this._livePlaceOrder(order, { emergency: true }); // C3 FIX: bypass circuit breaker
 
       transitionOrder(order, ORDER_STATE.PLACED, { brokerId: result.orderId });
       transitionOrder(order, ORDER_STATE.FILLED);
@@ -683,23 +688,21 @@ export class ExecutionEngine {
             ).catch(() => { });
           }
 
-        } else if (order.side === 'SELL') {
+        }
+        else if (order.side === 'SELL') {
           const posCtx = this._filledPositions.get(order.symbol);
           if (posCtx) {
             const pnl = (order.price - posCtx.price) * posCtx.quantity;
             order.pnl = pnl;
 
-            log.info({
-              symbol: order.symbol,
-              entryPrice: posCtx.price,
-              sellPrice: order.price,
-              quantity: posCtx.quantity,
-              pnl,
-            }, 'SELL filled — recording position outcome');
+            // FIX N2: signal-driven SELL now updates daily P&L and kill switch.
+            // Previously only forceExit() called recordTradePnL(), meaning signal-driven
+            // exits were invisible to the risk manager — daily loss limit and kill switch
+            // drawdown threshold could never trigger from a strategy-driven SELL.
+            await this.riskManager.recordTradePnL(pnl, order.symbol);
 
             this.recordPositionOutcome(order.symbol, pnl).catch((err) =>
-              log.warn({ symbol: order.symbol, err: err.message },
-                'Position outcome recording failed')
+              log.warn({ symbol: order.symbol, err: err.message }, 'Position outcome recording failed')
             );
 
             this._filledPositions.delete(order.symbol);
@@ -783,10 +786,14 @@ export class ExecutionEngine {
   }
 
   /** @private */
-  async _livePlaceOrder(order) {
+  async _livePlaceOrder(order, { emergency = false } = {}) {
     if (!this.broker) throw new Error('Live trading requires a broker instance');
 
-    const response = await this.broker.placeOrder({
+    const placeFn = emergency
+      ? (params) => this.broker.placeEmergencyOrder(params) // C3 FIX: bypass circuit breaker
+      : (params) => this.broker.placeOrder(params);
+
+    const response = await placeFn({
       symbol: order.symbol,
       exchange: order.exchange,
       side: order.side,
@@ -796,6 +803,19 @@ export class ExecutionEngine {
       product: order.product,
     });
 
+    // M6 FIX: handle null orderId safely
+    const brokerOrderId = response?.order_id || response?.orderId || response?.orderid || null;
+    if (!brokerOrderId) {
+      log.error({
+        localOrderId: order.id,
+        symbol: order.symbol,
+        side: order.side,
+        rawResponse: JSON.stringify(response).slice(0, 200),
+      }, 'M6: Broker returned no order ID — cannot confirm fill or fetch price. ' +
+      'Position tracked at scan-time price. Manual reconciliation required.');
+      return { orderId: null };
+    }
+
     // Capture scan-time price before overwriting for logging
     const scanTimePrice = order.price;
     const maxAttempts = 4;
@@ -803,18 +823,17 @@ export class ExecutionEngine {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        const history = await this.broker.getOrderHistory(response.order_id);
+        const history = await this.broker.getOrderHistory(brokerOrderId);
         const fetchedPrice = history?.average_price
           || (Array.isArray(history) ? history[history.length - 1]?.average_price : null)
           || null;
 
         if (fetchedPrice && fetchedPrice > 0) {
           fillPrice = fetchedPrice;
-          // Fix 26 (logging): capture scanTimePrice before overwriting
           log.info({
-            orderId: response.order_id,
+            orderId: brokerOrderId,
             fillPrice,
-            scanPrice: scanTimePrice,  // correctly shows original scan-time price
+            scanPrice: scanTimePrice,
             attempts: attempt,
           }, 'Fill price fetched — overwriting scan-time price');
           order.price = fillPrice;
@@ -829,13 +848,13 @@ export class ExecutionEngine {
 
     if (!fillPrice) {
       log.warn({
-        orderId: response.order_id,
+        orderId: brokerOrderId,
         attempts: maxAttempts,
         fallback: 'scan-time price',
       }, 'Could not fetch fill price — using scan-time price');
     }
 
-    return { orderId: response.order_id };
+    return { orderId: brokerOrderId };
   }
 
   // ═══════════════════════════════════════════════════════
@@ -912,7 +931,16 @@ export class ExecutionEngine {
         if (posDateIST === todayIST && !brokerSymbols.has(symbol)) {
           log.warn(`Position reconciliation: ${symbol} closed externally — removing from engine state`);
           this.markPositionClosed(symbol);
-          if (this.riskManager) this.riskManager.removePosition();
+          if (this.riskManager) {
+            this.riskManager.removePosition();
+            // N9 FIX: record as zero-P&L for daily accounting
+            await this.riskManager.recordTradePnL(0, symbol);
+          }
+          // N9 FIX: notify adaptive weights
+          this.recordPositionOutcome(symbol, 0).catch(err =>
+            log.warn({ symbol, err: err.message }, 'Outcome recording failed in reconciliation')
+          );
+
           if (this.telegram?.enabled) {
             this.telegram.sendRaw(
               `⚠️ <b>Position Closed Externally — ${symbol}</b>\n` +

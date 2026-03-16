@@ -70,7 +70,7 @@ export class ShadowRecorder {
      * @param {string|null} regime     - TRENDING / SIDEWAYS / VOLATILE / UNKNOWN / null
      * @returns {Promise<void>}
      */
-    async recordSignals(symbol, strategySignals, consensusResult, actedOn, currentPrice, regime) {
+    async recordSignals(symbol, strategySignals, consensusResult, actedOn, currentPrice, regime, paperMode = false) {
         try {
             if (!currentPrice || currentPrice <= 0) {
                 log.warn({ symbol }, 'Shadow signal skipped — currentPrice is zero or missing');
@@ -123,7 +123,7 @@ export class ShadowRecorder {
 
             // Regime column handling — simplest approach: always include it (NULL if absent)
             // Rebuild with explicit regime column for clean SQL
-            await this._batchInsert(symbol, toRecord, currentPrice, consensusReached, actedOn, regime);
+            await this._batchInsert(symbol, toRecord, currentPrice, consensusReached, actedOn, regime, paperMode);
 
             log.debug({
                 symbol,
@@ -289,6 +289,7 @@ export class ShadowRecorder {
         FROM shadow_signals
         WHERE strategy = $1
           AND created_at >= NOW() - ($2 || ' days')::INTERVAL
+          AND paper_mode = false
       `, [strategy, days]);
 
             const row = result.rows[0];
@@ -343,7 +344,7 @@ export class ShadowRecorder {
     // ═══════════════════════════════════════════════════════
 
     /** @private */
-    async _batchInsert(symbol, signals, currentPrice, consensusReached, actedOn, regime) {
+    async _batchInsert(symbol, signals, currentPrice, consensusReached, actedOn, regime, paperMode = false) {
         if (signals.length === 0) return;
 
         // Build parameterised batch INSERT
@@ -352,7 +353,7 @@ export class ShadowRecorder {
         let p = 1;
 
         for (const sig of signals) {
-            rowPlaceholders.push(`($${p++}, $${p++}, $${p++}, $${p++}, $${p++}, $${p++}, $${p++})`);
+            rowPlaceholders.push(`($${p++}, $${p++}, $${p++}, $${p++}, $${p++}, $${p++}, $${p++}, $${p++})`);
             params.push(
                 symbol,
                 sig.strategy,
@@ -361,13 +362,14 @@ export class ShadowRecorder {
                 currentPrice,
                 consensusReached,
                 actedOn,
+                paperMode, // Fix S6
             );
         }
 
         // regime is the same for all signals in a scan cycle — update after INSERT
         await query(
             `INSERT INTO shadow_signals
-         (symbol, strategy, direction, confidence, price_at_signal, consensus_reached, acted_on)
+         (symbol, strategy, direction, confidence, price_at_signal, consensus_reached, acted_on, paper_mode)
        VALUES ${rowPlaceholders.join(', ')}`,
             params
         );

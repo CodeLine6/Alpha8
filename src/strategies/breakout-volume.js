@@ -44,7 +44,10 @@ export class BreakoutVolumeStrategy extends BaseStrategy {
       this.volumeMultiplier = await this._getLiveSetting('BREAKOUT_VOLUME_MULTIPLIER', this._baseVolumeMultiplier);
       this.bbPeriod = await this._getLiveSetting('BREAKOUT_BB_PERIOD', this._baseBbPeriod);
       this.bbStdDev = await this._getLiveSetting('BREAKOUT_BB_STDDEV', this._baseBbStdDev);
-      this.minCandles = Math.max(this.lookbackPeriod + 5, 25);
+
+      // N8 FIX: Bollinger Bands require bbPeriod candles. If bbPeriod > lookbackPeriod + 5,
+      // the old formula set minCandles below what BB needs → BB silently disabled every scan.
+      this.minCandles = Math.max(this.lookbackPeriod + 5, this.bbPeriod + 5, 25);
 
       log.debug({
         lookbackPeriod: this.lookbackPeriod, volumeMultiplier: this.volumeMultiplier,

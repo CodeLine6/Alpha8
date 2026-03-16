@@ -114,9 +114,7 @@ export function computeExitLevels({
         : null;
 
     const trailMultiplier = REGIME_TRAIL_MULTIPLIER[regime] ?? REGIME_TRAIL_MULTIPLIER.UNKNOWN;
-    const effectiveTrailPct = atrPct != null
-        ? atrPct * trailMultiplier
-        : trailingStopPct;
+    const effectiveTrailPct = (atrPct != null ? atrPct : trailingStopPct) * trailMultiplier;
 
     const initialTrailStop = entryPrice * (1 - effectiveTrailPct / 100);
 
@@ -288,6 +286,7 @@ export function evaluateExits({
     const pnlPct = pct(posCtx.entryPrice, currentPrice);
     const maxHold = config.maxHoldMinutes ?? 90;
 
+    // Tier 1 (soft): flat or losing position past max hold → exit
     if (holdMinutes >= maxHold && pnlPct < 0.3) {
         return {
             exit: true, partial: false,
@@ -297,6 +296,26 @@ export function evaluateExits({
                 holdMinutes: +holdMinutes.toFixed(1),
                 maxHold,
                 pnlPct,
+                tier: 'soft',
+            },
+        };
+    }
+
+    // L1 FIX — Tier 2 (hard): any position held more than 2× maxHold gets exited
+    // regardless of P&L — UNLESS trailing stop has moved above breakeven (meaning
+    // the trail will handle the exit and we should let profit run).
+    const trailAboveBreakeven = posCtx.trailStopPrice >= posCtx.entryPrice;
+    if (holdMinutes >= maxHold * 2 && !trailAboveBreakeven) {
+        return {
+            exit: true, partial: false,
+            reason: 'TIME_EXIT',
+            qty: posCtx.quantity,
+            meta: {
+                holdMinutes: +holdMinutes.toFixed(1),
+                maxHold,
+                pnlPct,
+                tier: 'hard', // hard timeout — exits profitable positions too
+                note: 'Exceeded 2× maxHoldMinutes with trail stop below breakeven — hard exit',
             },
         };
     }

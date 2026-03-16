@@ -608,7 +608,16 @@ async function main() {
     if (scout) {
       activeSymbols = await scout.getActiveWatchlist();
     } else {
-      activeSymbols = pinnedSymbols;
+      activeSymbols = [...pinnedSymbols];
+    }
+
+    // S4 FIX: Cap watchlist size to maintain scan performance.
+    // 50 symbols take ~5-7 seconds to scan. 200+ would block the event loop too long.
+    const MAX_WATCHLIST_SIZE = 50;
+    if (activeSymbols.length > MAX_WATCHLIST_SIZE) {
+      log.warn({ count: activeSymbols.length, cap: MAX_WATCHLIST_SIZE },
+        'Watchlist size exceeds limit — capping to mantain scan performance');
+      activeSymbols = activeSymbols.slice(0, MAX_WATCHLIST_SIZE);
     }
 
     const items = [];
@@ -681,7 +690,20 @@ async function main() {
           quantity: sizing.quantity,
         }, 'Position sizing (Kelly inputs)');
 
-        items.push({ symbol, instrumentToken, candles, price: currentPrice, quantity: sizing.quantity || 1 });
+        // L2 FIX: respect Kelly's "no trade" signal.
+        if (sizing.kellyNegative) {
+          log.debug({ symbol, kellyPct: sizing.kellyPct },
+            'Skipping symbol — Kelly indicates negative edge');
+          continue;
+        }
+
+        // S1 FIX: guard against NaN quantity. If sizing.quantity is 0 but
+        // kellyNegative is false (e.g. tiny capital), trade at minimum of 1.
+        const finalQuantity = Number.isFinite(sizing.quantity) && sizing.quantity > 0
+          ? sizing.quantity
+          : 1;
+
+        items.push({ symbol, instrumentToken, candles, price: currentPrice, quantity: finalQuantity });
       } catch (err) {
         log.warn({ symbol, err: err.message }, 'Failed to build watchlist item');
       }

@@ -16,9 +16,9 @@ let pool = null;
 export function initDatabase(connectionString) {
   pool = new Pool({
     connectionString,
-    max: 10,
+    max: 20,                       // M5 FIX: 10 was too small for peak scan + background jobs
     idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 5000,
+    connectionTimeoutMillis: 15000, // M5 FIX: 5s too short — increase to 15s
   });
 
   pool.on('error', (err) => {

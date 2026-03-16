@@ -28,7 +28,10 @@ const log = createLogger('regime-detector');
 const CACHE_KEY = 'regime';
 const CACHE_TTL_SEC = 30 * 60; // 30 min
 
-const ADX_TRENDING_THRESHOLD = 25;
+// ADX thresholds for regime classification (Fix N10)
+// ADX < 20      → SIDEWAYS  (no directional conviction, 0.5× position size)
+// ADX 20 - 25   → TRENDING  (weak trend, treated as full trend — conservative)
+// ADX >= 25     → TRENDING  (strong confirmed trend, 1.0× position size)
 const ADX_SIDEWAYS_THRESHOLD = 20;
 const VOLATILITY_SPIKE_RATIO = 1.8;
 const ATR_PERIOD = 14;

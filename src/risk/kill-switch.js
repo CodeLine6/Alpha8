@@ -1,6 +1,9 @@
 import { createLogger } from '../lib/logger.js';
+import { writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
 
 const log = createLogger('kill-switch');
+const KILL_SWITCH_FILE = join(process.cwd(), '.kill_switch_state');
 
 /**
  * Kill Switch — Redis-persisted emergency halt.
@@ -47,29 +50,58 @@ export class KillSwitch {
   }
 
   /**
-   * Load persisted kill switch state from Redis on startup.
+   * Load persisted kill switch state from Redis (primary) or local file (secondary).
    * MUST be called during app init — before any trading logic runs.
    * @returns {Promise<void>}
    */
   async loadFromRedis() {
-    if (!this._cacheGet) return;
+    // ── Primary: Redis ────────────────────────────────────────────
+    if (this._cacheGet) {
+      try {
+        const stored = await this._cacheGet(REDIS_KEY);
+        if (stored.engaged) {
+          this._engaged = true;
+          this._reason = stored.reason || 'Restored from Redis';
+          this._engagedAt = stored.engagedAt || null;
+          this._drawdownPct = stored.drawdownPct || 0;
 
-    try {
-      const stored = await this._cacheGet(REDIS_KEY);
-      if (stored && stored.engaged) {
-        this._engaged = true;
-        this._reason = stored.reason || 'Restored from Redis';
-        this._engagedAt = stored.engagedAt || null;
-        this._drawdownPct = stored.drawdownPct || 0;
-
-        log.warn({
-          reason: this._reason,
-          engagedAt: this._engagedAt,
-          drawdownPct: this._drawdownPct,
-        }, '⚠ KILL SWITCH RESTORED FROM REDIS — trading blocked');
+          log.warn({
+            reason: this._reason,
+            engagedAt: this._engagedAt,
+            drawdownPct: this._drawdownPct,
+            source: 'redis',
+          }, '⚠ KILL SWITCH RESTORED FROM REDIS — trading blocked');
+        }
+        return; // Trust Redis (engaged or not) if it responded
+      } catch (err) {
+        log.error({ err: err.message }, 'Redis unavailable during loadFromRedis — checking file fallback');
       }
-    } catch (err) {
-      log.error({ err: err.message }, 'Failed to load kill switch state from Redis');
+    }
+
+    // ── Secondary: Local file ─────────────────────────────────────
+    // C6 FIX: check file when Redis has no state or is unavailable.
+    try {
+      if (existsSync(KILL_SWITCH_FILE)) {
+        const raw = readFileSync(KILL_SWITCH_FILE, 'utf8');
+        const stored = JSON.parse(raw);
+        if (stored && stored.engaged) {
+          this._engaged = true;
+          this._reason = stored.reason || 'Restored from file (Redis was unavailable)';
+          this._engagedAt = stored.engagedAt || null;
+          this._drawdownPct = stored.drawdownPct || 0;
+
+          log.error({
+            reason: this._reason,
+            engagedAt: this._engagedAt,
+            source: 'file',
+          }, '🛑 KILL SWITCH RESTORED FROM FILE — Redis was unavailable at prior engage()');
+          
+          // Re-persist to Redis now that we have the state
+          await this._persistToRedis();
+        }
+      }
+    } catch (fsErr) {
+      log.warn({ err: fsErr.message }, 'Kill switch file fallback read failed — starting unengaged');
     }
   }
 
@@ -239,30 +271,67 @@ export class KillSwitch {
     this._engagedAt = null;
     this._drawdownPct = 0;
 
-    // Await Redis clear
+    // Await persistence clear (Redis + File)
     await this._persistToRedis();
+
+    // C6 FIX: also delete the file so file fallback doesn't re-engage on next restart
+    try {
+      if (existsSync(KILL_SWITCH_FILE)) {
+        const { unlinkSync } = await import('node:fs');
+        unlinkSync(KILL_SWITCH_FILE);
+        log.info({ path: KILL_SWITCH_FILE }, 'Kill switch file cleared on reset');
+      }
+    } catch (fsErr) {
+      log.warn({ err: fsErr.message }, 'Failed to delete kill switch file on reset');
+    }
+
     return true;
   }
 
   /**
-   * Persist current state to Redis. AWAITED by callers.
+   * Persist current state to Redis (primary) and local file (secondary).
+   * Both are attempted independently — Redis failure does NOT skip file write.
    * @private
    * @returns {Promise<void>}
    */
   async _persistToRedis() {
-    if (!this._cacheSet) return;
+    const state = {
+      engaged: this._engaged,
+      reason: this._reason,
+      engagedAt: this._engagedAt,
+      drawdownPct: this._drawdownPct,
+    };
 
-    try {
-      await this._cacheSet(REDIS_KEY, {
-        engaged: this._engaged,
-        reason: this._reason,
-        engagedAt: this._engagedAt,
-        drawdownPct: this._drawdownPct,
-      });
-      log.debug('Kill switch state persisted to Redis');
-    } catch (err) {
-      log.error({ err: err.message }, 'CRITICAL: Failed to persist kill switch state to Redis');
-      throw err; // Propagate — callers must know persistence failed
+    // ── Primary: Redis ────────────────────────────────────────────
+    let redisError = null;
+    if (this._cacheSet) {
+      try {
+        await this._cacheSet(REDIS_KEY, state);
+        log.debug('Kill switch state persisted to Redis');
+      } catch (err) {
+        log.error({ err: err.message },
+          'CRITICAL: Failed to persist kill switch state to Redis — using file fallback only');
+        redisError = err;
+      }
     }
+
+    // ── Secondary: Local file ─────────────────────────────────────
+    try {
+      if (this._engaged) {
+        writeFileSync(KILL_SWITCH_FILE, JSON.stringify(state), 'utf8');
+        log.debug({ path: KILL_SWITCH_FILE }, 'Kill switch state persisted to file');
+      } else {
+        // If we are disengaging, also try to clear the file
+        if (existsSync(KILL_SWITCH_FILE)) {
+          const { unlinkSync } = await import('node:fs');
+          unlinkSync(KILL_SWITCH_FILE);
+        }
+      }
+    } catch (fsErr) {
+      log.warn({ err: fsErr.message }, 'Kill switch file persistence failed');
+    }
+
+    // N6 FIX: re-throw Redis error if it occurred, so callers (and tests) know persistence is compromised.
+    if (redisError) throw redisError;
   }
 }

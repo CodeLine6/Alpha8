@@ -75,16 +75,35 @@ export function encryptToken(plaintext) {
 }
 
 /**
+ * Detect whether a string looks like a value encrypted by encryptToken().
+ * Encrypted format: `iv:authTag:ciphertext`
+ * @private
+ */
+function looksEncrypted(value) {
+  const parts = value.split(':');
+  if (parts.length !== 3) return false;
+  const [iv, authTag, ciphertext] = parts;
+  return (
+    /^[0-9a-f]{24}$/i.test(iv) &&       // 12-byte IV
+    /^[0-9a-f]{32}$/i.test(authTag) &&   // 16-byte auth tag
+    ciphertext.length > 0 &&
+    ciphertext.length % 2 === 0 &&
+    /^[0-9a-f]+$/i.test(ciphertext)
+  );
+}
+
+/**
  * Decrypt a token value from Redis.
  *
- * Handles three cases:
- *   1. TOKEN_ENCRYPTION_KEY set + value is encrypted format → decrypt and return
- *   2. TOKEN_ENCRYPTION_KEY set + value is legacy plaintext → return plaintext + warn
- *   3. TOKEN_ENCRYPTION_KEY not set → return value as-is (plaintext passthrough)
+ * Handles four cases:
+ *   1. KEY set + value is encrypted → decrypt and return
+ *   2. KEY set + value is legacy plaintext → return plaintext + warn
+ *   3. KEY not set + value is plaintext → return as-is (dev mode)
+ *   4. KEY not set + value looks encrypted → THROW (S2 FIX)
  *
  * @param {string} value - The raw value from Redis
  * @returns {string} Decrypted (or original) access token
- * @throws {Error} If value looks encrypted but decryption fails (corrupt/wrong key)
+ * @throws {Error} If decryption fails or encrypted value used without key
  */
 export function decryptToken(value) {
   if (!value) return value;
@@ -92,15 +111,17 @@ export function decryptToken(value) {
   const key = getKey();
 
   if (!key) {
-    // No encryption configured — treat all values as plaintext
+    if (looksEncrypted(value)) {
+      const msg =
+        'CRITICAL: Redis contains an encrypted token but TOKEN_ENCRYPTION_KEY is not set. ' +
+        'The token cannot be decrypted. Either restore the key or run `npm run login`.';
+      console.error(`[crypto-utils] ${msg}`);
+      throw new Error(msg);
+    }
     return value;
   }
 
   // ── Legacy plaintext guard ────────────────────────────────────────────────
-  // A valid encrypted value always has exactly 2 colons (iv:authTag:ciphertext).
-  // Kite access tokens are alphanumeric strings with no colons.
-  // If the stored value doesn't match encrypted format, it's a legacy plaintext
-  // token written before encryption was enabled. Return it and warn to rotate.
   const parts = value.split(':');
   if (parts.length !== 3) {
     console.warn(
@@ -131,4 +152,4 @@ export function decryptToken(value) {
       'Run `npm run login` to generate a fresh token.'
     );
   }
-}
+}
