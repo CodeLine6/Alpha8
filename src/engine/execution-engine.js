@@ -293,6 +293,8 @@ export class ExecutionEngine {
     let finalSignal = consensusResult;
     let adjustedQty = quantity;
     let pipelineLog = null;
+    let acted = false;
+    let order = null;
 
     if (this.pipeline) {
       const isConviction = !!consensusResult.convictionStrategy;
@@ -307,6 +309,14 @@ export class ExecutionEngine {
       if (!pipelineResult.allowed) {
         log.info({ symbol, regime, blockedBy: pipelineResult.blockedBy },
           `Signal BLOCKED by pipeline gate: ${pipelineResult.blockedBy}`);
+        
+        // Record shadow even if blocked by pipeline (Fix S7: Capture pipeline failures)
+        if (this.shadowRecorder) {
+          this.shadowRecorder.recordSignals(
+            symbol, consensusResult.details || [], consensusResult, false, currentPrice, regime, this.paperMode
+          ).catch(err => log.warn({ symbol, err: err.message }, 'Shadow signal (BLOCKED) recording failed'));
+        }
+
         return {
           action: `BLOCKED:${pipelineResult.blockedBy}`,
           order: null,
@@ -342,7 +352,7 @@ export class ExecutionEngine {
       this._lastSignalStrategies.set(symbol, firingStrategies);
     }
 
-    const order = await this.executeOrder({
+    order = await this.executeOrder({
       symbol,
       side: finalSignal.signal,
       quantity: adjustedQty,
@@ -350,9 +360,11 @@ export class ExecutionEngine {
       strategy: finalSignal.reason || consensusResult.reason,
     });
 
-    const acted = order.state === ORDER_STATE.FILLED;
+    acted = (order.state === (this.paperMode ? 'FILLED' : 'PLACED') || order.state === 'FILLED');
+    // Ensure acted is true if order reached broker or was filled in paper mode
+    const isActed = order.state === 'FILLED' || (order.brokerId && order.state !== 'REJECTED');
 
-    if (acted) {
+    if (isActed) {
       const signalId = this._pendingSignalIds.get(symbol);
       await this._markSignalActedOn(signalId, symbol, finalSignal.signal);
       this._pendingSignalIds.delete(symbol);
@@ -363,7 +375,7 @@ export class ExecutionEngine {
         symbol,
         consensusResult.details || [],
         consensusResult,
-        acted,
+        isActed,
         currentPrice,
         regime,
         this.paperMode, // S6 FIX: pass paperMode
@@ -371,7 +383,7 @@ export class ExecutionEngine {
     }
 
     return {
-      action: acted ? 'EXECUTED' : order.state,
+      action: isActed ? 'EXECUTED' : order.state,
       order,
       consensus: consensusResult,
       pipelineLog,

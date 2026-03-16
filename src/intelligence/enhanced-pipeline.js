@@ -253,20 +253,6 @@ export class EnhancedSignalPipeline {
         return { allowed: true, signal: finalSignal, positionSizeMult, log: gateLog, blockedBy: null };
     }
 
-    /**
-     * Record a trade outcome for adaptive weight training.
-     * Call this when a position closes (from execution-engine.js).
-     *
-     * @param {string} strategy  - strategy name
-     * @param {string} signal    - 'BUY'|'SELL'
-     * @param {string} symbol
-     * @param {number} pnl
-     */
-    async recordTradeOutcome(strategy, signal, symbol, pnl) {
-        if (!this.adaptiveWeights) return;
-        const outcome = pnl > 0 ? 'WIN' : 'LOSS';
-        await this.adaptiveWeights.recordOutcome({ strategy, signal, symbol, outcome, pnl });
-    }
 
     /**
      * Weekly maintenance — update strategy weights.
