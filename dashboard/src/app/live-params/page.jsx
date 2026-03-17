@@ -12,6 +12,7 @@ const CATEGORY_META = {
     rsi: { label: 'RSI Mean Reversion Strategy', icon: '🔄' },
     vwap: { label: 'VWAP Momentum Strategy', icon: '📊' },
     breakout: { label: 'Breakout Volume Strategy', icon: '🚀' },
+    consensus: { label: 'Signal Consensus', icon: '🤝' },
 };
 
 // ─── Skeleton helpers ────────────────────────────────────────────────────────

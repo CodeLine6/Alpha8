@@ -77,12 +77,27 @@ export class SignalConsensus {
     this.minConfidence = config.minConfidence ?? 40;
     this.groupedConsensus = config.groupedConsensus ?? true;
     this.superConvictionEnabled = config.superConvictionEnabled ?? false;
+    this.superConvictionThreshold = 80;
     this.strategies = [];
+    this._getLiveSetting = config.getLiveSetting || null;
   }
 
   addStrategy(strategy) {
     this.strategies.push(strategy);
     log.info({ strategy: strategy.name, total: this.strategies.length }, 'Strategy registered');
+  }
+
+  /**
+   * Refresh live parameters from Redis.
+   * @returns {Promise<void>}
+   */
+  async refreshParams() {
+    if (!this._getLiveSetting) return;
+    try {
+      this.superConvictionThreshold = await this._getLiveSetting('SUPER_CONVICTION_THRESHOLD', 80);
+    } catch (err) {
+      log.warn({ err: err.message }, 'Failed to refresh SignalConsensus params');
+    }
   }
 
   evaluate(candles) {
@@ -316,7 +331,7 @@ export class SignalConsensus {
     // ── Super Conviction Bypass ───────────────────────────────────────────
     if (this.superConvictionEnabled) {
       const extremeResults = results.filter(
-        (r) => r.confidence >= 80 && r.meetsFloor && !r.suppressedByTime && r.signal !== SIGNAL.HOLD
+        (r) => r.confidence >= this.superConvictionThreshold && r.meetsFloor && !r.suppressedByTime && r.signal !== SIGNAL.HOLD
       );
 
       if (extremeResults.length > 0) {

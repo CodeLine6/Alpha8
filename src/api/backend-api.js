@@ -229,6 +229,13 @@ export function createApiHandler(deps) {
       type: 'number', min: 1, max: 4, step: 0.5,
       default: 2, category: 'breakout',
     },
+    // ── Signal Consensus ─────────────────────────────────────────────────────
+    SUPER_CONVICTION_THRESHOLD: {
+      label: 'Super Conviction Threshold',
+      description: 'Confidence % required for a single strategy to bypass cross-group consensus',
+      type: 'number', min: 60, max: 95, step: 1,
+      default: 80, category: 'consensus',
+    },
   };
 
   // ═══════════════════════════════════════════════════════
@@ -958,6 +965,7 @@ export function createApiHandler(deps) {
           vwap: 'VWAP Momentum Strategy',
           breakout: 'Breakout Volume Strategy',
           exits: 'Exit Strategies',
+          consensus: 'Signal Consensus',
         },
       });
     } catch (err) {

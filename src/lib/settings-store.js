@@ -58,6 +58,9 @@ const DEFAULTS = {
     BREAKOUT_VOLUME_MULTIPLIER: null,
     BREAKOUT_BB_PERIOD: null,
     BREAKOUT_BB_STDDEV: null,
+
+    // ── Signal Consensus ────────────────────────────────────────────────────────
+    SUPER_CONVICTION_THRESHOLD: null,
 };
 
 export async function getLiveSetting(key, configFallback) {

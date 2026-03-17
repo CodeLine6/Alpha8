@@ -327,15 +327,25 @@ export class MarketScheduler {
         );
       }
 
-      // Refresh strategy params
-      if (this.engine?.consensus?.strategies?.length > 0) {
-        await Promise.all(
-          this.engine.consensus.strategies
-            .filter(s => typeof s.refreshParams === 'function')
-            .map(s => s.refreshParams().catch(err =>
-              log.warn({ strategy: s.name, err: err.message }, 'refreshParams failed')
-            ))
-        );
+      // Refresh strategy + consensus params
+      if (this.engine?.consensus) {
+        // Refresh consensus-level params (e.g. Super Conviction threshold)
+        if (typeof this.engine.consensus.refreshParams === 'function') {
+          await this.engine.consensus.refreshParams().catch(err =>
+            log.warn({ err: err.message }, 'Consensus refreshParams failed')
+          );
+        }
+
+        // Refresh individual strategy params (EMA periods, RSI floors, etc)
+        if (this.engine.consensus.strategies?.length > 0) {
+          await Promise.all(
+            this.engine.consensus.strategies
+              .filter(s => typeof s.refreshParams === 'function')
+              .map(s => s.refreshParams().catch(err =>
+                log.warn({ strategy: s.name, err: err.message }, 'refreshParams failed')
+              ))
+          );
+        }
       }
 
       // Per-scan reconciliation

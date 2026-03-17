@@ -267,7 +267,14 @@ async function main() {
     }
   }
 
-  const consensus = new SignalConsensus({ minAgreement: 2, superConvictionEnabled });
+  const consensus = new SignalConsensus({
+    minAgreement: 2,
+    superConvictionEnabled,
+    getLiveSetting: redisHealthy ? getLiveSetting : null
+  });
+  if (redisHealthy) {
+    await consensus.refreshParams().catch(err => log.warn({ err: err.message }, 'Initial consensus param refresh failed'));
+  }
   consensus.addStrategy(new EMACrossoverStrategy());
   consensus.addStrategy(new RSIMeanReversionStrategy());
   consensus.addStrategy(new VWAPMomentumStrategy());
