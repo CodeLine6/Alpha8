@@ -31,6 +31,7 @@ import { IntradayDecayManager } from './intelligence/intraday-decay.js';
 import { PositionManager } from './risk/position-manager.js';
 import { getAllLiveSettings, getLiveSetting, resetLiveSetting, setLiveSetting } from './lib/settings-store.js';
 import { decryptToken } from './lib/crypto-utils.js';
+import { runAutoLogin } from '../scripts/auto-login.js';
 
 const log = createLogger('main');
 const APP_VERSION = '1.0.0';
@@ -419,6 +420,7 @@ async function main() {
       { command: 'status', description: 'View current system and PnL status' },
       { command: 'watchlist', description: 'View the active trading watchlist' },
       { command: 'scout', description: 'Trigger a manual symbol scout scan' },
+      { command: 'login', description: 'Manually trigger Zerodha login flow' },
       { command: 'params', description: 'View current live risk parameters' },
       { command: 'set', description: 'Set a live risk parameter (e.g. /set STOP_LOSS_PCT 0.8)' },
       { command: 'reset', description: 'Reset a live parameter to default' },
@@ -438,6 +440,40 @@ async function main() {
         telegram.sendRaw('✅ <b>Kill Switch Reset</b>\nTrading may resume.');
       } else {
         telegram.sendRaw('ℹ️ <b>Kill Switch</b> is not currently engaged.');
+      }
+    });
+
+    telegram.onCommand('/login', async () => {
+      log.info('Manual login triggered via Telegram');
+      telegram.sendRaw('🔐 <b>Manual Login Triggered</b>\nAttempting Zerodha authentication...');
+
+      try {
+        const result = await runAutoLogin({ silent: true });
+        if (result.success && result.accessToken) {
+          // Update local state so the running process picks up the new token immediately
+          accessToken = result.accessToken;
+          kiteClient = new KiteClient({
+            apiKey: config.KITE_API_KEY,
+            apiSecret: config.KITE_API_SECRET,
+            accessToken,
+          });
+          broker = new BrokerManager(kiteClient);
+
+          // Update dependent components
+          if (engine) engine.broker = broker;
+          if (scout) scout.broker = broker;
+          if (holdingsManager) holdingsManager.broker = broker;
+          if (positionManager) positionManager.broker = broker;
+          if (instrumentManager) instrumentManager.broker = broker;
+
+          log.info('Broker and dependent components updated with new access token');
+        } else if (!result.success) {
+          // runAutoLogin already sends a failure alert via Telegram
+          log.warn({ err: result.error }, 'Manual login failed');
+        }
+      } catch (err) {
+        log.error({ err: err.message }, 'Manual login command failed');
+        telegram.sendRaw(`❌ <b>Login command error</b>\n${err.message}`);
       }
     });
 
@@ -717,8 +753,8 @@ async function main() {
 
         // S1 FIX: guard against NaN quantity.
         if (!Number.isFinite(sizing.quantity) || sizing.quantity <= 0) {
-           log.debug({ symbol, quantity: sizing.quantity }, 'Skipping symbol — quantity is zero or invalid');
-           continue;
+          log.debug({ symbol, quantity: sizing.quantity }, 'Skipping symbol — quantity is zero or invalid');
+          continue;
         }
 
         const finalQuantity = sizing.quantity;
@@ -923,7 +959,8 @@ async function main() {
         `/conviction <code>on/off</code> - Toggle Super Conviction\n` +
         `/reset_kill_switch - Reset the kill switch\n` +
         `/market_open - Trigger market routines\n` +
-        `/help - Show this help message`;
+        `/help - Show this help message` +
+        `/login - Login to Zerodha`;
       telegram.sendRaw(msg);
     });
 
