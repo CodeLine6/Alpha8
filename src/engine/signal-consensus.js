@@ -339,6 +339,12 @@ export class SignalConsensus {
           (prev.confidence > current.confidence) ? prev : current
         );
 
+        log.info({
+          strategy: best.strategy,
+          confidence: best.confidence,
+          threshold: this.superConvictionThreshold,
+        }, `⏩ Super Conviction BYPASS: ${best.strategy} (${best.confidence}%)`);
+
         return {
           signal: best.signal,
           confidence: best.confidence,

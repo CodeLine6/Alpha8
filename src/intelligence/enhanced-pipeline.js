@@ -217,9 +217,13 @@ export class EnhancedSignalPipeline {
 
         // ── Gate 2: Trend Filter ────────────────────────────────────────────────
         if (this.trendFilter) {
-            const r = await this.trendFilter.check(symbol, finalSignal.signal);
-            gateLog.push(r.allowed ? `✅ Trend: ${r.reason}` : `❌ Trend: ${r.reason}`);
-            if (!r.allowed) return this._blocked('TREND_FILTER', gateLog, positionSizeMult);
+            if (isConvictionBypass) {
+                gateLog.push('⏩ Trend Filter: Bypassed via Super Conviction');
+            } else {
+                const r = await this.trendFilter.check(symbol, finalSignal.signal);
+                gateLog.push(r.allowed ? `✅ Trend: ${r.reason}` : `❌ Trend: ${r.reason}`);
+                if (!r.allowed) return this._blocked('TREND_FILTER', gateLog, positionSizeMult);
+            }
         }
 
         // ── Gate 3: Regime Detector ─────────────────────────────────────────────
