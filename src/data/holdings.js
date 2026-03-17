@@ -177,4 +177,18 @@ export class HoldingsManager {
             return { totalValue: 0, holdings: [] };
         }
     }
+
+    /**
+     * Force-clear the holdings snapshot cache.
+     * Call this after a BUY or SELL fill to ensure the next exposure check is fresh.
+     */
+    async clearSnapshotCache() {
+        if (!this.redis) return;
+        try {
+            await this.redis.del('holdings:snapshot');
+            log.debug('Holdings snapshot cache cleared');
+        } catch (err) {
+            log.warn({ err: err.message }, 'Failed to clear holdings cache');
+        }
+    }
 }

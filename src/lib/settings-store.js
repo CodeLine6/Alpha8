@@ -18,6 +18,8 @@ const DEFAULTS = {
     MAX_POSITION_COUNT: null,
     KILL_SWITCH_DRAWDOWN_PCT: null,
     TRADING_CAPITAL: null,
+    MAX_CAPITAL_EXPOSURE_PCT: null,
+    MAX_POSITION_VALUE_PCT: null,
 
     // ── Position Exit — Core ──────────────────────────────────────────────────────
     STOP_LOSS_PCT: null,   // Hard stop loss % below entry

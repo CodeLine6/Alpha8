@@ -82,9 +82,27 @@ export function createApiHandler(deps) {
       default: config.KILL_SWITCH_DRAWDOWN_PCT,
       category: 'risk',
     },
-    /* NOTE: TRADING_CAPITAL is intentionally NOT in this schema (Fix S5).
-       Changing it via live settings inflates/deflates all risk thresholds
-       relative to actual deployed capital. Change in .env and restart instead. */
+    TRADING_CAPITAL: {
+      label: 'Trading Capital (₹)',
+      description: 'Total capital used for position sizing (overrides .env)',
+      type: 'number', min: 1000, max: 10000000, step: 100,
+      default: config.TRADING_CAPITAL,
+      category: 'risk',
+    },
+    MAX_CAPITAL_EXPOSURE_PCT: {
+      label: 'Max Total Exposure %',
+      description: 'Max % of capital allowed in all positions combined',
+      type: 'number', min: 1, max: 200, step: 5,
+      default: config.MAX_CAPITAL_EXPOSURE_PCT ?? 100,
+      category: 'risk',
+    },
+    MAX_POSITION_VALUE_PCT: {
+      label: 'Max Per-Position %',
+      description: 'Max % of capital allowed per single stock',
+      type: 'number', min: 1, max: 100, step: 5,
+      default: config.MAX_POSITION_VALUE_PCT ?? 100,
+      category: 'risk',
+    },
     STOP_LOSS_PCT: {
       label: 'Stop Loss %',
       description: 'Hard stop loss % below entry price — triggers immediate exit',

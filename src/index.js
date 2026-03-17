@@ -732,13 +732,13 @@ async function main() {
         const stats = statsMap?.get(symbol) ?? { winRate: 0.5, avgWin: 1000, avgLoss: 500 };
 
         const sizing = calculatePositionSize({
-          capital: config.TRADING_CAPITAL,
+          capital: riskManager.capital,
           winRate: stats.winRate,
           avgWin: stats.avgWin,
           avgLoss: stats.avgLoss,
           entryPrice: currentPrice || 100,
-          maxRiskPct: config.PER_TRADE_STOP_LOSS_PCT,
-          maxPositionPct: config.MAX_POSITION_VALUE_PCT || 100,
+          maxRiskPct: riskManager.perTradeStopLossPct,
+          maxPositionPct: riskManager.maxPositionPct,
         });
 
         log.debug({

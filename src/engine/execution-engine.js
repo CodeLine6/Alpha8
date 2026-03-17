@@ -605,11 +605,22 @@ export class ExecutionEngine {
     }
 
     // ─── Phase 1: Risk Engine Check ──────────────────────
-    let totalExposure = 0;
+    let brokerExposure = 0;
     if (this.holdingsManager) {
       const exposureData = await this.holdingsManager.getTotalExposureValue();
-      totalExposure = exposureData.totalValue;
+      brokerExposure = exposureData.totalValue;
     }
+
+    // Autoritative in-memory exposure (essential for Paper Mode and immediate sync)
+    let memoryExposure = 0;
+    if (this._filledPositions.size > 0) {
+      for (const pos of this._filledPositions.values()) {
+        memoryExposure += (pos.quantity * (pos.price || pos.entryPrice || 0));
+      }
+    }
+
+    // Use the higher of the two to be conservative
+    const totalExposure = Math.max(brokerExposure, memoryExposure);
 
     const riskDecision = this.riskManager.validateOrder({
       symbol: params.symbol,
@@ -628,11 +639,28 @@ export class ExecutionEngine {
       return order;
     }
 
+    // Step 64: Track pending exposure until order is FILLED or REJECTED
+    if (params.side === 'BUY') {
+      this.riskManager.addPendingExposure(params.quantity * params.price);
+    }
+
     this._pendingSymbols.add(params.symbol);
     try {
-      return await this._placeWithRetry(order);
+      const result = await this._placeWithRetry(order);
+
+      // Invalidate holdings cache immediately if something was filled
+      // to ensure the NEXT scan cycle sees the updated exposure.
+      if (result.state === ORDER_STATE.FILLED && this.holdingsManager) {
+        this.holdingsManager.clearSnapshotCache().catch(() => { });
+      }
+
+      return result;
     } finally {
       this._pendingSymbols.delete(params.symbol);
+      // Step 65: Always clear pending exposure when order reaches final state
+      if (order.side === 'BUY') {
+        this.riskManager.clearPendingExposure(order.quantity * order.price);
+      }
     }
   }
 

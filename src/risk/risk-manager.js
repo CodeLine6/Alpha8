@@ -84,6 +84,9 @@ export class RiskManager {
     this._wins = 0;
     this._losses = 0;
 
+    /** @type {number} Total value of orders placed but not yet filled/cancelled */
+    this._pendingExposureValue = 0;
+
     // Derived limits — recomputed on every refreshLiveSettings() call
     this._recomputeLimits();
 
@@ -339,6 +342,7 @@ export class RiskManager {
         maxCapitalExposurePct: this.maxCapitalExposurePct,
       },
       currentExposure: totalExposureValue,
+      pendingExposure: this._pendingExposureValue,
     };
 
     // ─── Check 1: Kill Switch (highest priority) ─────────
@@ -385,11 +389,12 @@ export class RiskManager {
     // ─── Check 6: Total Capital Exposure (only for BUY) ──
     if (order.side === 'BUY') {
       const newTradeValue = order.quantity * order.price;
-      const totalAfterTrade = totalExposureValue + newTradeValue;
+      const totalAfterTrade = totalExposureValue + this._pendingExposureValue + newTradeValue;
 
       if (totalAfterTrade > this._maxCapitalExposureAmount) {
         const reason =
           `Total capital exposure limit reached: ₹${totalAfterTrade.toFixed(2)} ` +
+          `(filled: ₹${totalExposureValue.toFixed(0)}, pending: ₹${this._pendingExposureValue.toFixed(0)}, new: ₹${newTradeValue.toFixed(0)}) ` +
           `exceeds max ₹${this._maxCapitalExposureAmount.toFixed(2)} (${this.maxCapitalExposurePct}% of capital)`;
         log.warn({ ...context, newTradeValue, totalAfterTrade }, `ORDER REJECTED — ${reason}`);
         return { allowed: false, reason, context };
@@ -480,8 +485,29 @@ export class RiskManager {
     this._tradeCount = 0;
     this._wins = 0;
     this._losses = 0;
+    this._pendingExposureValue = 0;
     this._persistToRedis().catch(() => { });
     log.info({ capital: this.capital }, 'Risk manager daily state reset');
+  }
+
+  /**
+   * Add to pending exposure when an order is placed.
+   * @param {number} value - quantity * price
+   */
+  addPendingExposure(value) {
+    if (value <= 0) return;
+    this._pendingExposureValue += value;
+    log.debug({ value, totalPending: this._pendingExposureValue }, 'Pending exposure increased');
+  }
+
+  /**
+   * Remove from pending exposure when an order reaches final state.
+   * @param {number} value
+   */
+  clearPendingExposure(value) {
+    if (value <= 0) return;
+    this._pendingExposureValue = Math.max(0, this._pendingExposureValue - value);
+    log.debug({ value, totalPending: this._pendingExposureValue }, 'Pending exposure cleared');
   }
 
   // ═══════════════════════════════════════════════════════
