@@ -170,7 +170,34 @@ export class AdaptiveWeightManager {
      * @private
      */
     async _fetchAccuracy(strategy) {
-        // Primary source: signal_outcomes (live trades only after Fix S6)
+        // Primary source: shadow_signals (Pure Intelligence / Technical Accuracy)
+        // Fix (Phase 17): We prioritize the strategy's technical prediction over 
+        // final trade management (PnL). This is non-biased as it includes solo signals.
+        try {
+            const result = await this.dbQuery(
+                `SELECT
+           COUNT(*)                                                AS total,
+           COUNT(*) FILTER (WHERE was_correct_30min = true)       AS wins
+         FROM shadow_signals
+         WHERE strategy    = $1
+           AND created_at >= NOW() - INTERVAL '7 days'
+           AND was_correct_30min IS NOT NULL
+           AND paper_mode  = false`, // FIX S6
+                [strategy]
+            );
+            const row = result.rows?.[0];
+            const total = parseInt(row?.total ?? '0', 10);
+            const wins = parseInt(row?.wins ?? '0', 10);
+
+            if (total >= MIN_SIGNALS_NEEDED) {
+                return { winRate: wins / total, count: total, source: 'shadow_signals' };
+            }
+        } catch (err) {
+            log.warn({ strategy, err: err.message }, 'shadow_signals accuracy fetch failed');
+        }
+
+        // Fallback 1: signal_outcomes (Realized Trade PnL)
+        // Only used if shadow data is insufficient.
         try {
             const result = await this.dbQuery(
                 `SELECT
@@ -191,30 +218,6 @@ export class AdaptiveWeightManager {
             }
         } catch (err) {
             log.warn({ strategy, err: err.message }, 'signal_outcomes accuracy fetch failed');
-        }
-
-        // Fallback 1: shadow_signals (unbiased, live only after FIX S6)
-        try {
-            const result = await this.dbQuery(
-                `SELECT
-           COUNT(*)                                                AS total,
-           COUNT(*) FILTER (WHERE outcome = 'WIN' AND acted_on)   AS wins
-         FROM shadow_signals
-         WHERE strategy    = $1
-           AND created_at >= NOW() - INTERVAL '7 days'
-           AND outcome IS NOT NULL
-           AND paper_mode  = false`, // FIX S6
-                [strategy]
-            );
-            const row = result.rows?.[0];
-            const total = parseInt(row?.total ?? '0', 10);
-            const wins = parseInt(row?.wins ?? '0', 10);
-
-            if (total >= MIN_SIGNALS_NEEDED) {
-                return { winRate: wins / total, count: total, source: 'shadow_signals' };
-            }
-        } catch (err) {
-            log.warn({ strategy, err: err.message }, 'shadow_signals accuracy fetch failed');
         }
 
         return null; // insufficient data from both sources

@@ -1063,23 +1063,35 @@ export class ExecutionEngine {
   async _persistSignals(symbol, consensus, currentPrice = null) {
     let consensusSignalId = null;
     try {
+      const hasPosition = this._filledPositions.has(symbol);
       await query('BEGIN');
+
       for (const detail of (consensus.details || [])) {
+        const sig = detail.signal || 'HOLD';
+        // Fix (Phase 16): Skip HOLD signals if no position exists
+        if (sig === 'HOLD' && !hasPosition) continue;
+
         await query(
           `INSERT INTO signals (symbol, strategy, signal, confidence, acted_on, reason, price, created_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
-          [symbol, detail.strategy || 'unknown', detail.signal || 'HOLD',
+          [symbol, detail.strategy || 'unknown', sig,
             detail.confidence || 0, false, (detail.reason || '').slice(0, 500), currentPrice || null]
         );
       }
-      const consensusRow = await query(
-        `INSERT INTO signals (symbol, strategy, signal, confidence, acted_on, reason, price, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-         RETURNING id`,
-        [symbol, 'CONSENSUS', consensus.signal || 'HOLD', consensus.confidence || 0,
-          false, (consensus.reason || '').slice(0, 500), currentPrice || null]
-      );
-      consensusSignalId = consensusRow.rows?.[0]?.id ?? null;
+
+      const conSig = consensus.signal || 'HOLD';
+      // Fix (Phase 16): Skip CONSENSUS HOLD signal if no position exists
+      if (conSig !== 'HOLD' || hasPosition) {
+        const consensusRow = await query(
+          `INSERT INTO signals (symbol, strategy, signal, confidence, acted_on, reason, price, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+           RETURNING id`,
+          [symbol, 'CONSENSUS', conSig, consensus.confidence || 0,
+            false, (consensus.reason || '').slice(0, 500), currentPrice || null]
+        );
+        consensusSignalId = consensusRow.rows?.[0]?.id ?? null;
+      }
+
       await query('COMMIT');
     } catch (err) {
       try { await query('ROLLBACK'); } catch { /* swallow */ }
