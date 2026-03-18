@@ -104,7 +104,7 @@ export async function executeSquareOff({ broker, riskManager, engine, getOpenPos
       // 2. Execute exit via engine.forceExit()
       // This handles: Order creation, Broker placement (live), State update, 
       // Risk Manager P&L logging, Outcome recording, and DB Persistence.
-      const result = await engine.forceExit(symbol, exitPrice, 'SQUARE_OFF', true);
+      const result = await engine.forceExit(symbol, exitPrice, 'SQUARE_OFF');
 
       if (result.success) {
         squaredOff.push({

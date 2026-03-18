@@ -75,6 +75,7 @@ export async function classifySentiment(symbol, headlines, apiKey) {
 
     const prompt = `Headlines:\n${headlineText}`;
 
+    const today = new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' });
     const systemInstruction =
         `You are a senior equity analyst specializing in Indian stock markets (NSE/BSE).
 Today's date: ${today}

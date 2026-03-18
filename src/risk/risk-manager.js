@@ -2,6 +2,7 @@ import { createLogger } from '../lib/logger.js';
 import { RISK_DEFAULTS, SQUARE_OFF_TIME } from '../config/constants.js';
 import { isSquareOffTime, isTradingDay } from '../data/market-hours.js';
 
+import { getISTTime } from '../data/market-hours.js';
 const log = createLogger('risk-manager');
 
 /**
@@ -194,8 +195,8 @@ export class RiskManager {
     try {
       const stored = await this._cacheGet('risk:daily_state');
       if (stored) {
-        const today = new Date().toISOString().split('T')[0];
-        if (stored.date === today) {
+      const today = getISTTime().dateStr;
+      if (stored.date === today) {
           this._dailyPnL = stored.dailyPnL || 0;
           this._openPositionCount = stored.openPositionCount || 0;
           this._tradeCount = stored.tradeCount || 0;
@@ -437,7 +438,16 @@ export class RiskManager {
       tradeCount: this._tradeCount,
     }, 'Trade PnL recorded');
 
-    this._persistToRedis().catch(() => { });
+    const today = getISTTime().dateStr;
+    const state = {
+      date: today,
+      dailyPnL: this._dailyPnL,
+      openPositionCount: this._openPositionCount,
+      tradeCount: this._tradeCount,
+      wins: this._wins,
+      losses: this._losses,
+    };
+    this._cacheSet('risk:daily_state', state).catch(() => { });
 
     // Re-fetch kill switch threshold in case it was live-overridden
     // _killSwitchAmount is always in sync because _recomputeLimits() is called

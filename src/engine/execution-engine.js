@@ -127,7 +127,7 @@ export class ExecutionEngine {
   async hydratePositions() {
     log.info('Hydrating open positions from DB...');
 
-    const isPaperMode = !this._config?.LIVE_TRADING;
+    const isPaperMode = this.paperMode;
 
     const result = await query(
       `SELECT symbol, price, quantity, strategy, created_at,
@@ -454,7 +454,7 @@ export class ExecutionEngine {
     }
 
     const exitQty = qty ?? posCtx.quantity;
-    const isFullExit = !qty || qty >= posCtx.quantity;
+    const isFullExit = qty === null || qty === undefined || qty >= posCtx.quantity;
 
     // Fix 1: was `currentPrice` (undefined) — now correctly uses `exitPrice`
     const unrealisedPnL = (exitPrice - posCtx.entryPrice) * exitQty;
@@ -482,6 +482,12 @@ export class ExecutionEngine {
       const result = this.paperMode
         ? await this._paperPlaceOrder(order)
         : await this._livePlaceOrder(order, { emergency: true }); // C3 FIX: bypass circuit breaker
+
+      // Defensive check: if broker returns no order ID, do NOT proceed.
+      // This stays in memory so reconciliation (for LIVE) or next scan can retry.
+      if (!result.orderId) {
+        throw new Error('Broker returned no order ID — exit not confirmed');
+      }
 
       transitionOrder(order, ORDER_STATE.PLACED, { brokerId: result.orderId });
       transitionOrder(order, ORDER_STATE.FILLED);
@@ -522,7 +528,7 @@ export class ExecutionEngine {
         }, `📊 Partial exit recorded: ${symbol}`);
       }
 
-      this._persistTrade(order).catch(err =>
+      await this._persistTrade(order).catch(err =>
         log.error({ symbol, err: err.message }, 'Trade persist failed after force exit')
       );
 
@@ -787,7 +793,7 @@ export class ExecutionEngine {
           }
         }
 
-        this._persistTrade(order).catch((err) =>
+        await this._persistTrade(order).catch((err) =>
           log.error({ orderId: order.id, err: err.message }, 'Failed to persist trade to DB')
         );
 

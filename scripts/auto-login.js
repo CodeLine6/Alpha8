@@ -237,9 +237,10 @@ async function browserLogin() {
   let requestToken = null;
 
   try {
-    // Force a completely fresh browser context (clears cookies, cache, local storage)
-    const context = await browser.createBrowserContext();
-    const page = await context.newPage();
+    // S3 FIX: Use the default browser context's first page to avoid opening two windows
+    // (createBrowserContext() triggers a separate incognito window in non-headless mode)
+    const pages = await browser.pages();
+    const page = pages.length > 0 ? pages[0] : await browser.newPage();
 
     // Set viewport and user-agent
     await page.setViewport({ width: 1280, height: 800 });
@@ -262,7 +263,13 @@ async function browserLogin() {
 
     // ─── Step 4: Click Login ─────────────────────────
     console.log('🔘 Clicking login...');
-    await page.click('button[type="submit"]');
+    // S3 FIX: Wrap click in Promise.all to handle navigation reliably
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {
+        console.log('   (Navigation wait timed out or skipped — checking for TOTP screen next)');
+      }),
+      page.click('button[type="submit"]')
+    ]);
 
     // ─── Step 5: Wait for TOTP page ──────────────────────────────
     console.log('⏳ Waiting for TOTP input...');
@@ -282,23 +289,16 @@ async function browserLogin() {
     await new Promise((r) => setTimeout(r, 500));
 
     // ─── Step 6: Find TOTP input FIRST, then generate code ───────
-    // S3 FIX: find the input element before generating the TOTP code.
-    // On cold startups, page.waitForFunction passes early but the input
-    // is not yet interactive. We locate it here, then generate the code
-    // immediately before typing to minimize the time between generation
-    // and submission (TOTP window = 30s, generation + typing < 5s).
-    const totpInputs = await page.$$('input[type="text"], input[type="number"], input[autocomplete="one-time-code"]');
-    let totpInput = null;
-    for (const inp of totpInputs) {
-      const isVisible = await inp.evaluate((el) => el.offsetParent !== null);
-      const value = await inp.evaluate((el) => el.value);
-      if (isVisible && !value) {
-        totpInput = inp;
-        break;
-      }
-    }
+    // S3 FIX: Use a more atomic evaluation to find the input to avoid context destruction
+    const totpSelector = 'input[type="text"], input[type="number"], input[autocomplete="one-time-code"]';
+    await page.waitForSelector(totpSelector, { visible: true, timeout: 10000 });
 
-    if (!totpInput) {
+    const totpInput = await page.evaluateHandle((sel) => {
+      const inputs = Array.from(document.querySelectorAll(sel));
+      return inputs.find(inp => inp.offsetParent !== null && !inp.value);
+    }, totpSelector);
+
+    if (!totpInput || !totpInput.asElement()) {
       await page.screenshot({ path: 'scripts/debug-totp-not-found.png', fullPage: true });
       throw new Error('Could not find TOTP input field (screenshot saved to scripts/debug-totp-not-found.png)');
     }
@@ -340,10 +340,22 @@ async function browserLogin() {
       await new Promise((r) => setTimeout(r, 800));
     }
 
+    // ─── Step 7: Submit TOTP ─────────────────────────────────────
+    console.log('🔘 Submitting TOTP...');
     try {
       const submitBtn = await page.$('button[type="submit"]');
-      if (submitBtn) await submitBtn.click();
-    } catch { /* may auto-submit */ }
+      if (submitBtn) {
+        // S3 FIX: Ensure we wait for the navigation triggered by the submit click
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {
+            console.log('   (Submit navigation wait timed out — check redirect URL)');
+          }),
+          submitBtn.click()
+        ]);
+      }
+    } catch (err) {
+      console.log(`   (Submit interaction feedback: ${err.message})`);
+    }
 
     // ─── Step 8: Wait for redirect with request_token ─
     console.log('⏳ Waiting for redirect...');
