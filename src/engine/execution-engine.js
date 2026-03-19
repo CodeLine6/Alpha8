@@ -301,8 +301,11 @@ export class ExecutionEngine {
 
     if (this.pipeline && consensusResult.signal === 'BUY') {  // ← ADD signal check
       const isConviction = !!consensusResult.convictionStrategy;
+      // Pass the live-setting threshold so the pipeline's bypass check uses
+      // the same value that signal-consensus used to grant convictionStrategy.
+      const convictionThreshold = this.consensus.superConvictionThreshold ?? 80;
       const pipelineResult = await this.pipeline.process(
-        symbol, consensusResult.details || [], regime, isConviction
+        symbol, consensusResult.details || [], regime, isConviction, convictionThreshold
       );
       pipelineLog = pipelineResult.log;
 

@@ -157,9 +157,12 @@ export class EnhancedSignalPipeline {
      *                                         and passed here to avoid double-detection.
      *                                         Falls back to default threshold (2.0) if null.
      * @param {boolean}      [isConvictionBypass=false] - If true, skips Gate 1 (Weighted Consensus).
+     * @param {number}       [convictionThreshold=80]   - Minimum confidence % for Super Conviction
+     *                                         bypass. Must match the live setting from
+     *                                         signal-consensus (SUPER_CONVICTION_THRESHOLD).
      * @returns {Promise<PipelineResult>}
      */
-    async process(symbol, strategySignals, regime = null, isConvictionBypass = false) {
+    async process(symbol, strategySignals, regime = null, isConvictionBypass = false, convictionThreshold = 80) {
         const gateLog = [];
         let positionSizeMult = 1.0;
 
@@ -176,12 +179,14 @@ export class EnhancedSignalPipeline {
             // Feature 10: Super Conviction Bypass
             // If the consensus layer flagged this as an extreme conviction signal,
             // we bypass the weighted consensus requirement but still run Trend/Regime/News.
-            finalSignal = strategySignals.find(s => s.confidence >= 80 && s.signal !== 'HOLD');
+            // convictionThreshold comes from signal-consensus.superConvictionThreshold which
+            // is kept in sync with the SUPER_CONVICTION_THRESHOLD live setting via Redis.
+            finalSignal = strategySignals.find(s => s.confidence >= convictionThreshold && s.signal !== 'HOLD');
             if (finalSignal) {
-                gateLog.push(`⏩ Super Conviction Bypass: ${finalSignal.strategy} (${finalSignal.confidence}%)`);
+                gateLog.push(`⏩ Super Conviction Bypass: ${finalSignal.strategy} (${finalSignal.confidence}% >= ${convictionThreshold}%)`);
             } else {
                 // Should not happen if flag is true, but safety first
-                gateLog.push('❌ Conviction bypass requested but no high-confidence signal found');
+                gateLog.push(`❌ Conviction bypass requested but no signal meets threshold (${convictionThreshold}%)`);
                 return this._blocked('CONSENSUS', gateLog, positionSizeMult);
             }
         } else if (this.adaptiveWeights) {
