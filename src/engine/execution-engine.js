@@ -40,8 +40,7 @@
 import { createLogger } from '../lib/logger.js';
 import { ORDER_STATE, MAX_ORDER_RETRIES, RETRY_DELAY_MS } from '../config/constants.js';
 import { createOrder, transitionOrder, isTerminal } from './order-state-machine.js';
-import { query } from '../lib/db.js';
-import { ShadowRecorder } from '../intelligence/shadow-recorder.js';
+import { query, getPool } from '../lib/db.js';
 
 const log = createLogger('execution-engine');
 
