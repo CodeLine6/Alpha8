@@ -13,48 +13,36 @@
  *   7. Sends Telegram alert on success or failure
  *   8. On failure: engages kill switch
  *
- * FIXES APPLIED:
+ * FIXES:
  *
- *   Fix L1 — Retry the entire browser login flow up to MAX_LOGIN_ATTEMPTS times.
- *     Both reported errors are transient: a slow render causes the selector
- *     timeout; a race on navigation causes "execution context was destroyed".
- *     Retrying after a short backoff resolves both without operator intervention.
+ *   L1 — Retry the entire browser login flow up to MAX_LOGIN_ATTEMPTS times.
+ *        Transient failures (slow render, navigation race) recover automatically.
  *
- *   Fix L2 — Multiple selector fallbacks for every input field.
- *     `input[type="text"]` is too generic. Zerodha uses data-driven class names
- *     that can change. We now try 4 different selectors in order and use
- *     whichever is visible — the login survives minor Zerodha UI updates.
+ *   L2 — Multiple selector fallbacks for every input field.
+ *        Tried in specificity order — first visible, enabled match wins.
+ *        Survives minor Zerodha DOM changes without a code update.
  *
- *   Fix L3 — Navigation race condition eliminated.
- *     `Promise.all([waitForNavigation, click])` fails when navigation completes
- *     before the Promise.all is evaluated. Replaced with a pattern that sets up
- *     the navigation promise BEFORE clicking, using page.waitForNavigation with
- *     a lenient timeout and a fallback URL-poll loop.
+ *   L3 — Navigation race condition eliminated.
+ *        waitForNavigation() is registered BEFORE any click or type that
+ *        could trigger a page transition.
  *
- *   Fix L4 — "Execution context was destroyed" now caught and retried.
- *     Caught at the attempt level — triggers a full retry rather than
- *     immediately engaging the kill switch.
+ *   L3b — Zerodha TOTP auto-submit handled correctly.
+ *        Zerodha auto-submits the moment the 6th TOTP digit is typed —
+ *        no button click occurs. waitForNavigation must be registered
+ *        before typing begins, not after. A 2 s race window detects
+ *        auto-submit; manual button click is used only as a fallback.
  *
- *   Fix L5 — Error classification extended with both new error patterns.
- *     `Waiting for selector` and `Execution context was destroyed` are now
- *     classified as TRANSIENT (retry) rather than UNKNOWN (kill switch).
+ *   L4 — "Execution context was destroyed" caught and retried rather than
+ *        immediately engaging the kill switch.
  *
- *   Fix L6 — TOTP generated as late as possible, typed immediately.
- *     TOTP tokens are valid for 30 seconds. Previously there was up to
- *     800 ms of dead time between generation and typing. Now generated
- *     in the same tick as the first keystroke.
+ *   L5 — Error classification extended: selector timeout and context
+ *        destroyed are classified TRANSIENT (retry) not UNKNOWN (kill switch).
  *
- *   Fix L7 — Unexpected dialogs (popups, alerts) auto-dismissed.
- *     An unhandled `dialog` event freezes Puppeteer indefinitely.
- *     Now auto-accepted so they never block the flow.
+ *   L6 — TOTP generated immediately before type() to minimise expiry risk.
  *
- *   Fix L8 — Images and fonts blocked for faster page loads.
- *     Reduces login time by ~40% on slow connections, giving selectors
- *     more time budget relative to the overall timeout.
+ *   L7 — Unexpected dialogs auto-dismissed so they never freeze Puppeteer.
  *
- * Usage:
- *   node scripts/auto-login.js          # Run once
- *   npm run login                       # Via package.json script
+ *   L8 — Images, fonts, and media blocked for ~40% faster page loads.
  *
  * @module auto-login
  */
@@ -85,17 +73,16 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 const REDIS_KEY = 'kite:access_token';
-const REDIS_TTL = 24 * 60 * 60; // 24 hours in seconds
+const REDIS_TTL = 24 * 60 * 60; // 24 hours
 
-// Fix L1: retry configuration
+// L1: retry config
 const MAX_LOGIN_ATTEMPTS = 3;
-const RETRY_DELAY_MS = 5000; // wait 5 s between attempts
+const RETRY_DELAY_MS = 5000;
 
-// ─── Selector pools ───────────────────────────────────────
+// ─── Selector pools (L2) ─────────────────────────────────
 //
-// Fix L2: Multiple fallback selectors for every input field.
-// Tried in order — first visible, enabled match wins.
-// This survives minor Zerodha DOM changes without a code update.
+// Tried in order — first visible + enabled match wins.
+// Specific selectors first, generic last-resort at the end.
 
 const USERID_SELECTORS = [
   'input#userid',
@@ -103,7 +90,7 @@ const USERID_SELECTORS = [
   'input[autocomplete="username"]',
   'input[placeholder*="User ID"]',
   'input[placeholder*="user ID"]',
-  'input[type="text"]',          // generic last resort
+  'input[type="text"]',
 ];
 
 const PASSWORD_SELECTORS = [
@@ -122,7 +109,7 @@ const TOTP_SELECTORS = [
   'input[placeholder*="TOTP"]',
   'input[placeholder*="6-digit"]',
   'input[type="number"]',
-  'input[type="text"]',          // generic last resort
+  'input[type="text"]',
 ];
 
 const SUBMIT_SELECTORS = [
@@ -166,7 +153,7 @@ async function sendTelegram(message) {
   await telegram.sendRaw(message);
 }
 
-// ─── Redis Helper ────────────────────────────────────────
+// ─── Redis Helper ─────────────────────────────────────────
 
 import { encryptToken } from '../src/lib/crypto-utils.js';
 
@@ -211,7 +198,7 @@ async function storeTokenInRedis(accessToken) {
   }
 }
 
-// ─── Kill Switch Helper ──────────────────────────────────
+// ─── Kill Switch Helper ───────────────────────────────────
 
 async function engageKillSwitch(reason) {
   try {
@@ -236,19 +223,16 @@ async function engageKillSwitch(reason) {
   }
 }
 
-// ─── Error Classification ────────────────────────────────
-//
-// Fix L5: Extended with the two new error patterns that were previously
-// falling through to UNKNOWN and triggering the kill switch unnecessarily.
+// ─── Error Classification (L5) ───────────────────────────
 
 function classifyLoginError(err) {
   const msg = (err.message || '').toLowerCase();
 
-  // Fix L5a: selector timeout — transient slow render, safe to retry
+  // L5a: selector timeout — transient slow render
   if (
     msg.includes('waiting for selector') ||
     msg.includes('failed to find element') ||
-    msg.includes('selector') && msg.includes('failed')
+    (msg.includes('selector') && msg.includes('failed'))
   ) {
     return {
       type: 'TRANSIENT',
@@ -258,7 +242,7 @@ function classifyLoginError(err) {
     };
   }
 
-  // Fix L5b: execution context destroyed — navigation race, safe to retry
+  // L5b: execution context destroyed — navigation race
   if (
     msg.includes('execution context was destroyed') ||
     msg.includes('context was destroyed') ||
@@ -277,7 +261,7 @@ function classifyLoginError(err) {
     return {
       type: 'UI_CHANGED',
       emoji: '🔧',
-      action: 'Zerodha login UI may have changed. Check selector in scripts/auto-login.js. Screenshot saved.',
+      action: 'Zerodha login UI may have changed. Check selectors in scripts/auto-login.js. Screenshot saved.',
       retry: false,
     };
   }
@@ -326,13 +310,11 @@ function classifyLoginError(err) {
   };
 }
 
-// ─── Puppeteer Helpers ───────────────────────────────────
+// ─── Puppeteer Helpers ────────────────────────────────────
 
 /**
  * Find the first visible, enabled element matching any of the given selectors.
- * Returns a Puppeteer ElementHandle or throws if none found within timeoutMs.
- *
- * Fix L2: Centralised selector-pool resolution used for every input field.
+ * L2: Centralised selector-pool resolution used for every input field.
  */
 async function findElement(page, selectors, timeoutMs = 10000) {
   const deadline = Date.now() + timeoutMs;
@@ -343,8 +325,8 @@ async function findElement(page, selectors, timeoutMs = 10000) {
         const handle = await page.evaluateHandle((sel) => {
           const els = Array.from(document.querySelectorAll(sel));
           return els.find(el =>
-            el.offsetParent !== null &&        // visible
-            !el.disabled &&                    // enabled
+            el.offsetParent !== null &&
+            !el.disabled &&
             el.offsetWidth > 0 &&
             el.offsetHeight > 0
           ) || null;
@@ -353,55 +335,40 @@ async function findElement(page, selectors, timeoutMs = 10000) {
         const element = handle.asElement();
         if (element) return element;
       } catch {
-        // selector syntax error or destroyed context — try next
+        // destroyed context or bad selector — try next
       }
     }
     await new Promise(r => setTimeout(r, 200));
   }
 
   throw new Error(
-    `No visible element found for selectors: [${selectors.join(', ')}] ` +
-    `within ${timeoutMs}ms`
+    `No visible element found for selectors: [${selectors.join(', ')}] within ${timeoutMs}ms`
   );
 }
 
 /**
- * Safely click a submit button, waiting for any resulting navigation.
- *
- * Fix L3: The original code used Promise.all([waitForNavigation, click]).
- * If navigation completed before the Promise.all was evaluated, the
- * waitForNavigation promise never settled and the code hung or raced.
- *
- * This version:
- *   1. Registers the navigation listener BEFORE the click.
- *   2. Clicks.
- *   3. Waits up to timeoutMs for navigation OR URL change (whichever comes first).
- *   4. Falls through gracefully if neither fires (single-page transition).
+ * Click a submit button and wait for the resulting navigation.
+ * L3: Navigation listener registered BEFORE the click.
  */
 async function clickAndWaitForNav(page, submitSelectors, timeoutMs = 20000) {
-  // Set up nav listener BEFORE clicking — eliminates the race window
+  // Register nav listener BEFORE clicking — eliminates the race window
   const navPromise = page.waitForNavigation({
     waitUntil: 'networkidle2',
     timeout: timeoutMs,
-  }).catch(() => null); // navigation may not occur (SPA transition)
+  }).catch(() => null);
 
-  // Click the first available submit button
   const btn = await findElement(page, submitSelectors, 5000).catch(() => null);
   if (btn) {
     await btn.click();
   } else {
-    // Fallback: press Enter on the active element
     await page.keyboard.press('Enter');
   }
 
-  // Await navigation (null if it didn't happen — that's fine for SPA flows)
   await navPromise;
-
-  // Extra settling time for React/SPA re-renders
   await new Promise(r => setTimeout(r, 500));
 }
 
-// ─── Browser Login Flow ──────────────────────────────────
+// ─── Browser Login Flow ───────────────────────────────────
 
 async function browserLogin() {
   const kite = new KiteConnect({ api_key: KITE_API_KEY });
@@ -426,15 +393,13 @@ async function browserLogin() {
     const pages = await browser.pages();
     const page = pages.length > 0 ? pages[0] : await browser.newPage();
 
-    // Fix L7: Auto-dismiss unexpected dialogs (alerts, confirms, prompts).
-    // An unhandled dialog event freezes Puppeteer indefinitely.
+    // L7: Auto-dismiss unexpected dialogs that would freeze Puppeteer
     page.on('dialog', async (dialog) => {
       console.log(`⚠️  Auto-dismissing dialog: "${dialog.message().slice(0, 80)}"`);
       await dialog.accept().catch(() => { });
     });
 
-    // Fix L8: Block images and fonts to reduce page load time by ~40%.
-    // This gives selector waits more effective budget on slow connections.
+    // L8: Block images/fonts/media for ~40% faster page loads
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const type = req.resourceType();
@@ -455,29 +420,25 @@ async function browserLogin() {
     console.log('📄 Opening Kite login page...');
     await page.goto(loginUrl, { waitUntil: 'networkidle2', timeout: 30000 });
 
-    // ─── Step 2: Enter User ID ───────────────────────────
-    // Fix L2: tries USERID_SELECTORS in order, first visible wins
+    // ─── Step 2: Enter User ID ────────────────────────────
     console.log('👤 Entering user ID...');
     const userIdInput = await findElement(page, USERID_SELECTORS, 15000);
-    await userIdInput.click({ clickCount: 3 }); // select-all before typing
+    await userIdInput.click({ clickCount: 3 });
     await userIdInput.type(ZERODHA_USER_ID, { delay: 50 });
 
-    // ─── Step 3: Enter Password ──────────────────────────
-    // Fix L2: tries PASSWORD_SELECTORS in order
+    // ─── Step 3: Enter Password ───────────────────────────
     console.log('🔑 Entering password...');
     const passwordInput = await findElement(page, PASSWORD_SELECTORS, 10000);
     await passwordInput.click({ clickCount: 3 });
     await passwordInput.type(ZERODHA_PASSWORD, { delay: 50 });
 
-    // ─── Step 4: Submit credentials ─────────────────────
-    // Fix L3: nav listener registered BEFORE click eliminates the race
+    // ─── Step 4: Submit credentials ───────────────────────
+    // L3: nav listener registered inside clickAndWaitForNav before click
     console.log('🔘 Submitting credentials...');
     await clickAndWaitForNav(page, SUBMIT_SELECTORS, 20000);
 
-    // ─── Step 5: Wait for TOTP page ─────────────────────
+    // ─── Step 5: Wait for TOTP page ───────────────────────
     console.log('⏳ Waiting for TOTP input...');
-
-    // Wait for any TOTP-like input to become visible
     await page.waitForFunction(
       (selectors) => {
         for (const sel of selectors) {
@@ -493,8 +454,7 @@ async function browserLogin() {
       TOTP_SELECTORS
     );
 
-    // ─── Step 6: Find TOTP input ─────────────────────────
-    // Fix L2: tries TOTP_SELECTORS in order
+    // ─── Step 6: Find TOTP input ──────────────────────────
     console.log('🔐 Locating TOTP input...');
     const totpInput = await findElement(page, TOTP_SELECTORS, 10000);
 
@@ -503,49 +463,97 @@ async function browserLogin() {
       throw new Error('Could not find TOTP input field (debug-totp-not-found.png saved)');
     }
 
-    // Fix L6: Generate TOTP as LATE as possible — right before typing.
-    // TOTP tokens are valid for 30 s. Every millisecond of dead time
-    // between generation and submission is expiry risk.
+    // ─── Step 7: Type TOTP and handle auto-submit ─────────
+    //
+    // L3b FIX: Zerodha auto-submits the moment the 6th TOTP digit is
+    // entered. The page navigates DURING type() — while Puppeteer is still
+    // operating in the same frame. If waitForNavigation is set up after
+    // type() the navigation event has already fired and any subsequent
+    // page interaction throws "execution context was destroyed".
+    //
+    // Fix: register waitForNavigation BEFORE the first keystroke so the
+    // event is captured regardless of how fast Zerodha's handler fires.
+    // Then race the nav promise against a 2 s timeout:
+    //   nav resolved  → auto-submit fired, skip button click entirely
+    //   timeout fires → auto-submit didn't happen, fall back to manual click
+
     const totpGenerator = new TOTP({ secret: ZERODHA_TOTP_SECRET });
-    const totp = totpGenerator.generate();
-    console.log(`🔐 Generated TOTP: ${totp.slice(0, 2)}****`);
 
-    await totpInput.click({ clickCount: 3 });
-    await totpInput.type(totp, { delay: 80 });
+    /**
+     * Type a TOTP code and wait to see whether Zerodha auto-submits.
+     * Returns true if auto-submit was detected, false if a manual click
+     * will be needed. Throws 'TOTP_INVALID:...' if Zerodha showed an error.
+     */
+    const typeAndDetectSubmit = async (totpCode) => {
+      // MUST register before the first keystroke (L3b)
+      const navPromise = page.waitForNavigation({
+        waitUntil: 'networkidle2',
+        timeout: 30000,
+      }).catch(() => null);
 
-    // Brief pause — let Zerodha's client-side validate the 6-digit input
-    await new Promise(r => setTimeout(r, 600));
+      await totpInput.click({ clickCount: 3 });
+      await totpInput.type(totpCode, { delay: 80 });
 
-    // Check for immediate TOTP error before submitting
-    const pageError = await page.evaluate(() => {
-      const selectors = ['.error-message', '.alert-danger', '[class*="error"]', '.is-error'];
-      for (const sel of selectors) {
-        const el = document.querySelector(sel);
-        if (el && el.textContent.trim()) return el.textContent.trim();
+      // Give Zerodha's auto-submit handler up to 2 s to fire
+      const autoSubmitted = await Promise.race([
+        navPromise.then(() => true),
+        new Promise(r => setTimeout(() => r(false), 2000)),
+      ]);
+
+      if (autoSubmitted) {
+        console.log('✅ TOTP auto-submitted by Zerodha — navigation detected');
+        return true;
       }
-      return null;
-    });
 
-    if (pageError && (pageError.toLowerCase().includes('otp') || pageError.toLowerCase().includes('invalid'))) {
-      // TOTP may have expired — wait for next 30 s window and retry once
-      console.log(`⚠️  TOTP validation error: "${pageError.slice(0, 60)}" — regenerating...`);
+      // No auto-submit — check whether Zerodha displayed a validation error
+      const pageError = await page.evaluate(() => {
+        const sels = ['.error-message', '.alert-danger', '[class*="error"]', '.is-error'];
+        for (const s of sels) {
+          const el = document.querySelector(s);
+          if (el && el.textContent.trim()) return el.textContent.trim();
+        }
+        return null;
+      }).catch(() => null);
+
+      if (
+        pageError &&
+        (pageError.toLowerCase().includes('otp') || pageError.toLowerCase().includes('invalid'))
+      ) {
+        throw new Error(`TOTP_INVALID: ${pageError.slice(0, 80)}`);
+      }
+
+      return false; // no error, no auto-submit — caller should click manually
+    };
+
+    // L6: generate TOTP immediately before typing
+    const totp1 = totpGenerator.generate();
+    console.log(`🔐 Generated TOTP: ${totp1.slice(0, 2)}****`);
+
+    let autoSubmitted = false;
+    try {
+      autoSubmitted = await typeAndDetectSubmit(totp1);
+    } catch (err) {
+      if (!err.message.startsWith('TOTP_INVALID')) throw err;
+
+      // TOTP rejected — wait for next 30 s window and retry once
+      console.log(`⚠️  TOTP rejected: "${err.message.replace('TOTP_INVALID: ', '').slice(0, 60)}" — regenerating...`);
       await new Promise(r => setTimeout(r, 3000));
 
-      // Clear and re-type with fresh TOTP
       await totpInput.click({ clickCount: 3 });
       await page.keyboard.press('Backspace');
-      const retryTotp = totpGenerator.generate();
-      console.log(`🔐 Retry TOTP: ${retryTotp.slice(0, 2)}****`);
-      await totpInput.type(retryTotp, { delay: 80 });
-      await new Promise(r => setTimeout(r, 600));
+
+      const totp2 = totpGenerator.generate();
+      console.log(`🔐 Retry TOTP: ${totp2.slice(0, 2)}****`);
+      autoSubmitted = await typeAndDetectSubmit(totp2);
     }
 
-    // ─── Step 7: Submit TOTP ─────────────────────────────
-    // Fix L3: nav listener registered BEFORE click
-    console.log('🔘 Submitting TOTP...');
-    await clickAndWaitForNav(page, SUBMIT_SELECTORS, 30000);
+    if (!autoSubmitted) {
+      // Zerodha did not auto-submit — click the button manually
+      console.log('🔘 Submitting TOTP manually (auto-submit did not fire)...');
+      await clickAndWaitForNav(page, SUBMIT_SELECTORS, 30000);
+    }
 
-    // ─── Step 8: Wait for redirect with request_token ────
+    // ─── Step 8: Wait for redirect with request_token ─────
     console.log('⏳ Waiting for redirect with request_token...');
 
     try {
@@ -559,14 +567,15 @@ async function browserLogin() {
         { timeout: 30000 }
       );
     } catch {
-      // waitForFunction timed out — take a screenshot and throw a classifiable error
       await page.screenshot({ path: 'scripts/debug-redirect-timeout.png', fullPage: true });
       const currentUrl = page.url();
-      const pageText = await page.evaluate(() => document.body?.innerText?.slice(0, 300) || '');
+      const pageText = await page.evaluate(
+        () => document.body?.innerText?.slice(0, 300) || ''
+      ).catch(() => '');
       throw new Error(
         `Redirect timed out.\n` +
         `  Current URL: ${currentUrl}\n` +
-        `  Page content snippet: ${pageText.slice(0, 150)}\n` +
+        `  Page snippet: ${pageText.slice(0, 150)}\n` +
         `  Debug screenshot: scripts/debug-redirect-timeout.png`
       );
     }
@@ -574,7 +583,7 @@ async function browserLogin() {
     const finalUrl = page.url();
     console.log(`🔗 Redirect URL: ${finalUrl.slice(0, 100)}...`);
 
-    // ─── Step 9: Extract request_token ───────────────────
+    // ─── Step 9: Extract request_token ────────────────────
     const urlParams = new URL(finalUrl).searchParams;
     requestToken = urlParams.get('request_token');
 
@@ -593,12 +602,7 @@ async function browserLogin() {
   return requestToken;
 }
 
-// ─── Retry-wrapped login ─────────────────────────────────
-//
-// Fix L1: Wraps browserLogin() with up to MAX_LOGIN_ATTEMPTS retries.
-// Only TRANSIENT errors (network, selector timeout, context destroyed)
-// are retried. UI_CHANGED and BAD_CREDENTIALS bail out immediately —
-// retrying those would just waste time and delay the kill switch alert.
+// ─── Retry-wrapped login (L1) ─────────────────────────────
 
 async function browserLoginWithRetry() {
   let lastError = null;
@@ -607,21 +611,19 @@ async function browserLoginWithRetry() {
     try {
       console.log(`\n🔄 Login attempt ${attempt}/${MAX_LOGIN_ATTEMPTS}...`);
       return await browserLogin();
-
     } catch (err) {
       lastError = err;
       const classification = classifyLoginError(err);
 
       console.error(`❌ Attempt ${attempt} failed [${classification.type}]: ${err.message}`);
 
-      // Non-retryable — bail immediately so the kill switch fires faster
       if (!classification.retry) {
         console.error(`   Not retrying: ${classification.action}`);
         throw err;
       }
 
       if (attempt < MAX_LOGIN_ATTEMPTS) {
-        const waitMs = RETRY_DELAY_MS * attempt; // linear backoff: 5s, 10s
+        const waitMs = RETRY_DELAY_MS * attempt;
         console.log(`   Retrying in ${waitMs / 1000}s... (${classification.action})`);
         await new Promise(r => setTimeout(r, waitMs));
       }
@@ -631,7 +633,7 @@ async function browserLoginWithRetry() {
   throw lastError;
 }
 
-// ─── Generate Access Token ───────────────────────────────
+// ─── Generate Access Token ────────────────────────────────
 
 async function generateAccessToken(requestToken) {
   const kite = new KiteConnect({ api_key: KITE_API_KEY });
@@ -645,7 +647,7 @@ async function generateAccessToken(requestToken) {
   return session.access_token;
 }
 
-// ─── Main ────────────────────────────────────────────────
+// ─── Main ─────────────────────────────────────────────────
 
 export async function runAutoLogin(options = {}) {
   const { silent = false } = options;
@@ -668,16 +670,10 @@ export async function runAutoLogin(options = {}) {
   }
 
   try {
-    // Step 1: Browser login → request_token (with retries)
     const requestToken = await browserLoginWithRetry();
-
-    // Step 2: Exchange request_token → access_token
     const accessToken = await generateAccessToken(requestToken);
-
-    // Step 3: Store in Redis
     await storeTokenInRedis(accessToken);
 
-    // Step 4: Verify the token works
     const kite = new KiteConnect({ api_key: KITE_API_KEY });
     kite.setAccessToken(accessToken);
     const profile = await kite.getProfile();
@@ -688,7 +684,6 @@ export async function runAutoLogin(options = {}) {
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
-    // Step 5: Telegram success alert
     await sendTelegram(
       `✅ <b>Alpha8 Authenticated</b>\n` +
       `👤 User: ${profile.user_name} (${profile.user_id})\n` +
@@ -713,13 +708,11 @@ export async function runAutoLogin(options = {}) {
       console.error('');
     }
 
-    // Engage kill switch
     await engageKillSwitch(`Auto-login failed: ${err.message}`);
 
     const classification = classifyLoginError(err);
     console.error(`[Login Failure Type: ${classification.type}] ${classification.action}`);
 
-    // Telegram failure alert
     await sendTelegram(
       `🛑 <b>Alpha8 Login FAILED</b>\n\n` +
       `${classification.emoji} <b>Type: ${classification.type}</b>\n` +
@@ -733,7 +726,7 @@ export async function runAutoLogin(options = {}) {
   }
 }
 
-// ─── CLI Entrypoint ──────────────────────────────────────
+// ─── CLI Entrypoint ───────────────────────────────────────
 const isMain = process.argv[1] &&
   fileURLToPath(import.meta.url).toLowerCase() === path.resolve(process.argv[1]).toLowerCase();
 

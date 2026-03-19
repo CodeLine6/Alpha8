@@ -350,21 +350,21 @@ export function createApiHandler(deps) {
       } catch { /* OK — no trades yet */ }
 
       json(res, {
-        pnl: dbSummary ? parseFloat(dbSummary.pnl) : tradeStats.totalPnl || 0,
-        pnlPct: dbSummary ? parseFloat(dbSummary.pnl_pct) : (tradeStats.totalPnl / config.TRADING_CAPITAL * 100) || 0,
-        tradeCount: dbSummary ? dbSummary.trade_count : tradeStats.count,
-        winCount: dbSummary ? dbSummary.win_count : tradeStats.wins,
-        lossCount: dbSummary ? dbSummary.loss_count : tradeStats.losses,
-        filled: dbSummary ? dbSummary.filled : tradeStats.filled,
-        rejected: dbSummary ? dbSummary.rejected : tradeStats.rejected,
+        pnl: tradeStats.totalPnl || 0,
+        pnlPct: (tradeStats.totalPnl / config.TRADING_CAPITAL * 100) || 0,
+        tradeCount: tradeStats.count,
+        winCount: tradeStats.wins,
+        lossCount: tradeStats.losses,
+        filled: tradeStats.filled,
+        rejected: tradeStats.rejected,
         drawdownPct: riskStatus.drawdownPct || 0,
         capital: config.TRADING_CAPITAL,
         capitalDeployed: riskStatus.dailyPnl ? Math.abs(riskStatus.dailyPnl) : 0,
         paperMode: !config.LIVE_TRADING,
         killSwitchEngaged: ksStatus.engaged,
         killSwitchReason: ksStatus.reason,
-        bestTrade: dbSummary?.best_trade || null,
-        worstTrade: dbSummary?.worst_trade || null,
+        bestTrade: null,
+        worstTrade: null,
       });
     } catch (err) {
       log.error({ err }, 'Error in /api/summary');
