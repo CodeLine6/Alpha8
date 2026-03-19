@@ -290,33 +290,31 @@ export class ExecutionEngine {
 
 
 
-    let finalSignal = consensusResult;
-    let adjustedQty = quantity;
-    let pipelineLog = null;
     let acted = false;
     let order = null;
 
-    if (this.pipeline) {
+    // src/engine/execution-engine.js — processSignal()
+    // Only run the pipeline for BUY signals:
+
+    let finalSignal = consensusResult;
+    let adjustedQty = quantity;
+    let pipelineLog = null;
+
+    if (this.pipeline && consensusResult.signal === 'BUY') {  // ← ADD signal check
       const isConviction = !!consensusResult.convictionStrategy;
       const pipelineResult = await this.pipeline.process(
-        symbol,
-        consensusResult.details || [],
-        regime,
-        isConviction
+        symbol, consensusResult.details || [], regime, isConviction
       );
       pipelineLog = pipelineResult.log;
 
       if (!pipelineResult.allowed) {
-        log.info({ symbol, regime, blockedBy: pipelineResult.blockedBy },
-          `Signal BLOCKED by pipeline gate: ${pipelineResult.blockedBy}`);
-        
-        // Record shadow even if blocked by pipeline (Fix S7: Capture pipeline failures)
+        log.info({ symbol, blockedBy: pipelineResult.blockedBy }, 'BUY blocked by pipeline');
         if (this.shadowRecorder) {
           this.shadowRecorder.recordSignals(
-            symbol, consensusResult.details || [], consensusResult, false, currentPrice, regime, this.paperMode
-          ).catch(err => log.warn({ symbol, err: err.message }, 'Shadow signal (BLOCKED) recording failed'));
+            symbol, consensusResult.details || [], consensusResult,
+            false, currentPrice, regime, this.paperMode
+          ).catch(() => { });
         }
-
         return {
           action: `BLOCKED:${pipelineResult.blockedBy}`,
           order: null,
@@ -327,13 +325,13 @@ export class ExecutionEngine {
 
       if (pipelineResult.positionSizeMult < 1.0) {
         adjustedQty = Math.max(1, Math.floor(quantity * pipelineResult.positionSizeMult));
-        log.info({ symbol, originalQty: quantity, adjustedQty, multiplier: pipelineResult.positionSizeMult },
-          'Position size reduced by regime detector');
       }
-
       if (pipelineResult.signal) {
         finalSignal = { ...consensusResult, ...pipelineResult.signal };
       }
+    } else if (this.pipeline && consensusResult.signal === 'SELL') {
+      // SELL signals bypass pipeline gates — exits must always be allowed
+      log.debug({ symbol }, 'SELL signal bypasses pipeline gates');
     }
 
     if (finalSignal.signal === 'BUY') {
@@ -375,7 +373,7 @@ export class ExecutionEngine {
         symbol,
         consensusResult.details || [],
         consensusResult,
-        isActed,
+        !!isActed,
         currentPrice,
         regime,
         this.paperMode, // S6 FIX: pass paperMode
@@ -1095,43 +1093,45 @@ export class ExecutionEngine {
 
   /** @private */
   async _persistSignals(symbol, consensus, currentPrice = null) {
-    let consensusSignalId = null;
+    const pool = getPool();
+    const client = await pool.connect();
     try {
       const hasPosition = this._filledPositions.has(symbol);
-      await query('BEGIN');
+      await client.query('BEGIN');
 
       for (const detail of (consensus.details || [])) {
         const sig = detail.signal || 'HOLD';
-        // Fix (Phase 16): Skip HOLD signals if no position exists
         if (sig === 'HOLD' && !hasPosition) continue;
-
-        await query(
+        await client.query(
           `INSERT INTO signals (symbol, strategy, signal, confidence, acted_on, reason, price, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
           [symbol, detail.strategy || 'unknown', sig,
-            detail.confidence || 0, false, (detail.reason || '').slice(0, 500), currentPrice || null]
+            detail.confidence || 0, false,
+            (detail.reason || '').slice(0, 500), currentPrice || null]
         );
       }
 
       const conSig = consensus.signal || 'HOLD';
-      // Fix (Phase 16): Skip CONSENSUS HOLD signal if no position exists
+      let consensusSignalId = null;
       if (conSig !== 'HOLD' || hasPosition) {
-        const consensusRow = await query(
+        const res = await client.query(
           `INSERT INTO signals (symbol, strategy, signal, confidence, acted_on, reason, price, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-           RETURNING id`,
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) RETURNING id`,
           [symbol, 'CONSENSUS', conSig, consensus.confidence || 0,
             false, (consensus.reason || '').slice(0, 500), currentPrice || null]
         );
-        consensusSignalId = consensusRow.rows?.[0]?.id ?? null;
+        consensusSignalId = res.rows?.[0]?.id ?? null;
       }
 
-      await query('COMMIT');
+      await client.query('COMMIT');
+      return consensusSignalId;
     } catch (err) {
-      try { await query('ROLLBACK'); } catch { /* swallow */ }
+      await client.query('ROLLBACK').catch(() => { });
       log.error({ symbol, err: err.message }, 'Failed to persist signals to DB');
+      return null;
+    } finally {
+      client.release(); // ← ALWAYS release the connection
     }
-    return consensusSignalId;
   }
 
   /** @private */

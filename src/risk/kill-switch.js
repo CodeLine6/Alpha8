@@ -1,5 +1,11 @@
 import { createLogger } from '../lib/logger.js';
-import { writeFileSync, readFileSync, existsSync } from 'node:fs';
+// BUG #23 FIX: unlinkSync was being dynamically imported inside async methods
+// (reset() and _persistToRedis()) with `await import('node:fs')` even though
+// the module was already statically imported at the top of the file.
+// Using await import() in a synchronous-intent block adds unnecessary async
+// overhead in the critical shutdown path and is semantically wrong.
+// Added unlinkSync to the static import — one line change, zero behaviour change.
+import { writeFileSync, readFileSync, existsSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 
 const log = createLogger('kill-switch');
@@ -59,7 +65,7 @@ export class KillSwitch {
     if (this._cacheGet) {
       try {
         const stored = await this._cacheGet(REDIS_KEY);
-        if (stored.engaged) {
+        if (stored && stored.engaged) {
           this._engaged = true;
           this._reason = stored.reason || 'Restored from Redis';
           this._engagedAt = stored.engagedAt || null;
@@ -95,7 +101,7 @@ export class KillSwitch {
             engagedAt: this._engagedAt,
             source: 'file',
           }, '🛑 KILL SWITCH RESTORED FROM FILE — Redis was unavailable at prior engage()');
-          
+
           // Re-persist to Redis now that we have the state
           await this._persistToRedis();
         }
@@ -274,10 +280,11 @@ export class KillSwitch {
     // Await persistence clear (Redis + File)
     await this._persistToRedis();
 
-    // C6 FIX: also delete the file so file fallback doesn't re-engage on next restart
+    // BUG #23 FIX: unlinkSync is now statically imported at the top of the file.
+    // Previously this used `await import('node:fs')` which is redundant
+    // (node:fs is already imported) and adds needless async overhead here.
     try {
       if (existsSync(KILL_SWITCH_FILE)) {
-        const { unlinkSync } = await import('node:fs');
         unlinkSync(KILL_SWITCH_FILE);
         log.info({ path: KILL_SWITCH_FILE }, 'Kill switch file cleared on reset');
       }
@@ -316,14 +323,14 @@ export class KillSwitch {
     }
 
     // ── Secondary: Local file ─────────────────────────────────────
+    // BUG #23 FIX: No longer uses `await import('node:fs')` — unlinkSync
+    // is now statically imported at the top of the file.
     try {
       if (this._engaged) {
         writeFileSync(KILL_SWITCH_FILE, JSON.stringify(state), 'utf8');
         log.debug({ path: KILL_SWITCH_FILE }, 'Kill switch state persisted to file');
       } else {
-        // If we are disengaging, also try to clear the file
         if (existsSync(KILL_SWITCH_FILE)) {
-          const { unlinkSync } = await import('node:fs');
           unlinkSync(KILL_SWITCH_FILE);
         }
       }
@@ -331,7 +338,7 @@ export class KillSwitch {
       log.warn({ err: fsErr.message }, 'Kill switch file persistence failed');
     }
 
-    // N6 FIX: re-throw Redis error if it occurred, so callers (and tests) know persistence is compromised.
+    // Re-throw Redis error so callers (and tests) know persistence is compromised.
     if (redisError) throw redisError;
   }
 }

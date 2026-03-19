@@ -7,6 +7,16 @@ dotenvConfig();
 /**
  * Zod schema for all environment variables.
  * Fails fast at startup if any required variable is missing or invalid.
+ *
+ * BUG #19 FIX: Added 6 previously un-validated env vars that were used throughout
+ * the codebase but absent from this schema — typos in .env were silently ignored
+ * and the system fell back to hardcoded defaults with no warning:
+ *   PROFIT_TARGET_PCT, RISK_REWARD_RATIO, PARTIAL_EXIT_ENABLED,
+ *   PARTIAL_EXIT_PCT, SIGNAL_REVERSAL_ENABLED, SCOUT_MAX_DYNAMIC,
+ *   SCOUT_EXCLUDE_SYMBOLS
+ *
+ * Also added cross-field refinement: STOP_LOSS_PCT must be < TRAILING_STOP_PCT,
+ * otherwise the trailing stop can never trigger before the hard stop floor.
  */
 const envSchema = z.object({
   // ─── Application ──────────────────────────────────────
@@ -52,14 +62,27 @@ const envSchema = z.object({
   MAX_POSITION_COUNT: z.coerce.number().int().positive().default(5),
   PER_TRADE_STOP_LOSS_PCT: z.coerce.number().positive().max(100).default(1),
   KILL_SWITCH_DRAWDOWN_PCT: z.coerce.number().positive().max(100).default(5),
-  MAX_CAPITAL_EXPOSURE_PCT: z.coerce.number().positive().max(100).default(100),
+  MAX_CAPITAL_EXPOSURE_PCT: z.coerce.number().positive().max(200).default(100),
   MAX_POSITION_VALUE_PCT: z.coerce.number().positive().max(100).default(100),
 
   // ─── Position Management ─────────────────────────────
   STOP_LOSS_PCT: z.coerce.number().positive().max(100).default(1),
-  TRAILING_STOP_PCT: z.coerce.number().positive().max(100).default(1.0),
+  TRAILING_STOP_PCT: z.coerce.number().positive().max(100).default(1.5),
   MAX_HOLD_MINUTES: z.coerce.number().int().positive().default(90),
   POSITION_MGMT_ENABLED: z
+    .string()
+    .transform((v) => v !== 'false')
+    .default('true'),
+
+  // ─── Exit Strategies (BUG #19 — previously missing) ──
+  PROFIT_TARGET_PCT: z.coerce.number().positive().max(20).default(1.8),
+  RISK_REWARD_RATIO: z.coerce.number().positive().max(10).default(2.0),
+  PARTIAL_EXIT_ENABLED: z
+    .string()
+    .transform((v) => v !== 'false')
+    .default('true'),
+  PARTIAL_EXIT_PCT: z.coerce.number().int().min(10).max(90).default(50),
+  SIGNAL_REVERSAL_ENABLED: z
     .string()
     .transform((v) => v !== 'false')
     .default('true'),
@@ -67,24 +90,41 @@ const envSchema = z.object({
   // ─── Watchlist ────────────────────────────────────────
   WATCHLIST: z.string().optional().default('RELIANCE,TCS,INFY,HDFCBANK,ICICIBANK'),
 
+  // ─── Symbol Scout (BUG #19 — previously missing) ─────
+  SCOUT_MAX_DYNAMIC: z.coerce.number().int().positive().default(10),
+  SCOUT_EXCLUDE_SYMBOLS: z.string().optional().default(''),
+
   // ─── API Authentication ───────────────────────────────
   API_SECRET_KEY: z.string().optional().default(''),
 
+  // ─── Token Encryption ────────────────────────────────
+  TOKEN_ENCRYPTION_KEY: z.string().optional().default(''),
+
   // ─── News Sentiment Filter ────────────────────────────
-  // Optional — leave empty to disable news sentiment gate.
-  // Get your key from Google AI Studio
   GEMINI_API_KEY: z.string().optional().default(''),
-}).refine(
-  (data) => data.KILL_SWITCH_DRAWDOWN_PCT >= data.MAX_DAILY_LOSS_PCT, {
-  message: 'KILL_SWITCH_DRAWDOWN_PCT must be >= MAX_DAILY_LOSS_PCT',
-  path: ['KILL_SWITCH_DRAWDOWN_PCT'],
-}
-).refine(
-  (data) => data.PER_TRADE_STOP_LOSS_PCT <= data.MAX_DAILY_LOSS_PCT, {
-  message: 'PER_TRADE_STOP_LOSS_PCT should be <= MAX_DAILY_LOSS_PCT',
-  path: ['PER_TRADE_STOP_LOSS_PCT'],
-}
-);
+  GEMINI_MODEL: z.string().optional().default('gemini-1.5-flash'),
+})
+  .refine(
+    (data) => data.KILL_SWITCH_DRAWDOWN_PCT >= data.MAX_DAILY_LOSS_PCT, {
+    message: 'KILL_SWITCH_DRAWDOWN_PCT must be >= MAX_DAILY_LOSS_PCT',
+    path: ['KILL_SWITCH_DRAWDOWN_PCT'],
+  }
+  )
+  .refine(
+    (data) => data.PER_TRADE_STOP_LOSS_PCT <= data.MAX_DAILY_LOSS_PCT, {
+    message: 'PER_TRADE_STOP_LOSS_PCT should be <= MAX_DAILY_LOSS_PCT',
+    path: ['PER_TRADE_STOP_LOSS_PCT'],
+  }
+  )
+  // BUG #19 FIX — cross-field: stop loss must be less than trailing stop.
+  // If STOP_LOSS_PCT >= TRAILING_STOP_PCT the hard floor would trigger before
+  // the trail ever fires, making TRAILING_STOP_PCT completely dead.
+  .refine(
+    (data) => data.STOP_LOSS_PCT < data.TRAILING_STOP_PCT, {
+    message: 'STOP_LOSS_PCT must be less than TRAILING_STOP_PCT',
+    path: ['STOP_LOSS_PCT'],
+  }
+  );
 
 /**
  * Validated and typed configuration object.

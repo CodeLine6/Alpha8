@@ -13,9 +13,29 @@
  *   - Exit on SELL signal, stop-loss trigger, or 15:15 IST square-off
  *   - Position sizing: risk 1% of current capital per trade
  *   - No lookahead bias: strategy only sees candles up to current bar
+ *
+ * BUG #17 FIX — SQUARE_OFF_TIME aligned with live system:
+ *   The original file hardcoded `const SQUARE_OFF_TIME = '15:45'` — a full
+ *   30 minutes later than the live system's 15:15 IST cutoff defined in
+ *   src/config/constants.js.
+ *
+ *   This caused backtest results to include trades between 15:15 and 15:44
+ *   that are NEVER executable in live trading. Strategies with late-day BUY
+ *   signals would appear profitable in backtests but those signals are always
+ *   blocked in production by the square-off guard. The inflated win-rate fed
+ *   directly into the Kelly criterion's position sizing — meaning live trades
+ *   were oversized relative to actual strategy performance.
+ *
+ *   FIX: Import SQUARE_OFF_TIME from the canonical constants file so backtest
+ *   and live system always use the same value. If the live cutoff ever changes,
+ *   both are updated in one place.
  */
 
 import { groupByDay, toISTTimeString } from './historical-data-fetcher.js';
+// BUG #17 FIX: Import the canonical square-off time from constants so backtest
+// and live system always agree. Previously hardcoded as '15:45' here vs '15:15'
+// in production — a 30-minute gap that inflated backtest P&L.
+import { SQUARE_OFF_TIME } from '../config/constants.js';
 
 // ── Strategy imports (lazy — resolved at runtime from project root) ───────────
 // We import these lazily so backtest.js can be run standalone without the full
@@ -37,9 +57,6 @@ const WARMUP_CANDLES = {
   'VWAP_MOMENTUM': 5, // Needs a few candles for volume average
   'BREAKOUT_VOLUME': 22, // 20-period lookback + buffer
 };
-
-/** Square-off time in IST "HH:MM" */
-const SQUARE_OFF_TIME = '15:45';
 
 /** Stop-loss: 1% below entry (matching risk-manager.js) */
 const STOP_LOSS_PCT = 0.01;
@@ -120,8 +137,11 @@ export class BacktestEngine {
     const days = groupByDay(candles);
     const sortedDays = [...days.keys()].sort();
 
-    this.logger(`[BacktestEngine] Starting simulation: ${sortedDays.length} trading days, ` +
-      `${candles.length} candles, strategies: [${this.strategyNames.join(', ')}]`);
+    this.logger(
+      `[BacktestEngine] Starting simulation: ${sortedDays.length} trading days, ` +
+      `${candles.length} candles, strategies: [${this.strategyNames.join(', ')}], ` +
+      `squareOff: ${SQUARE_OFF_TIME} IST`  // log the value so it's auditable
+    );
 
     for (const day of sortedDays) {
       const dayCandles = days.get(day);
@@ -165,6 +185,9 @@ export class BacktestEngine {
       const timeIST = toISTTimeString(candle.date);
 
       // ── Square-off check ──────────────────────────────────────────────────
+      // BUG #17 FIX: SQUARE_OFF_TIME is now imported from constants.js (15:15),
+      // matching the live system. Previously this constant was '15:45' — allowing
+      // 30 extra minutes of backtest trading that can never happen in production.
       if (timeIST >= SQUARE_OFF_TIME) {
         if (this.position) {
           this._closePosition(candle, 'SQUARE_OFF', candle.open);
@@ -272,17 +295,13 @@ export class BacktestEngine {
     const entryPrice = candle.close;
     const stopLoss = entryPrice * (1 - STOP_LOSS_PCT);
 
-    // Position sizing: risk 1% of capital, stop distance = 1%
-    // => quantity = (capital * RISK_PER_TRADE_PCT) / (entryPrice * STOP_LOSS_PCT)
-    // => simplified: risk amount / price drop to stop = shares
     const riskAmount = this.capital * RISK_PER_TRADE_PCT;
     const stopDistance = entryPrice * STOP_LOSS_PCT;
     let quantity = Math.floor(riskAmount / stopDistance);
 
-    // Cap at MAX_POSITION_PCT of capital
     const maxShares = Math.floor((this.capital * MAX_POSITION_PCT) / entryPrice);
     quantity = Math.min(quantity, maxShares);
-    quantity = Math.max(quantity, 1); // At least 1 share
+    quantity = Math.max(quantity, 1);
 
     this.position = {
       symbol: this.symbol,
@@ -345,7 +364,6 @@ export class BacktestEngine {
 
       try {
         const mod = await loader();
-        // Support default export (class) or named export
         const StratClass = mod.default ?? mod[Object.keys(mod)[0]];
         instances[name] = new StratClass();
       } catch (err) {

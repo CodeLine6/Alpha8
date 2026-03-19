@@ -3,11 +3,19 @@
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 
+/**
+ * BUG #24 FIX — Duplicate ⚙️ icon on Live Params and Settings:
+ *   Both nav items used the same ⚙️ emoji. On mobile viewports where
+ *   sidebar-label text is hidden (width < 768px), both items were visually
+ *   identical — a user could not distinguish them without tapping each one.
+ *   Changed Live Params to use 🎛️ (control sliders), which is semantically
+ *   appropriate for a parameter tuning panel.
+ */
 const NAV_ITEMS = [
     { href: '/', label: 'Dashboard', icon: '📊' },
     { href: '/history', label: 'History', icon: '📋' },
     { href: '/strategies', label: 'Strategies', icon: '🧠' },
-    { href: '/live-params', label: 'Live Params', icon: '⚙️' },  // ← add this
+    { href: '/live-params', label: 'Live Params', icon: '🎛️' }, // ← was ⚙️ (BUG #24 FIX)
     { href: '/settings', label: 'Settings', icon: '⚙️' },
 ];
 
@@ -39,8 +47,8 @@ export default function Sidebar() {
                             href={item.href}
                             title={item.label}
                             className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 ${isActive
-                                ? 'bg-blue-500/10 text-blue-400 border border-blue-500/30'
-                                : 'text-[var(--text-secondary)] hover:bg-[var(--bg-card-hover)] hover:text-[var(--text-primary)] border border-transparent'
+                                    ? 'bg-blue-500/10 text-blue-400 border border-blue-500/30'
+                                    : 'text-[var(--text-secondary)] hover:bg-[var(--bg-card-hover)] hover:text-[var(--text-primary)] border border-transparent'
                                 }`}
                         >
                             <span className="text-lg shrink-0">{item.icon}</span>

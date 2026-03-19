@@ -9,8 +9,10 @@
  */
 
 import { describe, it, expect, beforeEach, jest } from '@jest/globals';
+import { calculateMetrics } from '../src/backtesting/metrics-calculator.js'; // ← now correct
 
-import { calculateMetrics, calculateMaxDrawdown, calculateSharpe, calculateSortino, compareStrategies }
+
+import { calculateMaxDrawdown, calculateSharpe, calculateSortino, compareStrategies }
   from '../src/backtesting/metrics-calculator.js';
 
 import { groupByDay, toISTTimeString, normaliseCandle }

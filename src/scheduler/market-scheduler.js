@@ -31,6 +31,18 @@
  *   Fix S4 — Watchlist size cap enforced
  *     Dynamic watchlist is now capped at MAX_WATCHLIST_SIZE (default 20).
  *     Uncapped watchlists cause 15+ second scans, blocking stop-loss monitoring.
+ *
+ *   Fix 27 (BUG #14) — clearRecentExits() moved to TOP of _strategyScan()
+ *     PREVIOUS BUG: clearRecentExits() was called AFTER Phase 2 (checkAll),
+ *     immediately before the Phase 3 entry scan. This meant any symbol added
+ *     to _recentlyExited by a forceExit() stop-loss in Phase 2 was immediately
+ *     wiped, allowing processSignal() to re-enter the just-stopped position in
+ *     the same scan cycle — the exact scenario Fix 27 was designed to prevent.
+ *
+ *     FIX: clearRecentExits() is now called at the very TOP of _strategyScan(),
+ *     before any position checks or entry scans. This clears exits from the
+ *     PREVIOUS scan cycle only. Exits recorded during the CURRENT cycle's
+ *     Phase 2 (checkAll) remain intact and correctly block Phase 3 re-entry.
  */
 
 import cron from 'node-cron';
@@ -42,7 +54,7 @@ import { executeSquareOff } from '../risk/square-off-job.js';
 const log = createLogger('scheduler');
 
 const MAX_WATCHLIST_SIZE = 20; // Fix S4: hard cap to keep scan time < 30s
-const LTP_TIMEOUT_MS = 8000; // Fix C5: passed to position manager
+const LTP_TIMEOUT_MS = 8000;  // Fix C5: passed to position manager
 
 export class MarketScheduler {
   constructor(deps) {
@@ -293,17 +305,38 @@ export class MarketScheduler {
   /**
    * Main strategy scan — every 5 minutes.
    *
-   * Fix N4: Single checkAll() call with latestSignals collected from Phase 1.
-   * Previously there were two checkAll() calls (one without signals for stops,
-   * one with signals for reversal), each causing a separate broker getLTP() call.
-   * Now: one signal collection pass (no broker call), one checkAll() with all data.
+   * ── Execution order ──────────────────────────────────────────────────────
    *
-   * Fix S4: Watchlist is capped at MAX_WATCHLIST_SIZE symbols.
+   *   STEP 0  clearRecentExits()                    ← BUG #14 FIX
+   *           Clears exits recorded in the PREVIOUS scan cycle.
+   *           Must happen at the very top so Phase 2 (checkAll) can
+   *           populate _recentlyExited for the CURRENT cycle, and Phase 3
+   *           (entry scan) correctly sees those fresh entries.
+   *
+   *           PREVIOUS (broken) order was:
+   *             Phase 2: checkAll()  → force exits populate _recentlyExited
+   *             clearRecentExits()   → immediately wipes _recentlyExited   ← BUG
+   *             Phase 3: entry scan  → re-enters just-stopped position      ← BUG
+   *
+   *           CORRECT order is:
+   *             clearRecentExits()   → wipes LAST cycle's exits            ← FIX
+   *             Phase 2: checkAll()  → THIS cycle's exits go into the set
+   *             Phase 3: entry scan  → set still intact, blocks re-entry   ← FIX
+   *
+   *   STEP 1  Refresh live risk + strategy params from Redis
+   *   STEP 2  Per-scan position reconciliation (async, non-blocking)
+   *   STEP 3  Build watchlist (LTP + candles per symbol)
+   *   PHASE 1 Collect latestSignals from held symbols (no broker call, no orders)
+   *   PHASE 2 checkAll() with latestSignals — single LTP fetch, all exit types
+   *   PHASE 3 Entry scan for non-held symbols via processSignal()
+   *
+   * Fix N4: Single checkAll() call per scan with latestSignals.
+   * Fix S4: Watchlist capped at MAX_WATCHLIST_SIZE symbols.
    */
   async _strategyScan() {
-    // N4 FIX: When NOT scanning (post-warning window), run position checks once and
-    // return immediately. The dedicated 3:12 PM job (_positionCheckOnly) covers
-    // this window — this is a belt-and-suspenders guard only.
+    // ── When NOT scanning (post-warning window), run position checks and return.
+    // The dedicated 3:12 PM job (_positionCheckOnly) is the primary path here;
+    // this guard is belt-and-suspenders only.
     if (!this._scanning) {
       if (this.positionManager) {
         await this._runPositionChecks();
@@ -311,6 +344,7 @@ export class MarketScheduler {
       log.info('Strategy scan skipped — scanning not active');
       return { scanned: 0 };
     }
+
     if (this._scanInProgress) {
       log.warn('Scan overlap — skipping');
       return { scanned: 0, reason: 'overlap' };
@@ -320,7 +354,36 @@ export class MarketScheduler {
     this._scanCount++;
 
     try {
-      // Refresh live risk params
+      // ── STEP 0: Clear exits from the PREVIOUS scan cycle ─────────────────
+      //
+      // BUG #14 FIX — this MUST be the first operation inside the scan.
+      //
+      // Rationale:
+      //   _recentlyExited is populated by forceExit() during Phase 2 (checkAll).
+      //   If we cleared it AFTER Phase 2 (the original bug), the set would be
+      //   empty by the time Phase 3's processSignal() runs — allowing immediate
+      //   re-entry into the position that was just stopped out.
+      //
+      //   By clearing at the TOP instead, we wipe the PREVIOUS cycle's entries
+      //   (stale, already protected against), while THIS cycle's Phase 2 exits
+      //   remain in the set throughout Phase 3.
+      //
+      // Timeline illustration:
+      //   Cycle N-1: RELIANCE stop-loss hit → added to _recentlyExited
+      //   Cycle N  : clearRecentExits() at top → wipes Cycle N-1 entry (safe,
+      //              Cycle N-1's Phase 3 already passed without re-entry)
+      //   Cycle N  : Phase 2 checkAll() → nothing exits (no stop hit this cycle)
+      //   Cycle N  : Phase 3 entry scan → RELIANCE can now be re-entered ✓
+      //
+      //   Cycle N  : INFY stop-loss hit in Phase 2 → added to _recentlyExited
+      //   Cycle N  : Phase 3 entry scan → INFY blocked from re-entry ✓
+      //   Cycle N+1: clearRecentExits() at top → wipes Cycle N entry
+      //   Cycle N+1: INFY can now be re-entered if signals agree ✓
+      if (typeof this.engine.clearRecentExits === 'function') {
+        this.engine.clearRecentExits();
+      }
+
+      // ── STEP 1: Refresh live risk params ──────────────────────────────────
       if (this.riskManager.refreshLiveSettings) {
         await this.riskManager.refreshLiveSettings().catch(err =>
           log.warn({ err: err.message }, 'refreshLiveSettings failed')
@@ -329,14 +392,12 @@ export class MarketScheduler {
 
       // Refresh strategy + consensus params
       if (this.engine?.consensus) {
-        // Refresh consensus-level params (e.g. Super Conviction threshold)
         if (typeof this.engine.consensus.refreshParams === 'function') {
           await this.engine.consensus.refreshParams().catch(err =>
             log.warn({ err: err.message }, 'Consensus refreshParams failed')
           );
         }
 
-        // Refresh individual strategy params (EMA periods, RSI floors, etc)
         if (this.engine.consensus.strategies?.length > 0) {
           await Promise.all(
             this.engine.consensus.strategies
@@ -348,13 +409,14 @@ export class MarketScheduler {
         }
       }
 
-      // Per-scan reconciliation
+      // ── STEP 2: Per-scan reconciliation ───────────────────────────────────
       if (this.engine._filledPositions?.size > 0 && this.broker) {
         this.engine.reconcilePositions(this.broker).catch(err =>
           log.warn({ err: err.message }, 'Reconciliation failed')
         );
       }
 
+      // ── STEP 3: Build watchlist ────────────────────────────────────────────
       const rawWatchlist = await this.getWatchlist();
       if (!rawWatchlist?.length) return { scanned: 0 };
 
@@ -370,16 +432,20 @@ export class MarketScheduler {
       const heldItems = watchlist.filter(w => heldSymbols.has(w.symbol));
       const nonHeldItems = watchlist.filter(w => !heldSymbols.has(w.symbol));
 
-      // ── Phase 1: Collect current signals for held symbols ─────────────
+      // ── PHASE 1: Collect current signals for held symbols ─────────────────
       // No broker calls, no order placement. Only consensus.evaluate() to
-      // build latestSignals map for signal-reversal exit detection.
+      // build the latestSignals map for signal-reversal exit detection in Phase 2.
       const latestSignals = {};
       for (const item of heldItems) {
         try {
           const result = this.engine.consensus.evaluate(item.candles);
           for (const detail of (result.details || [])) {
-            if (detail.strategy && detail.signal
-              && detail.meetsFloor !== false && !detail.suppressedByTime) {
+            if (
+              detail.strategy &&
+              detail.signal &&
+              detail.meetsFloor !== false &&
+              !detail.suppressedByTime
+            ) {
               latestSignals[detail.strategy] = detail.signal;
             }
           }
@@ -388,18 +454,19 @@ export class MarketScheduler {
         }
       }
 
-      // ── Phase 2: Single checkAll() with latestSignals ─────────────────
+      // ── PHASE 2: Single checkAll() with latestSignals ─────────────────────
       // Fix N4: ONE call, covers stop/trail/time/profit AND signal-reversal.
-      // Previously two calls caused two LTP fetches per held symbol per scan.
+      // Force exits here will add symbols to _recentlyExited.
+      // DO NOT call clearRecentExits() after this point in the same cycle.
       if (this.positionManager) {
         await this._runPositionChecks(latestSignals);
       }
 
-      // ── Phase 3: Entry scan for non-held symbols ──────────────────────
-      if (typeof this.engine.clearRecentExits === 'function') {
-        this.engine.clearRecentExits();
-      }
-
+      // ── PHASE 3: Entry scan for non-held symbols ──────────────────────────
+      // _recentlyExited is intact from Phase 2 — any symbol force-exited above
+      // will be blocked from re-entry by processSignal()'s guard check.
+      // clearRecentExits() for THIS cycle's entries happens at the TOP of the
+      // NEXT scan cycle (Step 0 above).
       const results = [];
       for (const item of nonHeldItems) {
         try {
@@ -416,6 +483,7 @@ export class MarketScheduler {
       }
 
       return { scanned: watchlist.length, results };
+
     } finally {
       this._scanInProgress = false;
     }
@@ -442,6 +510,10 @@ export class MarketScheduler {
    * Dedicated position check for the 3:10–3:15 PM window.
    * After _squareOffWarning sets _scanning=false, _strategyScan no longer runs,
    * but stop-loss and trailing stop exits must still fire until square-off.
+   *
+   * Note: clearRecentExits() is intentionally NOT called here. This job runs
+   * outside the normal scan cycle and should not interfere with the
+   * _recentlyExited state managed by _strategyScan.
    */
   async _positionCheckOnly() {
     log.info('═══ PRE-CLOSE POSITION CHECK (3:12 PM) ═══');

@@ -300,15 +300,24 @@ export class PositionManager {
                 const keys = symbols.map(s => `NSE:${s}`);
                 // C5 FIX: hard 10-second timeout on LTP fetch to prevent unbounded blocking.
                 const LTP_TIMEOUT_MS = 10000;
-                const ltp = await Promise.race([
-                  this.broker.getLTP(keys),
-                  new Promise((_, reject) =>
-                    setTimeout(
-                      () => reject(new Error(`LTP fetch timed out after ${LTP_TIMEOUT_MS}ms`)),
-                      LTP_TIMEOUT_MS
-                    )
-                  ),
-                ]);
+                async function withTimeout(promise, ms, errorMsg) {
+                    let timer;
+                    const timeout = new Promise((_, reject) => {
+                        timer = setTimeout(() => reject(new Error(errorMsg)), ms);
+                    });
+                    try {
+                        return await Promise.race([promise, timeout]);
+                    } finally {
+                        clearTimeout(timer); // ← always clear
+                    }
+                }
+
+                // Usage:
+                const ltp = await withTimeout(
+                    this.broker.getLTP(keys),
+                    LTP_TIMEOUT_MS,
+                    `LTP fetch timed out after ${LTP_TIMEOUT_MS}ms`
+                );
 
                 for (const sym of symbols) {
                     const price = ltp?.[`NSE:${sym}`]?.last_price;
@@ -318,7 +327,7 @@ export class PositionManager {
                 }
             } catch (err) {
                 log.error({ err: err.message, symbols },
-                  'LTP fetch failed/timed out in position manager — positions skipped this cycle');
+                    'LTP fetch failed/timed out in position manager — positions skipped this cycle');
                 return result;
             }
         }
@@ -332,10 +341,10 @@ export class PositionManager {
                             // C5 FIX: Also apply timeout to candle fetches
                             const CANDLE_TIMEOUT_MS = 8000;
                             const candles = await Promise.race([
-                              this.engine._fetchCandles(sym, 20),
-                              new Promise((_, reject) =>
-                                setTimeout(() => reject(new Error('Candle fetch timed out')), CANDLE_TIMEOUT_MS)
-                              ),
+                                this.engine._fetchCandles(sym, 20),
+                                new Promise((_, reject) =>
+                                    setTimeout(() => reject(new Error('Candle fetch timed out')), CANDLE_TIMEOUT_MS)
+                                ),
                             ]);
 
                             if (candles?.length >= 15) {

@@ -14,17 +14,20 @@
  *   Adaptive weights should eventually read from shadow_signals instead of
  *   signal_outcomes to get unbiased accuracy data.
  *
- * USAGE:
- *   // In processSignal(), fire-and-forget after consensus.evaluate():
- *   shadowRecorder.recordSignals(
- *     symbol, consensusResult.details, consensusResult, acted, currentPrice, regime
- *   ).catch(err => log.warn(err));
+ * BUG #22 FIX — Regime included in INSERT instead of separate UPDATE:
+ *   The original code did a two-step write:
+ *     1. INSERT rows without regime
+ *     2. UPDATE shadow_signals SET regime = $1
+ *        WHERE symbol = $2 AND created_at >= NOW() - INTERVAL '30 seconds'
  *
- *   // Background job every 30min during market hours:
- *   await shadowRecorder.fillPriceOutcomes();
+ *   This 30-second window was a race condition: if two scans ran within 30 s
+ *   (overlapping or back-to-back due to a slow scan), the second scan's UPDATE
+ *   would overwrite the regime on rows from the first scan — even though those
+ *   rows might have been recorded under a different regime classification.
  *
- *   // Adaptive weights reads:
- *   const accuracy = await shadowRecorder.getStrategyAccuracy('EMA_CROSSOVER', 14);
+ *   FIX: regime is now included as the 9th column directly in the INSERT VALUES
+ *   tuple. Each row gets exactly the regime value that was current at the moment
+ *   of signal generation. The separate UPDATE is removed entirely.
  *
  * @module shadow-recorder
  */
@@ -61,13 +64,12 @@ export class ShadowRecorder {
      * Called fire-and-forget — must never throw or block the signal loop.
      *
      * @param {string} symbol
-     * @param {Array}  strategySignals - consensusResult.details:
-     *                   [{ strategy, signal, confidence, reason }]
+     * @param {Array}  strategySignals - consensusResult.details
      * @param {Object} consensusResult - consensusResult from SignalConsensus.evaluate()
-     *                   { signal, confidence, reason, details }
      * @param {boolean} actedOn        - did an order actually FILL this scan?
      * @param {number}  currentPrice   - market price at signal time (REQUIRED — skip if 0)
      * @param {string|null} regime     - TRENDING / SIDEWAYS / VOLATILE / UNKNOWN / null
+     * @param {boolean} paperMode
      * @returns {Promise<void>}
      */
     async recordSignals(symbol, strategySignals, consensusResult, actedOn, currentPrice, regime, paperMode = false) {
@@ -92,37 +94,6 @@ export class ShadowRecorder {
 
             const consensusReached = consensusResult?.signal === 'BUY' || consensusResult?.signal === 'SELL';
 
-            // Batch INSERT — single round-trip regardless of how many strategies fired
-            const values = [];
-            const params = [];
-            let paramIdx = 1;
-
-            for (const sig of toRecord) {
-                values.push(
-                    `($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, ` +
-                    `$${paramIdx++}, $${paramIdx++}, $${paramIdx++})`
-                );
-                params.push(
-                    symbol,
-                    sig.strategy,
-                    sig.signal,           // 'BUY' or 'SELL'
-                    sig.confidence,
-                    currentPrice,
-                    consensusReached,
-                    actedOn,
-                );
-                // regime is optional — only available mid-scan, not on early HOLD returns
-                if (regime !== undefined && regime !== null) {
-                    values[values.length - 1] = values[values.length - 1].replace(
-                        /\)$/,
-                        `, $${paramIdx++})`
-                    );
-                    params.push(regime);
-                }
-            }
-
-            // Regime column handling — simplest approach: always include it (NULL if absent)
-            // Rebuild with explicit regime column for clean SQL
             await this._batchInsert(symbol, toRecord, currentPrice, consensusReached, actedOn, regime, paperMode);
 
             log.debug({
@@ -153,8 +124,6 @@ export class ShadowRecorder {
         }
 
         try {
-            // Find all rows that still have NULL price columns and are old enough
-            // to have a meaningful reading. Each window is checked independently.
             const pendingResult = await query(`
         SELECT
           id,
@@ -189,7 +158,6 @@ export class ShadowRecorder {
                 return { updated: 0, symbols: [] };
             }
 
-            // Get unique symbols, batch into groups of 50
             const uniqueSymbols = [...new Set(pendingResult.rows.map(r => r.symbol))];
             const priceMap = await this._fetchPricesBatched(uniqueSymbols, 50);
 
@@ -220,8 +188,6 @@ export class ShadowRecorder {
                     setClauses.push(`${correctCol} = $${paramIdx++}`);
                     values.push(isCorrect);
 
-                    // Feature 7: Record wrong 30-min signals for intraday weight decay.
-                    // Only the 30-minute window is authoritative — 15/60 min are supplementary.
                     if (is30min && !isCorrect && this.intradayDecay && row.strategy) {
                         this.intradayDecay.recordWrong(row.strategy).catch(() => { });
                     }
@@ -266,8 +232,6 @@ export class ShadowRecorder {
 
     /**
      * Get unbiased accuracy stats for a strategy from shadow signals.
-     * Use this instead of signal_outcomes for adaptive weight calculation
-     * once enough shadow data has accumulated.
      *
      * @param {string} strategy - one of the VALID_STRATEGIES values
      * @param {number} [days=14] - lookback window in days
@@ -289,6 +253,7 @@ export class ShadowRecorder {
         FROM shadow_signals
         WHERE strategy = $1
           AND created_at >= NOW() - ($2 || ' days')::INTERVAL
+          AND was_correct_30min IS NOT NULL
           AND paper_mode = false
       `, [strategy, days]);
 
@@ -318,16 +283,12 @@ export class ShadowRecorder {
                 evaluated,
                 sampleSize: evaluated,
                 insufficient: false,
-                // Overall accuracy (includes signals that reached consensus)
                 accuracy30min: Math.round((correctCount / evaluated) * 100),
                 correctCount,
-                // How often this strategy reached consensus
                 consensusRate: Math.round((parseInt(row.consensus_count, 10) / totalSignals) * 100),
-                // How often a consensus trade was actually executed (gates 2-6 pass rate)
                 actedOnRate: parseInt(row.consensus_count, 10) > 0
                     ? Math.round((parseInt(row.acted_on_count, 10) / parseInt(row.consensus_count, 10)) * 100)
                     : 0,
-                // Accuracy when strategy fired SOLO (no consensus) — the key unbiased metric
                 soloAccuracy30min: soloEvaluated >= MIN_SAMPLE_SIZE
                     ? Math.round((soloCorrect / soloEvaluated) * 100)
                     : null,
@@ -343,52 +304,59 @@ export class ShadowRecorder {
     // PRIVATE
     // ═══════════════════════════════════════════════════════
 
-    /** @private */
+    /**
+     * Batch INSERT shadow signals.
+     *
+     * BUG #22 FIX: regime is now the 9th column in each INSERT VALUES tuple.
+     * Previously the INSERT omitted regime, then a separate UPDATE was issued:
+     *
+     *   UPDATE shadow_signals SET regime = $1
+     *   WHERE symbol = $2 AND created_at >= NOW() - INTERVAL '30 seconds'
+     *
+     * That 30-second window was a race condition — concurrent scans could
+     * overwrite each other's regime values. Including regime directly in the
+     * INSERT eliminates the UPDATE entirely and makes each row's regime
+     * exactly the value that was current at the moment of signal generation.
+     *
+     * @private
+     */
     async _batchInsert(symbol, signals, currentPrice, consensusReached, actedOn, regime, paperMode = false) {
         if (signals.length === 0) return;
 
-        // Build parameterised batch INSERT
         const rowPlaceholders = [];
         const params = [];
         let p = 1;
 
         for (const sig of signals) {
-            rowPlaceholders.push(`($${p++}, $${p++}, $${p++}, $${p++}, $${p++}, $${p++}, $${p++}, $${p++})`);
+            // BUG #22 FIX: 9 columns including regime — no separate UPDATE needed
+            rowPlaceholders.push(
+                `($${p++}, $${p++}, $${p++}, $${p++}, $${p++}, $${p++}, $${p++}, $${p++}, $${p++})`
+            );
             params.push(
                 symbol,
                 sig.strategy,
-                sig.signal,
+                sig.signal,           // direction
                 sig.confidence,
-                currentPrice,
+                currentPrice,         // price_at_signal
                 consensusReached,
                 actedOn,
-                paperMode, // Fix S6
+                paperMode,
+                regime || null,       // ← included in INSERT, no racy UPDATE needed
             );
         }
 
-        // regime is the same for all signals in a scan cycle — update after INSERT
         await query(
             `INSERT INTO shadow_signals
-         (symbol, strategy, direction, confidence, price_at_signal, consensus_reached, acted_on, paper_mode)
+         (symbol, strategy, direction, confidence, price_at_signal,
+          consensus_reached, acted_on, paper_mode, regime)
        VALUES ${rowPlaceholders.join(', ')}`,
             params
         );
-
-        // Set regime in a single UPDATE if we have it — avoids inflating the INSERT params
-        if (regime) {
-            await query(`
-        UPDATE shadow_signals
-        SET regime = $1
-        WHERE symbol = $2
-          AND created_at >= NOW() - INTERVAL '30 seconds'
-          AND regime IS NULL
-      `, [regime, symbol]);
-        }
+        // ← No separate UPDATE for regime — it's in the INSERT above
     }
 
     /**
      * Fetch current prices for multiple symbols in batches.
-     * Avoids overwhelming the broker API on large watchlists.
      * @private
      */
     async _fetchPricesBatched(symbols, batchSize) {

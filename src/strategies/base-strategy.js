@@ -116,14 +116,4 @@ export class BaseStrategy {
     return this.buildSignal(SIGNAL.HOLD, 0, reason);
   }
 
-  /**
-   * Validate and clean candles array before analysis.
-   * @protected
-   * @param {any[]} candles
-   * @returns {import('../data/historical-data.js').Candle[]}
-   */
-  validateCandles(candles) {
-    if (!Array.isArray(candles)) return [];
-    return candles.filter(c => c && typeof c.close === 'number' && !isNaN(c.close));
-  }
 }

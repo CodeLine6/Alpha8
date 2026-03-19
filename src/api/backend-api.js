@@ -307,14 +307,24 @@ export function createApiHandler(deps) {
       const riskStatus = riskManager.getStatus();
       const ksStatus = killSwitch.getStatus();
 
-      let dbSummary = null;
+      // Remove the non-existent daily_summary query
+      let tradeStats = { count: 0, wins: 0, losses: 0, filled: 0, rejected: 0, totalPnl: 0 };
       try {
         const today = new Date().toISOString().split('T')[0];
-        const result = await query('SELECT * FROM daily_summary WHERE trade_date = $1', [today]);
+        const result = await query(`
+                SELECT
+                    COUNT(*) as count,
+                    COUNT(*) FILTER (WHERE pnl > 0)             as wins,
+                    COUNT(*) FILTER (WHERE pnl < 0)             as losses,
+                    COUNT(*) FILTER (WHERE status = 'FILLED')   as filled,
+                    COUNT(*) FILTER (WHERE status = 'REJECTED') as rejected,
+                    COALESCE(SUM(pnl), 0)                       as total_pnl
+                FROM trades
+                WHERE (created_at AT TIME ZONE 'Asia/Kolkata')::date = $1::date
+            `, [today]);
         dbSummary = result.rows[0] || null;
       } catch { /* DB may not have today's entry yet */ }
 
-      let tradeStats = { count: 0, wins: 0, losses: 0, filled: 0, rejected: 0, totalPnl: 0 };
       try {
         const today = new Date().toISOString().split('T')[0];
         const result = await query(`
@@ -992,6 +1002,11 @@ export function createApiHandler(deps) {
     }
   }
 
+  async function handleKillSwitchGet(req, res) {
+    if (!checkAuth(req, res)) return;
+    json(res, killSwitch.getStatus());
+  }
+
   // ═══════════════════════════════════════════════════════
   // MAIN ROUTER
   // ═══════════════════════════════════════════════════════
@@ -1022,6 +1037,8 @@ export function createApiHandler(deps) {
           case '/api/holdings': return handleHoldings(req, res);
           case '/api/live-settings': return handleLiveSettingsGet(req, res);
           case '/api/live-settings/schema': return handleLiveSettingsSchema(req, res);
+          case '/api/killswitch': return handleKillSwitchGet(req, res); // ← ADD
+
         }
       }
 
@@ -1040,4 +1057,6 @@ export function createApiHandler(deps) {
       json(res, { error: 'Internal server error' }, 500);
     }
   };
+
+
 }

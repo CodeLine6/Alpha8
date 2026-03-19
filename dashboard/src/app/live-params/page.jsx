@@ -418,18 +418,31 @@ function ParamRow({
             {/* Input + apply button */}
             <td>
                 <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-                    <input
-                        type="number"
-                        className="input"
-                        style={{ width: 110 }}
-                        min={schema.min}
-                        max={schema.max}
-                        step={schema.step}
-                        value={inputValue}
-                        disabled={isSaving}
-                        onChange={e => onInputChange(e.target.value)}
-                        onKeyDown={handleKeyDown}
-                    />
+                    {schema.type === 'boolean' ? (
+                        <select
+                            className="input"
+                            value={inputValue}
+                            disabled={isSaving}
+                            onChange={e => onInputChange(e.target.value)}
+                            style={{ width: 110 }}
+                        >
+                            <option value="true">Enabled</option>
+                            <option value="false">Disabled</option>
+                        </select>
+                    ) : (
+                        <input
+                            type="number"
+                            className="input"
+                            style={{ width: 110 }}
+                            min={schema.min}
+                            max={schema.max}
+                            step={schema.step}
+                            value={inputValue}
+                            disabled={isSaving}
+                            onChange={e => onInputChange(e.target.value)}
+                            onKeyDown={handleKeyDown}
+                        />
+                    )}
                     <button
                         className="btn btn-primary"
                         style={{ padding: '0.4rem 0.75rem', fontSize: '0.8rem', opacity: (!isDirty || isSaving) ? 0.5 : 1 }}
