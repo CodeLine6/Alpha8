@@ -1,45 +1,19 @@
 /**
- * @fileoverview Core backtest simulation engine for Alpha8.
+ * @fileoverview Alpha8 Backtesting Engine — with SHORT SELLING support
  *
- * Simulates a full trading day cycle for each day in the historical dataset:
- *   - Runs all 4 strategies (or a single specified one) on each 5-min bar
- *   - Applies stop-loss (1% below entry, matching live risk-manager.js)
- *   - Applies square-off at 15:15 IST (matching square-off-job.js)
- *   - Tracks capital, P&L, and all trade metadata
+ * Changes from original:
+ *   - _openPosition() now accepts direction 'BUY' or 'SELL' (short)
+ *   - _closePosition() covers shorts with BUY-to-close, P&L = entry - exit
+ *   - Stop-loss for shorts is ABOVE entry price
+ *   - Square-off covers both longs (SELL) and shorts (BUY-to-cover)
+ *   - RSI SELL signals are EXCLUDED from opening new short positions
  *
- * Design principles (mirrors live trading logic):
- *   - One position per symbol at a time
- *   - Entry on BUY signal (min 2 strategies agree if using consensus)
- *   - Exit on SELL signal, stop-loss trigger, or 15:15 IST square-off
- *   - Position sizing: risk 1% of current capital per trade
- *   - No lookahead bias: strategy only sees candles up to current bar
- *
- * BUG #17 FIX — SQUARE_OFF_TIME aligned with live system:
- *   The original file hardcoded `const SQUARE_OFF_TIME = '15:45'` — a full
- *   30 minutes later than the live system's 15:15 IST cutoff defined in
- *   src/config/constants.js.
- *
- *   This caused backtest results to include trades between 15:15 and 15:44
- *   that are NEVER executable in live trading. Strategies with late-day BUY
- *   signals would appear profitable in backtests but those signals are always
- *   blocked in production by the square-off guard. The inflated win-rate fed
- *   directly into the Kelly criterion's position sizing — meaning live trades
- *   were oversized relative to actual strategy performance.
- *
- *   FIX: Import SQUARE_OFF_TIME from the canonical constants file so backtest
- *   and live system always use the same value. If the live cutoff ever changes,
- *   both are updated in one place.
+ * BUG #17 FIX retained: SQUARE_OFF_TIME imported from constants.js
  */
 
 import { groupByDay, toISTTimeString } from './historical-data-fetcher.js';
-// BUG #17 FIX: Import the canonical square-off time from constants so backtest
-// and live system always agree. Previously hardcoded as '15:45' here vs '15:15'
-// in production — a 30-minute gap that inflated backtest P&L.
 import { SQUARE_OFF_TIME } from '../config/constants.js';
-
-// ── Strategy imports (lazy — resolved at runtime from project root) ───────────
-// We import these lazily so backtest.js can be run standalone without the full
-// app boot sequence (no Redis, no DB, no broker needed).
+import { SHORT_INELIGIBLE_STRATEGIES } from '../engine/signal-consensus.js';
 
 const STRATEGY_MAP = {
   'EMA_CROSSOVER': () => import('../strategies/ema-crossover.js'),
@@ -48,134 +22,70 @@ const STRATEGY_MAP = {
   'BREAKOUT_VOLUME': () => import('../strategies/breakout-volume.js'),
 };
 
-const ALL_STRATEGIES = Object.keys(STRATEGY_MAP);
+export const ALL_STRATEGIES = Object.keys(STRATEGY_MAP);
 
-/** Minimum candle warm-up window per strategy before we start trading */
 const WARMUP_CANDLES = {
-  'EMA_CROSSOVER': 25, // EMA 21 + buffer
-  'RSI_MEAN_REVERSION': 16, // RSI 14 + buffer
-  'VWAP_MOMENTUM': 5, // Needs a few candles for volume average
-  'BREAKOUT_VOLUME': 22, // 20-period lookback + buffer
+  'EMA_CROSSOVER': 25,
+  'RSI_MEAN_REVERSION': 16,
+  'VWAP_MOMENTUM': 5,
+  'BREAKOUT_VOLUME': 22,
 };
 
-/** Stop-loss: 1% below entry (matching risk-manager.js) */
-const STOP_LOSS_PCT = 0.01;
+const STOP_LOSS_PCT = 0.01;   // 1% — same for longs and shorts
+const RISK_PER_TRADE_PCT = 0.01;   // 1% of capital risked per trade
+const MAX_POSITION_PCT = 0.20;   // 20% max capital in any position
 
-/** Risk per trade: 1% of current capital */
-const RISK_PER_TRADE_PCT = 0.01;
-
-/** Max capital per single position: 20% */
-const MAX_POSITION_PCT = 0.20;
-
-/**
- * @typedef {object} BacktestConfig
- * @property {string}    symbol         - NSE trading symbol
- * @property {string[]}  strategies     - strategy names to use (or ['all'])
- * @property {number}    initialCapital - starting capital in ₹
- * @property {boolean}   [useConsensus] - require 2+ strategies to agree (default: false for solo, true for multi)
- * @property {number}    [minConsensus] - minimum agreeing strategies (default: 2)
- * @property {Function}  [logger]       - log function (default: console.log)
- */
-
-/**
- * @typedef {object} Position
- * @property {string}  symbol
- * @property {string}  strategy
- * @property {number}  entryPrice
- * @property {number}  stopLoss
- * @property {number}  quantity
- * @property {number}  entryValue
- * @property {Date}    entryTime
- * @property {string}  entryReason
- */
-
-/**
- * Main backtest simulation engine.
- */
 export class BacktestEngine {
-  /**
-   * @param {BacktestConfig} config
-   */
   constructor(config) {
     this.symbol = config.symbol;
     this.strategyNames = this._resolveStrategyNames(config.strategies);
     this.initialCapital = config.initialCapital;
     this.useConsensus = config.useConsensus ?? (this.strategyNames.length > 1);
     this.minConsensus = config.minConsensus ?? 2;
+    this.allowShorts = config.allowShorts ?? true;   // ← NEW: toggle shorts on/off
     this.logger = config.logger ?? console.log;
 
-    /** Current capital (changes as trades complete) */
     this.capital = this.initialCapital;
-
-    /** Open position state (one at a time, like the live engine) */
-    this.position = null;
-
-    /** Completed trade log */
+    this.position = null;   // { direction: 'BUY'|'SELL', entryPrice, stopLoss, quantity, ... }
     this.trades = [];
-
-    /** Loaded strategy instances */
     this._strategies = null;
   }
 
-  // ── Public API ─────────────────────────────────────────────────────────────
+  // ── Public API ──────────────────────────────────────────────────────────
 
-  /**
-   * Run the full backtest on a set of historical candles.
-   *
-   * @param {Array} candles  - flat OHLCV array sorted chronologically
-   * @returns {Promise<{ trades: Array, capital: number }>}
-   */
   async run(candles) {
     this.capital = this.initialCapital;
     this.position = null;
     this.trades = [];
-
-    // Load strategy instances
     this._strategies = await this._loadStrategies();
 
-    // Group candles by trading day (IST)
     const days = groupByDay(candles);
     const sortedDays = [...days.keys()].sort();
 
     this.logger(
-      `[BacktestEngine] Starting simulation: ${sortedDays.length} trading days, ` +
-      `${candles.length} candles, strategies: [${this.strategyNames.join(', ')}], ` +
-      `squareOff: ${SQUARE_OFF_TIME} IST`  // log the value so it's auditable
+      `[BacktestEngine] Starting simulation: ${sortedDays.length} days, ` +
+      `${candles.length} candles, shorts=${this.allowShorts}, ` +
+      `squareOff: ${SQUARE_OFF_TIME} IST`
     );
 
     for (const day of sortedDays) {
-      const dayCandles = days.get(day);
-      await this._simulateDay(day, dayCandles);
+      await this._simulateDay(day, days.get(day));
     }
 
-    this.logger(`[BacktestEngine] Simulation complete: ${this.trades.length} trades`);
-
-    return {
-      trades: this.trades,
-      capital: this.capital,
-    };
+    this.logger(`[BacktestEngine] Complete: ${this.trades.length} trades`);
+    return { trades: this.trades, capital: this.capital };
   }
 
-  // ── Private methods ────────────────────────────────────────────────────────
+  // ── Private ─────────────────────────────────────────────────────────────
 
-  /**
-   * Simulate a single trading day.
-   * Walks candle by candle, fires strategies, manages position.
-   *
-   * @param {string} day      - 'YYYY-MM-DD'
-   * @param {Array}  candles  - candles for this day only
-   */
   async _simulateDay(day, candles) {
-    // Filter to market hours: 09:15 – 15:30 IST
     const marketCandles = candles.filter(c => {
       const t = toISTTimeString(c.date);
       return t >= '09:15' && t <= '15:30';
     });
-
     if (marketCandles.length === 0) return;
 
-    // Close any leftover position from previous day at open (shouldn't happen
-    // in intraday, but safeguard for daily-bar backtests)
+    // Close any carry-over position from previous day
     if (this.position) {
       this._closePosition(marketCandles[0], 'CARRY_OVER', marketCandles[0].open);
     }
@@ -184,90 +94,89 @@ export class BacktestEngine {
       const candle = marketCandles[i];
       const timeIST = toISTTimeString(candle.date);
 
-      // ── Square-off check ──────────────────────────────────────────────────
-      // BUG #17 FIX: SQUARE_OFF_TIME is now imported from constants.js (15:15),
-      // matching the live system. Previously this constant was '15:45' — allowing
-      // 30 extra minutes of backtest trading that can never happen in production.
+      // ── Square-off ─────────────────────────────────────────────────
       if (timeIST >= SQUARE_OFF_TIME) {
         if (this.position) {
           this._closePosition(candle, 'SQUARE_OFF', candle.open);
         }
-        break; // No new positions after square-off time
+        break;
       }
 
-      // ── Stop-loss check ───────────────────────────────────────────────────
-      if (this.position && candle.low <= this.position.stopLoss) {
-        // Stopped out — fill at stop loss price (conservative; real fill may be worse)
-        const fillPrice = Math.min(this.position.stopLoss, candle.open);
-        this._closePosition(candle, 'STOP_LOSS', fillPrice);
+      // ── Stop-loss check ────────────────────────────────────────────
+      if (this.position) {
+        const isShort = this.position.direction === 'SELL';
+        const stopHit = isShort
+          ? candle.high >= this.position.stopLoss   // SHORT: stop above entry
+          : candle.low <= this.position.stopLoss;  // LONG:  stop below entry
+
+        if (stopHit) {
+          const fillPrice = isShort
+            ? Math.max(this.position.stopLoss, candle.open)
+            : Math.min(this.position.stopLoss, candle.open);
+          this._closePosition(candle, 'STOP_LOSS', fillPrice);
+        }
       }
 
-      // ── Strategy signal ───────────────────────────────────────────────────
-      // Only look at candles up to now (no lookahead bias)
+      // ── Strategy signals ───────────────────────────────────────────
       const windowCandles = marketCandles.slice(0, i + 1);
-
-      // Need minimum warm-up candles for meaningful signals
       const minWarmup = Math.min(...this.strategyNames.map(s => WARMUP_CANDLES[s] ?? 20));
       if (windowCandles.length < minWarmup) continue;
 
       const signals = this._getSignals(windowCandles, candle.volume);
-
       const decision = this.useConsensus
         ? this._consensusDecision(signals)
-        : signals[0]; // Single-strategy mode
+        : signals[0];
 
       if (!decision) continue;
 
-      // ── Entry logic ───────────────────────────────────────────────────────
-      if (decision.signal === 'BUY' && !this.position) {
-        this._openPosition(candle, decision);
+      // ── Entry / exit logic ─────────────────────────────────────────
+      if (decision.signal === 'BUY') {
+        if (!this.position) {
+          // Open long
+          this._openPosition(candle, decision, 'BUY');
+        } else if (this.position.direction === 'SELL') {
+          // Cover short
+          this._closePosition(candle, 'SIGNAL', candle.close);
+        }
       }
 
-      // ── Exit on SELL signal ───────────────────────────────────────────────
-      if (decision.signal === 'SELL' && this.position) {
-        this._closePosition(candle, 'SIGNAL', candle.close);
+      if (decision.signal === 'SELL') {
+        if (!this.position) {
+          // Open short — only if allowed and strategy is eligible
+          if (this.allowShorts && this._isShortEligible(decision.strategy)) {
+            this._openPosition(candle, decision, 'SELL');
+          }
+        } else if (this.position.direction === 'BUY') {
+          // Close long
+          this._closePosition(candle, 'SIGNAL', candle.close);
+        }
       }
     }
 
-    // If market close reached with an open position, square off at last close
+    // EOD square-off
     if (this.position) {
       const lastCandle = marketCandles[marketCandles.length - 1];
       this._closePosition(lastCandle, 'SQUARE_OFF', lastCandle.close);
     }
   }
 
-  /**
-   * Run all loaded strategies on the current candle window.
-   * Returns array of signal objects.
-   *
-   * @param {Array}  candles       - window of candles up to current bar
-   * @param {number} currentVolume - current bar's volume
-   * @returns {Array}
-   */
   _getSignals(candles, currentVolume) {
     const signals = [];
-
     for (const [name, strategy] of Object.entries(this._strategies)) {
       try {
         const sig = strategy.analyze(candles, currentVolume);
         if (sig && sig.signal !== 'HOLD') {
           signals.push({ ...sig, strategy: name });
         }
-      } catch {
-        // Strategy returned error (e.g. insufficient data) — treat as HOLD
-      }
+      } catch { /* insufficient data — treat as HOLD */ }
     }
-
     return signals;
   }
 
   /**
-   * Weighted consensus decision.
-   * At least `minConsensus` strategies must agree on the same direction.
-   * Returns the highest-confidence agreeing signal, or null if no consensus.
-   *
-   * @param {Array} signals
-   * @returns {object|null}
+   * Consensus for backtesting.
+   * SELL consensus excludes SHORT_INELIGIBLE_STRATEGIES from opening shorts.
+   * The returned signal includes `isShortEntry` flag.
    */
   _consensusDecision(signals) {
     if (signals.length === 0) return null;
@@ -276,34 +185,54 @@ export class BacktestEngine {
     const sells = signals.filter(s => s.signal === 'SELL');
 
     if (buys.length >= this.minConsensus) {
-      return buys.reduce((best, s) => s.confidence > best.confidence ? s : best, buys[0]);
-    }
-    if (sells.length >= this.minConsensus) {
-      return sells.reduce((best, s) => s.confidence > best.confidence ? s : best, sells[0]);
+      return buys.reduce((best, s) =>
+        s.confidence > best.confidence ? s : best, buys[0]);
     }
 
-    return null; // No consensus
+    if (sells.length >= this.minConsensus) {
+      const best = sells.reduce((b, s) =>
+        s.confidence > b.confidence ? s : b, sells[0]);
+
+      // Check if at least one short-eligible strategy is in the SELL camp
+      const hasEligible = sells.some(s => !SHORT_INELIGIBLE_STRATEGIES.has(s.strategy));
+      return { ...best, isShortEntry: hasEligible };
+    }
+
+    return null;
   }
 
   /**
-   * Open a new long position.
-   *
-   * @param {object} candle   - entry candle (fill at close price)
-   * @param {object} signal   - triggering signal
+   * Check if the strategy that generated a SELL signal can open a short.
+   * In single-strategy mode (no consensus), strategy must be short-eligible.
    */
-  _openPosition(candle, signal) {
-    const entryPrice = candle.close;
-    const stopLoss = entryPrice * (1 - STOP_LOSS_PCT);
+  _isShortEligible(strategyName) {
+    if (!strategyName) return false;
+    return !SHORT_INELIGIBLE_STRATEGIES.has(strategyName);
+  }
 
+  /**
+   * Open a new position — long (BUY) or short (SELL).
+   */
+  _openPosition(candle, signal, direction) {
+    const entryPrice = candle.close;
+    const isShort = direction === 'SELL';
+
+    // Stop loss: below entry for longs, above entry for shorts
+    const stopLoss = isShort
+      ? entryPrice * (1 + STOP_LOSS_PCT)
+      : entryPrice * (1 - STOP_LOSS_PCT);
+
+    // Position sizing: risk = stop-distance × quantity
     const riskAmount = this.capital * RISK_PER_TRADE_PCT;
     const stopDistance = entryPrice * STOP_LOSS_PCT;
     let quantity = Math.floor(riskAmount / stopDistance);
-
-    const maxShares = Math.floor((this.capital * MAX_POSITION_PCT) / entryPrice);
-    quantity = Math.min(quantity, maxShares);
+    const maxByCapital = Math.floor((this.capital * MAX_POSITION_PCT) / entryPrice);
+    quantity = Math.min(quantity, maxByCapital);
     quantity = Math.max(quantity, 1);
 
     this.position = {
+      direction,
+      isShort,
       symbol: this.symbol,
       strategy: signal.strategy,
       entryPrice,
@@ -317,25 +246,41 @@ export class BacktestEngine {
   }
 
   /**
-   * Close the current open position and record the trade.
-   *
-   * @param {object} candle      - exit candle
-   * @param {string} exitReason  - 'SIGNAL'|'STOP_LOSS'|'SQUARE_OFF'|'CARRY_OVER'
-   * @param {number} exitPrice   - actual fill price
+   * Close the current position.
+   * LONG:  sells at exitPrice, P&L = (exit - entry) * qty
+   * SHORT: covers at exitPrice, P&L = (entry - exit) * qty
    */
   _closePosition(candle, exitReason, exitPrice) {
     const pos = this.position;
-    const pnl = (exitPrice - pos.entryPrice) * pos.quantity;
-    const pnlPct = ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100;
+    const isShort = pos.isShort ?? pos.direction === 'SELL';
+
+    const grossPnl = isShort
+      ? (pos.entryPrice - exitPrice) * pos.quantity
+      : (exitPrice - pos.entryPrice) * pos.quantity;
+
+    const pnlPct = ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100
+      * (isShort ? -1 : 1);
+
+    // Transaction costs (both legs — entry and exit)
+    // For shorts: entry was a SELL order, exit is a BUY order
+    const entryCostSide = isShort ? 'SELL' : 'BUY';
+    const exitCostSide = isShort ? 'BUY' : 'SELL';
+    const entryCost = _calcLegCost(entryCostSide, pos.entryPrice, pos.quantity);
+    const exitCost = _calcLegCost(exitCostSide, exitPrice, pos.quantity);
+    const totalCost = entryCost + exitCost;
+    const netPnl = grossPnl - totalCost;
 
     const trade = {
       symbol: pos.symbol,
       strategy: pos.strategy,
-      side: 'BUY',
+      side: pos.direction,   // 'BUY' = long entry, 'SELL' = short entry
+      isShort,
       entryPrice: pos.entryPrice,
       exitPrice,
       quantity: pos.quantity,
-      pnl: Math.round(pnl * 100) / 100,
+      grossPnl: Math.round(grossPnl * 100) / 100,
+      totalCost: Math.round(totalCost * 100) / 100,
+      pnl: Math.round(netPnl * 100) / 100,   // net after costs
       pnlPct: Math.round(pnlPct * 100) / 100,
       exitReason,
       entryTime: pos.entryTime,
@@ -345,58 +290,40 @@ export class BacktestEngine {
     };
 
     this.trades.push(trade);
-    this.capital += pnl;
+    this.capital += netPnl;   // compound capital with net P&L
     this.position = null;
   }
 
-  /**
-   * Load and instantiate all configured strategies.
-   * @returns {Promise<object>}  map of strategyName → instance
-   */
-  async _loadStrategies() {
-    const instances = {};
-
-    for (const name of this.strategyNames) {
-      const loader = STRATEGY_MAP[name];
-      if (!loader) {
-        throw new Error(`Unknown strategy: "${name}". Valid options: ${ALL_STRATEGIES.join(', ')}`);
-      }
-
-      try {
-        const mod = await loader();
-        const StratClass = mod.default ?? mod[Object.keys(mod)[0]];
-        instances[name] = new StratClass();
-      } catch (err) {
-        throw new Error(`Failed to load strategy "${name}": ${err.message}`);
-      }
-    }
-
-    return instances;
-  }
-
-  /**
-   * Resolve strategy name list, expanding 'all' to all 4 strategies.
-   * @param {string|string[]} input
-   * @returns {string[]}
-   */
   _resolveStrategyNames(input) {
     if (!input) return ALL_STRATEGIES;
-
     const list = Array.isArray(input) ? input : [input];
-
     if (list.includes('all')) return ALL_STRATEGIES;
-
     for (const name of list) {
-      if (!STRATEGY_MAP[name]) {
-        throw new Error(
-          `Unknown strategy: "${name}". Valid: ${ALL_STRATEGIES.join(', ')}, all`
-        );
-      }
+      if (!STRATEGY_MAP[name]) throw new Error(`Unknown strategy: "${name}"`);
     }
-
     return list;
+  }
+
+  async _loadStrategies() {
+    const instances = {};
+    for (const name of this.strategyNames) {
+      const mod = await STRATEGY_MAP[name]();
+      const StratClass = mod.default ?? mod[Object.keys(mod)[0]];
+      instances[name] = new StratClass();
+    }
+    return instances;
   }
 }
 
-/** Export valid strategy names for CLI validation */
-export { ALL_STRATEGIES };
+// ── Internal: lightweight cost calculator (mirrors src/lib/brokerage.js) ─────
+
+function _calcLegCost(side, price, quantity) {
+  const value = price * quantity;
+  const brokerage = Math.min(20, value * 0.0003);
+  const stt = side === 'SELL' ? value * 0.00025 : 0;
+  const exchangeFee = value * 0.0000345;
+  const sebiFee = value * 0.000001;
+  const stampDuty = side === 'BUY' ? value * 0.00003 : 0;
+  const gst = (brokerage + exchangeFee + sebiFee) * 0.18;
+  return brokerage + stt + exchangeFee + sebiFee + stampDuty + gst;
+}

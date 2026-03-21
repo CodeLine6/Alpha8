@@ -140,10 +140,48 @@ export function printReport({ symbol, strategies, fromDate, toDate, metrics, tra
     const squareOffExits = trades.filter(t => t.exitReason === 'SQUARE_OFF').length;
 
     console.log(bold(`  EXIT BREAKDOWN`));
+
+    // ── Long vs Short breakdown ───────────────────────────────────────────
+    if (metrics.directionBreakdown) {
+      const { long, short } = metrics.directionBreakdown;
+      console.log(bold(`  LONG vs SHORT`));
+      console.log(`  ${hr}`);
+      if (long.count > 0) {
+        console.log(
+          `  📈 Longs  : ${long.count} trades | ` +
+          `${green(long.wins + 'W')} / ${red((long.count - long.wins) + 'L')} | ` +
+          `${long.winRate}% WR | ` +
+          colourPnl(long.pnl, formatINR(long.pnl))
+        );
+      }
+      if (short.count > 0) {
+        console.log(
+          `  📉 Shorts : ${short.count} trades | ` +
+          `${green(short.wins + 'W')} / ${red((short.count - short.wins) + 'L')} | ` +
+          `${short.winRate}% WR | ` +
+          colourPnl(short.pnl, formatINR(short.pnl))
+        );
+      }
+      console.log('');
+    }
     console.log(`  ${hr}`);
     console.log(`  Signal exits  : ${signalExits}`);
     console.log(`  Stop losses   : ${red(stopExits)}`);
     console.log(`  Square-offs   : ${yellow(squareOffExits)}`);
+    console.log('');
+  }
+
+  // ── Cost summary ─────────────────────────────────────────────────────────
+  if (trades.length > 0 && trades[0].totalCost !== undefined) {
+    const totalCosts = trades.reduce((s, t) => s + (t.totalCost || 0), 0);
+    const totalGross = trades.reduce((s, t) => s + (t.grossPnl || t.pnl || 0), 0);
+    const totalNet = trades.reduce((s, t) => s + (t.pnl || 0), 0);
+    console.log(bold(`  TRANSACTION COSTS`));
+    console.log(`  ${hr}`);
+    console.log(`  Total Charges  : ${red(formatINR(totalCosts))}`);
+    console.log(`  Gross P&L      : ${colourPnl(totalGross, formatINR(totalGross))}`);
+    console.log(`  Net P&L        : ${bold(colourPnl(totalNet, formatINR(totalNet)))}`);
+    console.log(`  Cost/Trade avg : ${formatINR(totalCosts / trades.length)}`);
     console.log('');
   }
 

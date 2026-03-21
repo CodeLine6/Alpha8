@@ -83,8 +83,8 @@ export async function executeSquareOff({ broker, riskManager, engine, getOpenPos
       let exitPrice = 0;
       if (broker) {
         try {
-          const ltp = await broker.getLTP(`NSE:${symbol}`);
-          if (ltp && ltp.last_price) exitPrice = ltp.last_price;
+          const ltp = await broker.getLTP([`NSE:${symbol}`]);   // ← array, not string
+          exitPrice = ltp?.[`NSE:${symbol}`]?.last_price ?? 0;  // ← correct key lookup
         } catch (e) {
           log.warn({ symbol, err: e.message }, 'Failed to fetch LTP for square-off fallback');
         }
@@ -125,14 +125,14 @@ export async function executeSquareOff({ broker, riskManager, engine, getOpenPos
             orderType: 'MARKET',
             product: 'MIS',
           });
-          
+
           const finalPrice = squareOffResult?.price || squareOffResult?.average_price || exitPrice;
           const entryPrice = pos.average_price || pos.buyPrice || 0;
           const pnl = (finalPrice - entryPrice) * qty;
 
-          await riskManager.recordTradePnL(pnl, symbol).catch(() => {});
+          await riskManager.recordTradePnL(pnl, symbol).catch(() => { });
           await riskManager.removePosition();
-          
+
           squaredOff.push({ symbol, qty, pnl, squareOffPrice: finalPrice });
         } else {
           throw new Error('Square-off rejected by engine (no position context?)');

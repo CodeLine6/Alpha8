@@ -285,6 +285,8 @@ export class PositionManager {
             `📥 Entry:  ₹${posCtx.entryPrice.toFixed(2)}\n` +
             `📤 Exit:   ₹${exitPrice.toFixed(2)}\n` +
             `💰 P&amp;L:   ${pnlStr}\n` +
+            `💰 Net P&amp;L: ${pnlStr}\n` +
+            `💸 Charges:  ₹${(exitResult?.costPaid || 0).toFixed(2)}\n` +
             `📦 Qty:    ${posCtx.quantity}\n` +
             `🏦 Strategy: ${posCtx.openingStrategy || 'unknown'}\n` +
             `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`

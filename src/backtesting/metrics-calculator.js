@@ -79,26 +79,26 @@ export function calculateMetrics(trades, initialCapital) {
   }
 
   // ── 1. Basic counts ────────────────────────────────────────────────────────
-  const wins   = trades.filter(t => t.pnl > 0);
+  const wins = trades.filter(t => t.pnl > 0);
   const losses = trades.filter(t => t.pnl <= 0);
 
-  const totalPnl    = trades.reduce((s, t) => s + t.pnl, 0);
+  const totalPnl = trades.reduce((s, t) => s + t.pnl, 0);
   const finalCapital = initialCapital + totalPnl;
 
   const grossProfit = wins.reduce((s, t) => s + t.pnl, 0);
-  const grossLoss   = Math.abs(losses.reduce((s, t) => s + t.pnl, 0));
+  const grossLoss = Math.abs(losses.reduce((s, t) => s + t.pnl, 0));
 
   // ── 2. Win/loss statistics ─────────────────────────────────────────────────
-  const winRate      = (wins.length / trades.length) * 100;
-  const avgWinPct    = wins.length > 0
+  const winRate = (wins.length / trades.length) * 100;
+  const avgWinPct = wins.length > 0
     ? wins.reduce((s, t) => s + t.pnlPct, 0) / wins.length
     : 0;
-  const avgLossPct   = losses.length > 0
+  const avgLossPct = losses.length > 0
     ? losses.reduce((s, t) => s + t.pnlPct, 0) / losses.length
     : 0;
   const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : Infinity;
 
-  const bestTrade  = trades.reduce((m, t) => t.pnlPct > m.pnlPct ? t : m, trades[0]);
+  const bestTrade = trades.reduce((m, t) => t.pnlPct > m.pnlPct ? t : m, trades[0]);
   const worstTrade = trades.reduce((m, t) => t.pnlPct < m.pnlPct ? t : m, trades[0]);
 
   // ── 3. Trade duration ──────────────────────────────────────────────────────
@@ -130,36 +130,60 @@ export function calculateMetrics(trades, initialCapital) {
   // ── 6. Sharpe ratio (annualised) ───────────────────────────────────────────
   // Using daily returns from the daily P&L series
   const dailyReturnsPct = buildDailyReturnSeries(trades, initialCapital);
-  const sharpeRatio     = calculateSharpe(dailyReturnsPct);
-  const sortinoRatio    = calculateSortino(dailyReturnsPct);
+  const sharpeRatio = calculateSharpe(dailyReturnsPct);
+  const sortinoRatio = calculateSortino(dailyReturnsPct);
 
   // ── 7. Calmar ratio ────────────────────────────────────────────────────────
   const totalReturnPct = ((finalCapital - initialCapital) / initialCapital) * 100;
-  const calmarRatio    = maxDrawdownPct > 0
+  const calmarRatio = maxDrawdownPct > 0
     ? round(totalReturnPct / maxDrawdownPct, 2)
     : Infinity;
 
+  // ── Long / Short breakdown ──────────────────────────────────────────────
+  const longTrades = trades.filter(t => !t.isShort);
+  const shortTrades = trades.filter(t => t.isShort);
+
+  const directionBreakdown = {
+    long: {
+      count: longTrades.length,
+      wins: longTrades.filter(t => t.pnl > 0).length,
+      pnl: round(longTrades.reduce((s, t) => s + t.pnl, 0)),
+      winRate: longTrades.length
+        ? round((longTrades.filter(t => t.pnl > 0).length / longTrades.length) * 100, 1)
+        : 0,
+    },
+    short: {
+      count: shortTrades.length,
+      wins: shortTrades.filter(t => t.pnl > 0).length,
+      pnl: round(shortTrades.reduce((s, t) => s + t.pnl, 0)),
+      winRate: shortTrades.length
+        ? round((shortTrades.filter(t => t.pnl > 0).length / shortTrades.length) * 100, 1)
+        : 0,
+    },
+  };
+
   return {
-    initialCapital:      round(initialCapital),
-    finalCapital:        round(finalCapital),
-    totalPnl:            round(totalPnl),
-    totalReturnPct:      round(totalReturnPct, 2),
-    totalTrades:         trades.length,
-    winningTrades:       wins.length,
-    losingTrades:        losses.length,
-    winRate:             round(winRate, 1),
-    avgWinPct:           round(avgWinPct, 2),
-    avgLossPct:          round(avgLossPct, 2),
-    profitFactor:        profitFactor === Infinity ? Infinity : round(profitFactor, 2),
-    maxDrawdownPct:      round(maxDrawdownPct, 2),
-    sharpeRatio:         round(sharpeRatio, 2),
-    sortinoRatio:        round(sortinoRatio, 2),
+    initialCapital: round(initialCapital),
+    finalCapital: round(finalCapital),
+    totalPnl: round(totalPnl),
+    totalReturnPct: round(totalReturnPct, 2),
+    totalTrades: trades.length,
+    winningTrades: wins.length,
+    losingTrades: losses.length,
+    winRate: round(winRate, 1),
+    avgWinPct: round(avgWinPct, 2),
+    avgLossPct: round(avgLossPct, 2),
+    profitFactor: profitFactor === Infinity ? Infinity : round(profitFactor, 2),
+    maxDrawdownPct: round(maxDrawdownPct, 2),
+    sharpeRatio: round(sharpeRatio, 2),
+    sortinoRatio: round(sortinoRatio, 2),
     calmarRatio,
-    bestTradePct:        round(bestTrade.pnlPct,  2),
-    worstTradePct:       round(worstTrade.pnlPct, 2),
+    bestTradePct: round(bestTrade.pnlPct, 2),
+    worstTradePct: round(worstTrade.pnlPct, 2),
     avgTradeDurationMin: round(avgTradeDurationMin, 0),
     equityCurve,
-    dailyPnl:            dailyPnlArray,
+    dailyPnl: dailyPnlArray,
+    directionBreakdown,
   };
 }
 
@@ -169,8 +193,8 @@ export function calculateMetrics(trades, initialCapital) {
  * @returns {number}
  */
 export function calculateMaxDrawdown(equityCurve) {
-  let peak   = equityCurve[0];
-  let maxDD  = 0;
+  let peak = equityCurve[0];
+  let maxDD = 0;
 
   for (const value of equityCurve) {
     if (value > peak) peak = value;
@@ -221,10 +245,10 @@ export function calculateSharpe(dailyReturnsPct) {
   if (dailyReturnsPct.length < 2) return 0;
 
   const rfDaily = (RISK_FREE_RATE_ANNUAL / TRADING_DAYS_PER_YEAR) * 100;
-  const excess  = dailyReturnsPct.map(r => r - rfDaily);
+  const excess = dailyReturnsPct.map(r => r - rfDaily);
 
   const mean = excess.reduce((s, r) => s + r, 0) / excess.length;
-  const std  = stdDev(excess);
+  const std = stdDev(excess);
 
   if (std === 0) return 0;
 
@@ -240,9 +264,9 @@ export function calculateSharpe(dailyReturnsPct) {
 export function calculateSortino(dailyReturnsPct) {
   if (dailyReturnsPct.length < 2) return 0;
 
-  const rfDaily    = (RISK_FREE_RATE_ANNUAL / TRADING_DAYS_PER_YEAR) * 100;
-  const excess     = dailyReturnsPct.map(r => r - rfDaily);
-  const mean       = excess.reduce((s, r) => s + r, 0) / excess.length;
+  const rfDaily = (RISK_FREE_RATE_ANNUAL / TRADING_DAYS_PER_YEAR) * 100;
+  const excess = dailyReturnsPct.map(r => r - rfDaily);
+  const mean = excess.reduce((s, r) => s + r, 0) / excess.length;
   const downsideRets = excess.filter(r => r < 0);
 
   if (downsideRets.length === 0) return Infinity;
@@ -269,25 +293,25 @@ function stdDev(arr) {
 function emptyMetrics(initialCapital) {
   return {
     initialCapital,
-    finalCapital:        initialCapital,
-    totalPnl:            0,
-    totalReturnPct:      0,
-    totalTrades:         0,
-    winningTrades:       0,
-    losingTrades:        0,
-    winRate:             0,
-    avgWinPct:           0,
-    avgLossPct:          0,
-    profitFactor:        0,
-    maxDrawdownPct:      0,
-    sharpeRatio:         0,
-    sortinoRatio:        0,
-    calmarRatio:         0,
-    bestTradePct:        0,
-    worstTradePct:       0,
+    finalCapital: initialCapital,
+    totalPnl: 0,
+    totalReturnPct: 0,
+    totalTrades: 0,
+    winningTrades: 0,
+    losingTrades: 0,
+    winRate: 0,
+    avgWinPct: 0,
+    avgLossPct: 0,
+    profitFactor: 0,
+    maxDrawdownPct: 0,
+    sharpeRatio: 0,
+    sortinoRatio: 0,
+    calmarRatio: 0,
+    bestTradePct: 0,
+    worstTradePct: 0,
     avgTradeDurationMin: 0,
-    equityCurve:         [initialCapital],
-    dailyPnl:            [],
+    equityCurve: [initialCapital],
+    dailyPnl: [],
   };
 }
 
@@ -301,13 +325,13 @@ function emptyMetrics(initialCapital) {
 export function compareStrategies(results) {
   return results
     .map(r => ({
-      strategy:       r.name,
-      returnPct:      r.metrics.totalReturnPct,
-      winRate:        r.metrics.winRate,
-      sharpe:         r.metrics.sharpeRatio,
-      maxDrawdown:    r.metrics.maxDrawdownPct,
-      profitFactor:   r.metrics.profitFactor,
-      totalTrades:    r.metrics.totalTrades,
+      strategy: r.name,
+      returnPct: r.metrics.totalReturnPct,
+      winRate: r.metrics.winRate,
+      sharpe: r.metrics.sharpeRatio,
+      maxDrawdown: r.metrics.maxDrawdownPct,
+      profitFactor: r.metrics.profitFactor,
+      totalTrades: r.metrics.totalTrades,
     }))
     .sort((a, b) => b.sharpe - a.sharpe);
 }

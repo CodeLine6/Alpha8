@@ -395,8 +395,12 @@ export function createApiHandler(deps) {
           const ctx = enginePositions.get(symbol);
           const currentPrice = priceMap[symbol] ?? null;
           const entryPrice = ctx.entryPrice ?? ctx.price;
+          const isShort = ctx.isShort ?? ctx.direction === 'SELL';
           const unrealisedPnL = currentPrice != null
-            ? (currentPrice - entryPrice) * ctx.quantity : null;
+            ? isShort
+              ? (entryPrice - currentPrice) * ctx.quantity   // short profits when price falls
+              : (currentPrice - entryPrice) * ctx.quantity
+            : null;
           const unrealisedPnLPct = currentPrice != null
             ? ((currentPrice - entryPrice) / entryPrice) * 100 : null;
           const holdMinutes = (Date.now() - ctx.timestamp) / 60000;
@@ -407,7 +411,7 @@ export function createApiHandler(deps) {
 
           return {
             symbol,
-            side: 'BUY',
+            side: ctx.direction ?? 'BUY',
             quantity: ctx.quantity,
             avgPrice: entryPrice,
             entryPrice,

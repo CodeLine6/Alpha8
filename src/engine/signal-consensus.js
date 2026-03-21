@@ -4,38 +4,36 @@
  * CHANGES (Tier 1):
  *   - Exported STRATEGY_GROUPS constant (reversal + momentum role groups)
  *   - Added `groupedConsensus` option (default: true)
- *   - Added `groupVotes` field to result for dashboard visibility.
- *   - When `groupedConsensus: false`, falls back to original "any N agree" logic.
+ *   - Added `groupVotes` field to result for dashboard visibility
+ *   - When `groupedConsensus: false`, falls back to original "any N agree" logic
  *
  * CHANGES (Tier 2 — Feature 6):
- *   - Added CONFIDENCE_FLOORS per strategy.
- *   - Signals below their floor are included in `details` but don't vote.
+ *   - Added CONFIDENCE_FLOORS per strategy
+ *   - Signals below their floor are included in `details` but don't vote
  *
  * CHANGES (Tier 3 — Feature 8):
- *   - Added OPEN_WINDOW_SUPPRESSED set for 09:15–09:30 noise suppression.
+ *   - Added OPEN_WINDOW_SUPPRESSED set for 09:15–09:30 noise suppression
  *
  * CHANGES (Tier 3 — Feature 9):
- *   - Conflict detection added at end of evaluate().
+ *   - Conflict detection added at end of evaluate()
+ *
+ * CHANGES (Short Selling):
+ *   - Exported SHORT_INELIGIBLE_STRATEGIES — RSI cannot open short positions
+ *   - _groupedConsensus() SELL path excludes RSI from short-entry consensus
+ *   - isShortEntry flag added to SELL consensus result
+ *   - RSI-only SELL marked isShortEntry:false (valid long exit, not a short entry)
+ *   - Super Conviction SELL also respects SHORT_INELIGIBLE_STRATEGIES
  *
  * FIXES APPLIED:
  *
  *   Fix A — Super Conviction convictionStrategy field
  *     _groupedConsensus() Super Conviction path now returns a `convictionStrategy`
- *     field containing the clean strategy name (e.g. 'EMA_CROSSOVER'). Previously
- *     the strategy name was only embedded in the reason string, making it impossible
- *     for execution-engine.js to set the correct openingStrategy and profit target
- *     mode on the posCtx without string parsing.
+ *     field containing the clean strategy name.
  *
  *   Fix B — weightedConsensusWithWeights respects meetsFloor and suppressedByTime
- *     Previously weightedConsensus() counted ALL signals in details[] that had
- *     signal='BUY'/'SELL', including those filtered by confidence floor or time
- *     suppression. This meant the pipeline Gate 1 was LESS strict than grouped
- *     consensus — it could unblock a trade the consensus layer explicitly blocked.
- *     Now signals with meetsFloor===false or suppressedByTime===true are skipped.
+ *     Signals with meetsFloor===false or suppressedByTime===true are skipped.
  *
  *   Fix C — isConflicted detects any disagreement, not just exact ties
- *     Old definition: buyCount > 0 && sellCount > 0 && buyCount === sellCount
- *     Missed cases like 2 BUY + 1 SELL where strategies actively disagree.
  *     New definition: buyCount > 0 && sellCount > 0 (any active disagreement).
  */
 
@@ -43,6 +41,8 @@ import { SIGNAL } from '../config/constants.js';
 import { createLogger } from '../lib/logger.js';
 
 const log = createLogger('signal-consensus');
+
+// ── Confidence floors ─────────────────────────────────────────────────────────
 
 const CONFIDENCE_FLOORS = {
   EMA_CROSSOVER: 55,
@@ -52,24 +52,41 @@ const CONFIDENCE_FLOORS = {
 };
 const DEFAULT_FLOOR = 40;
 
+// ── Open-window noise suppression ─────────────────────────────────────────────
+
 const OPEN_WINDOW_SUPPRESSED = new Set(['EMA_CROSSOVER', 'BREAKOUT_VOLUME']);
 const OPEN_WINDOW_END_MINUTES = 15;
+
+// ── Strategy groups ───────────────────────────────────────────────────────────
 
 export const STRATEGY_GROUPS = {
   REVERSAL: ['EMA_CROSSOVER', 'RSI_MEAN_REVERSION'],
   MOMENTUM: ['VWAP_MOMENTUM', 'BREAKOUT_VOLUME'],
 };
 
+// ── Short selling eligibility ─────────────────────────────────────────────────
+//
+// RSI_MEAN_REVERSION is excluded from OPENING short positions.
+// Overbought stocks can stay overbought for days in strong uptrends —
+// shorting into momentum is how accounts blow up.
+// RSI SELL signals remain valid as EXIT triggers for existing LONG positions.
+
+export const SHORT_INELIGIBLE_STRATEGIES = new Set(['RSI_MEAN_REVERSION']);
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
 function isInOpenNoiseWindow() {
   const now = new Date();
   const istString = now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
   const ist = new Date(istString);
-  const hours = ist.getHours();
-  const minutes = ist.getMinutes();
-  const totalMinutes = hours * 60 + minutes;
+  const totalMinutes = ist.getHours() * 60 + ist.getMinutes();
   const openMinutes = 9 * 60 + 15;
   return totalMinutes >= openMinutes && totalMinutes < openMinutes + OPEN_WINDOW_END_MINUTES;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SignalConsensus
+// ═══════════════════════════════════════════════════════════════════════════════
 
 export class SignalConsensus {
   constructor(config = {}) {
@@ -89,7 +106,6 @@ export class SignalConsensus {
 
   /**
    * Refresh live parameters from Redis.
-   * @returns {Promise<void>}
    */
   async refreshParams() {
     if (!this._getLiveSetting) return;
@@ -99,6 +115,10 @@ export class SignalConsensus {
       log.warn({ err: err.message }, 'Failed to refresh SignalConsensus params');
     }
   }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // evaluate()
+  // ─────────────────────────────────────────────────────────────────────────
 
   evaluate(candles) {
     if (this.strategies.length === 0) {
@@ -111,6 +131,7 @@ export class SignalConsensus {
         details: [],
         isConflicted: false,
         conflictDetails: null,
+        isShortEntry: false,
       };
     }
 
@@ -123,6 +144,7 @@ export class SignalConsensus {
       momentum: { buy: 0, sell: 0 },
     };
 
+    // ── Run each strategy ─────────────────────────────────────────────────
     for (const strategy of this.strategies) {
       let result;
       try {
@@ -143,6 +165,7 @@ export class SignalConsensus {
         continue;
       }
 
+      // Below global minConfidence → HOLD
       if (result.confidence < this.minConfidence) {
         votes.hold++;
         results.push({
@@ -157,14 +180,12 @@ export class SignalConsensus {
       const strategyKey = result.strategy ?? strategy.name;
       const floor = CONFIDENCE_FLOORS[strategyKey] ?? DEFAULT_FLOOR;
       const meetsFloor = result.confidence >= floor;
+      const suppressedByTime = inOpenWindow && OPEN_WINDOW_SUPPRESSED.has(strategyKey);
 
       if (!meetsFloor) {
         log.debug({ strategy: strategyKey, confidence: result.confidence, floor },
           'Signal filtered — below confidence floor');
       }
-
-      const suppressedByTime = inOpenWindow && OPEN_WINDOW_SUPPRESSED.has(strategyKey);
-
       if (suppressedByTime) {
         log.debug({ strategy: strategyKey, signal: result.signal },
           'Signal suppressed — open noise window (09:15–09:30 IST)');
@@ -196,6 +217,7 @@ export class SignalConsensus {
         continue;
       }
 
+      // Accumulate group votes
       if (STRATEGY_GROUPS.REVERSAL.includes(strategyKey)) {
         if (result.signal === SIGNAL.BUY) groupVotes.reversal.buy++;
         else groupVotes.reversal.sell++;
@@ -205,17 +227,23 @@ export class SignalConsensus {
       }
     }
 
+    // ── Resolve final signal ──────────────────────────────────────────────
     let finalSignal = SIGNAL.HOLD;
     let finalConfidence = 0;
     let reason = '';
+    let isShortEntry = false;
+    let convictionStrategy = undefined;
 
     if (this.groupedConsensus) {
-      const result = this._groupedConsensus(results, votes, groupVotes);
-      finalSignal = result.signal;
-      finalConfidence = result.confidence;
-      reason = result.reason;
-      // Propagate convictionStrategy if Super Conviction fired
-      if (result.convictionStrategy) {
+      const gr = this._groupedConsensus(results, votes, groupVotes);
+      finalSignal = gr.signal;
+      finalConfidence = gr.confidence;
+      reason = gr.reason;
+      isShortEntry = gr.isShortEntry ?? false;
+      convictionStrategy = gr.convictionStrategy;
+
+      // Super Conviction path returns early with convictionStrategy
+      if (convictionStrategy) {
         return {
           signal: finalSignal,
           confidence: finalConfidence,
@@ -223,17 +251,27 @@ export class SignalConsensus {
           votes,
           groupVotes,
           details: results,
-          convictionStrategy: result.convictionStrategy,
-          // Fix C: any disagreement is a conflict
+          convictionStrategy,
+          isShortEntry,
           isConflicted: this._computeConflicted(results),
           conflictDetails: this._computeConflictDetails(results),
         };
       }
     } else {
-      const result = this._simpleConsensus(results, votes);
-      finalSignal = result.signal;
-      finalConfidence = result.confidence;
-      reason = result.reason;
+      const sr = this._simpleConsensus(results, votes);
+      finalSignal = sr.signal;
+      finalConfidence = sr.confidence;
+      reason = sr.reason;
+      // In simple mode, SELL consensus is treated as a short entry
+      // only if at least one short-eligible strategy voted SELL
+      if (finalSignal === SIGNAL.SELL) {
+        isShortEntry = results.some(
+          r => r.signal === SIGNAL.SELL &&
+            r.meetsFloor !== false &&
+            !r.suppressedByTime &&
+            !SHORT_INELIGIBLE_STRATEGIES.has(r.strategy)
+        );
+      }
     }
 
     log.info({
@@ -241,6 +279,7 @@ export class SignalConsensus {
       confidence: finalConfidence,
       votes,
       groupVotes,
+      isShortEntry,
       mode: this.groupedConsensus ? 'grouped' : 'simple',
       inOpenWindow,
       strategiesRun: this.strategies.length,
@@ -257,121 +296,171 @@ export class SignalConsensus {
       votes,
       groupVotes,
       details: results,
+      isShortEntry,
       isConflicted,
       conflictDetails,
     };
   }
 
-  // ── Private helpers ────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────
+  // _groupedConsensus()
+  // ─────────────────────────────────────────────────────────────────────────
 
   /**
-   * Fix C: Compute isConflicted — any active disagreement (buy>0 AND sell>0).
-   * Only counts signals that met their floor and weren't time-suppressed.
-   * @private
-   */
-  _computeConflicted(results) {
-    const buyCount = results.filter(
-      d => d.signal === SIGNAL.BUY && d.meetsFloor && !d.suppressedByTime
-    ).length;
-    const sellCount = results.filter(
-      d => d.signal === SIGNAL.SELL && d.meetsFloor && !d.suppressedByTime
-    ).length;
-    return buyCount > 0 && sellCount > 0;
-  }
-
-  /** @private */
-  _computeConflictDetails(results) {
-    return {
-      buyStrategies: results
-        .filter(d => d.signal === SIGNAL.BUY && d.meetsFloor && !d.suppressedByTime)
-        .map(d => d.strategy),
-      sellStrategies: results
-        .filter(d => d.signal === SIGNAL.SELL && d.meetsFloor && !d.suppressedByTime)
-        .map(d => d.strategy),
-    };
-  }
-
-  /**
-   * Grouped consensus: ≥1 REVERSAL AND ≥1 MOMENTUM must agree in same direction.
+   * Cross-group consensus: ≥1 REVERSAL AND ≥1 MOMENTUM must agree.
    *
-   * Fix A: Super Conviction path now returns `convictionStrategy` so that
-   * execution-engine.js can set the correct openingStrategy on posCtx without
-   * string-parsing the reason field.
-   * @private
+   * BUY  (open long):  all strategies eligible.
+   * SELL (open short): SHORT_INELIGIBLE_STRATEGIES excluded from vote.
+   *                    RSI-only SELL → isShortEntry:false (long exit only).
    */
   _groupedConsensus(results, votes, groupVotes) {
-    // ── BUY check ─────────────────────────────────────────────────────────
+
+    // ── BUY check (open long) ─────────────────────────────────────────────
     if (groupVotes.reversal.buy >= 1 && groupVotes.momentum.buy >= 1) {
       const buyResults = results.filter(
-        (r) => r.signal === SIGNAL.BUY && r.confidence >= this.minConfidence && r.meetsFloor && !r.suppressedByTime
+        r => r.signal === SIGNAL.BUY &&
+          r.confidence >= this.minConfidence &&
+          r.meetsFloor &&
+          !r.suppressedByTime
       );
       const confidence = Math.round(
         buyResults.reduce((sum, r) => sum + r.confidence, 0) / buyResults.length
       );
       const reversalNames = this._groupContributors(results, STRATEGY_GROUPS.REVERSAL, SIGNAL.BUY);
       const momentumNames = this._groupContributors(results, STRATEGY_GROUPS.MOMENTUM, SIGNAL.BUY);
-      const reason = `BUY consensus: ${reversalNames.map(n => `${n}(reversal)`).join(' + ')} + ${momentumNames.map(n => `${n}(momentum)`).join(' + ')} agree`;
-      return { signal: SIGNAL.BUY, confidence, reason };
+      return {
+        signal: SIGNAL.BUY,
+        confidence,
+        isShortEntry: false,
+        reason: `BUY consensus: ${reversalNames.map(n => `${n}(reversal)`).join(' + ')} + ${momentumNames.map(n => `${n}(momentum)`).join(' + ')} agree`,
+      };
     }
 
-    // ── SELL check ────────────────────────────────────────────────────────
-    if (groupVotes.reversal.sell >= 1 && groupVotes.momentum.sell >= 1) {
-      const sellResults = results.filter(
-        (r) => r.signal === SIGNAL.SELL && r.confidence >= this.minConfidence && r.meetsFloor && !r.suppressedByTime
+    // ── SELL check (open short) ───────────────────────────────────────────
+    // RSI_MEAN_REVERSION is excluded from short-entry consensus.
+    // It is valid as a long EXIT but cannot open a new short position.
+    const shortEligibleResults = results.filter(
+      r => !SHORT_INELIGIBLE_STRATEGIES.has(r.strategy)
+    );
+
+    // Recount group votes for short-eligible strategies only
+    const shortGroupVotes = { reversal: { sell: 0 }, momentum: { sell: 0 } };
+    for (const r of shortEligibleResults) {
+      if (!r.meetsFloor || r.suppressedByTime || r.signal !== SIGNAL.SELL) continue;
+      if (STRATEGY_GROUPS.REVERSAL.includes(r.strategy)) shortGroupVotes.reversal.sell++;
+      if (STRATEGY_GROUPS.MOMENTUM.includes(r.strategy)) shortGroupVotes.momentum.sell++;
+    }
+
+    if (shortGroupVotes.reversal.sell >= 1 && shortGroupVotes.momentum.sell >= 1) {
+      const sellResults = shortEligibleResults.filter(
+        r => r.signal === SIGNAL.SELL &&
+          r.confidence >= this.minConfidence &&
+          r.meetsFloor &&
+          !r.suppressedByTime
       );
       const confidence = Math.round(
         sellResults.reduce((sum, r) => sum + r.confidence, 0) / sellResults.length
       );
-      const reversalNames = this._groupContributors(results, STRATEGY_GROUPS.REVERSAL, SIGNAL.SELL);
-      const momentumNames = this._groupContributors(results, STRATEGY_GROUPS.MOMENTUM, SIGNAL.SELL);
-      const reason = `SELL consensus: ${reversalNames.map(n => `${n}(reversal)`).join(' + ')} + ${momentumNames.map(n => `${n}(momentum)`).join(' + ')} agree`;
-      return { signal: SIGNAL.SELL, confidence, reason };
+      const reversalNames = this._groupContributors(shortEligibleResults, STRATEGY_GROUPS.REVERSAL, SIGNAL.SELL);
+      const momentumNames = this._groupContributors(shortEligibleResults, STRATEGY_GROUPS.MOMENTUM, SIGNAL.SELL);
+      return {
+        signal: SIGNAL.SELL,
+        confidence,
+        isShortEntry: true,   // ← eligible to open a new short position
+        reason: `SELL consensus (SHORT): ${reversalNames.map(n => `${n}(reversal)`).join(' + ')} + ${momentumNames.map(n => `${n}(momentum)`).join(' + ')} agree`,
+      };
+    }
+
+    // ── RSI-only SELL: valid long exit, NOT a short entry ─────────────────
+    // If the only SELL voters are SHORT_INELIGIBLE (e.g. RSI alone),
+    // surface the SELL so a held long position can be closed, but flag
+    // isShortEntry:false so the engine does NOT open a new short.
+    if (groupVotes.reversal.sell >= 1 || groupVotes.momentum.sell >= 1) {
+      const hasShortEligibleSell = shortEligibleResults.some(
+        r => r.signal === SIGNAL.SELL && r.meetsFloor && !r.suppressedByTime
+      );
+      if (!hasShortEligibleSell) {
+        const sellResults = results.filter(
+          r => r.signal === SIGNAL.SELL &&
+            r.confidence >= this.minConfidence &&
+            r.meetsFloor &&
+            !r.suppressedByTime
+        );
+        if (sellResults.length > 0) {
+          const confidence = Math.round(
+            sellResults.reduce((sum, r) => sum + r.confidence, 0) / sellResults.length
+          );
+          return {
+            signal: SIGNAL.SELL,
+            confidence,
+            isShortEntry: false,   // ← exit long only, do NOT open short
+            reason: 'SELL signal (EXIT LONG ONLY — RSI overbought, not eligible to open short)',
+          };
+        }
+      }
     }
 
     // ── Super Conviction Bypass ───────────────────────────────────────────
     if (this.superConvictionEnabled) {
       const extremeResults = results.filter(
-        (r) => r.confidence >= this.superConvictionThreshold && r.meetsFloor && !r.suppressedByTime && r.signal !== SIGNAL.HOLD
+        r => r.confidence >= this.superConvictionThreshold &&
+          r.meetsFloor &&
+          !r.suppressedByTime &&
+          r.signal !== SIGNAL.HOLD
       );
 
       if (extremeResults.length > 0) {
-        const best = extremeResults.reduce((prev, current) =>
-          (prev.confidence > current.confidence) ? prev : current
+        const best = extremeResults.reduce((prev, cur) =>
+          prev.confidence > cur.confidence ? prev : cur
         );
+
+        // RSI cannot bypass into a short entry
+        const isShortEntry = best.signal === SIGNAL.SELL &&
+          !SHORT_INELIGIBLE_STRATEGIES.has(best.strategy);
 
         log.info({
           strategy: best.strategy,
           confidence: best.confidence,
           threshold: this.superConvictionThreshold,
+          isShortEntry,
         }, `⏩ Super Conviction BYPASS: ${best.strategy} (${best.confidence}%)`);
 
         return {
           signal: best.signal,
           confidence: best.confidence,
-          // Fix A: expose clean strategy name so execution-engine can use it directly
-          // instead of parsing the reason string.
-          convictionStrategy: best.strategy,
+          convictionStrategy: best.strategy,   // Fix A: clean strategy name
+          isShortEntry,
           reason: `SUPER CONVICTION BYPASS: ${best.strategy} reached ${best.confidence}% confidence. Cross-group consensus skipped.`,
         };
       }
     }
 
     // ── No cross-group agreement ──────────────────────────────────────────
-    const reason =
-      `No cross-group consensus. ` +
-      `Reversal — BUY:${groupVotes.reversal.buy} SELL:${groupVotes.reversal.sell} | ` +
-      `Momentum — BUY:${groupVotes.momentum.buy} SELL:${groupVotes.momentum.sell}`;
-    return { signal: SIGNAL.HOLD, confidence: 0, reason };
+    return {
+      signal: SIGNAL.HOLD,
+      confidence: 0,
+      isShortEntry: false,
+      reason: `No cross-group consensus. ` +
+        `Reversal — BUY:${groupVotes.reversal.buy} SELL:${groupVotes.reversal.sell} | ` +
+        `Momentum — BUY:${groupVotes.momentum.buy} SELL:${groupVotes.momentum.sell}`,
+    };
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // _simpleConsensus()
+  // ─────────────────────────────────────────────────────────────────────────
+
   /**
-   * Simple (original) consensus: minAgreement strategies must agree.
-   * @private
+   * Original "any N strategies agree" logic.
+   * Used when groupedConsensus: false.
    */
   _simpleConsensus(results, votes) {
     if (votes.buy >= this.minAgreement && votes.buy > votes.sell) {
       const buyResults = results.filter(
-        (r) => r.signal === SIGNAL.BUY && r.confidence >= this.minConfidence && r.meetsFloor !== false && !r.suppressedByTime
+        r => r.signal === SIGNAL.BUY &&
+          r.confidence >= this.minConfidence &&
+          r.meetsFloor !== false &&
+          !r.suppressedByTime
       );
       const confidence = Math.round(
         buyResults.reduce((sum, r) => sum + r.confidence, 0) / buyResults.length
@@ -385,7 +474,10 @@ export class SignalConsensus {
 
     if (votes.sell >= this.minAgreement && votes.sell > votes.buy) {
       const sellResults = results.filter(
-        (r) => r.signal === SIGNAL.SELL && r.confidence >= this.minConfidence && r.meetsFloor !== false && !r.suppressedByTime
+        r => r.signal === SIGNAL.SELL &&
+          r.confidence >= this.minConfidence &&
+          r.meetsFloor !== false &&
+          !r.suppressedByTime
       );
       const confidence = Math.round(
         sellResults.reduce((sum, r) => sum + r.confidence, 0) / sellResults.length
@@ -400,22 +492,22 @@ export class SignalConsensus {
     return {
       signal: SIGNAL.HOLD,
       confidence: 0,
-      reason:
-        `No consensus (need ${this.minAgreement}). ` +
+      reason: `No consensus (need ${this.minAgreement}). ` +
         `Votes — BUY: ${votes.buy}, SELL: ${votes.sell}, HOLD: ${votes.hold}`,
     };
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // weightedConsensusWithWeights()  — called by EnhancedSignalPipeline
+  // ─────────────────────────────────────────────────────────────────────────
+
   /**
-   * Fix B: weightedConsensus now skips signals that did not meet their
-   * confidence floor or were suppressed by the open noise time window.
-   * Previously these were counted, making Gate 1 less strict than grouped
-   * consensus and allowing the pipeline to unblock explicitly blocked trades.
+   * Fix B: Signals with meetsFloor===false or suppressedByTime===true are
+   * skipped so pipeline Gate 1 is at least as strict as grouped consensus.
    *
-   * @param {Array}              signals   - [{ signal, confidence, strategy, meetsFloor, suppressedByTime }]
-   * @param {Map<string,number>} weights   - Pre-fetched weight map
-   * @param {number}             threshold - default 2.0
-   * @returns {object|null}
+   * @param {Array}              signals   - consensusResult.details[]
+   * @param {Map<string,number>} weights   - from AdaptiveWeightManager
+   * @param {number}             threshold - regime-adjusted minimum weight sum
    */
   weightedConsensusWithWeights(signals, weights, threshold = 2.0) {
     if (!signals || signals.length === 0) return null;
@@ -424,8 +516,7 @@ export class SignalConsensus {
     let sellWeight = 0;
 
     for (const sig of signals) {
-      // Fix B: skip signals filtered by confidence floor or time suppression.
-      // These are in details[] for shadow recording purposes only.
+      // Fix B: skip suppressed signals — they don't vote
       if (sig.meetsFloor === false) continue;
       if (sig.suppressedByTime === true) continue;
 
@@ -441,10 +532,11 @@ export class SignalConsensus {
     }, 'Weighted consensus threshold check');
 
     if (buyWeight >= threshold) {
-      const buys = signals.filter(s => s.signal === 'BUY' && s.meetsFloor !== false && !s.suppressedByTime);
+      const buys = signals.filter(
+        s => s.signal === 'BUY' && s.meetsFloor !== false && !s.suppressedByTime
+      );
       if (buys.length === 0) return null;
       const best = buys.reduce((m, s) => s.confidence > m.confidence ? s : m, buys[0]);
-      log.debug({ threshold, buyWeight }, 'BUY weighted consensus passed');
       return {
         ...best,
         weightedScore: Math.round(buyWeight * 100) / 100,
@@ -453,10 +545,13 @@ export class SignalConsensus {
     }
 
     if (sellWeight >= threshold) {
-      const sells = signals.filter(s => s.signal === 'SELL' && s.meetsFloor !== false && !s.suppressedByTime);
+      const sells = signals.filter(
+        s => s.signal === 'SELL' &&
+          s.meetsFloor !== false &&
+          !s.suppressedByTime
+      );
       if (sells.length === 0) return null;
       const best = sells.reduce((m, s) => s.confidence > m.confidence ? s : m, sells[0]);
-      log.debug({ threshold, sellWeight }, 'SELL weighted consensus passed');
       return {
         ...best,
         weightedScore: Math.round(sellWeight * 100) / 100,
@@ -470,19 +565,43 @@ export class SignalConsensus {
   }
 
   /**
-   * Async wrapper that fetches weights from Redis then calls weightedConsensusWithWeights.
+   * Async wrapper — fetches weights then calls weightedConsensusWithWeights.
    */
   async weightedConsensus(signals, threshold = 2.0) {
     if (!signals || signals.length === 0) return null;
-    // This method is only called from EnhancedSignalPipeline which has its own
-    // AdaptiveWeightManager. The method signature is kept for backward compat.
     return this.weightedConsensusWithWeights(signals, new Map(), threshold);
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // Private helpers
+  // ─────────────────────────────────────────────────────────────────────────
+
   /**
-   * Get strategy names that voted for a given signal within a group.
-   * @private
+   * Fix C: isConflicted — any active disagreement (buy > 0 AND sell > 0).
+   * Only counts signals that met floor and weren't time-suppressed.
    */
+  _computeConflicted(results) {
+    const buyCount = results.filter(
+      d => d.signal === SIGNAL.BUY && d.meetsFloor && !d.suppressedByTime
+    ).length;
+    const sellCount = results.filter(
+      d => d.signal === SIGNAL.SELL && d.meetsFloor && !d.suppressedByTime
+    ).length;
+    return buyCount > 0 && sellCount > 0;
+  }
+
+  _computeConflictDetails(results) {
+    return {
+      buyStrategies: results
+        .filter(d => d.signal === SIGNAL.BUY && d.meetsFloor && !d.suppressedByTime)
+        .map(d => d.strategy),
+      sellStrategies: results
+        .filter(d => d.signal === SIGNAL.SELL && d.meetsFloor && !d.suppressedByTime)
+        .map(d => d.strategy),
+    };
+  }
+
+  /** Get strategy names that voted for a given signal within a group. */
   _groupContributors(results, groupNames, targetSignal) {
     return results
       .filter(r =>
@@ -495,7 +614,6 @@ export class SignalConsensus {
       .map(r => r.strategy);
   }
 
-  /** @private */
   _voteSummary(signals, weights) {
     return signals
       .filter(s => s.meetsFloor !== false && !s.suppressedByTime)

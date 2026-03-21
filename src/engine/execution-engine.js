@@ -41,6 +41,7 @@ import { createLogger } from '../lib/logger.js';
 import { ORDER_STATE, MAX_ORDER_RETRIES, RETRY_DELAY_MS } from '../config/constants.js';
 import { createOrder, transitionOrder, isTerminal } from './order-state-machine.js';
 import { query, getPool } from '../lib/db.js';
+import { calcNetPnl, calcTradeCost } from '../lib/brokerage.js';
 
 const log = createLogger('execution-engine');
 
@@ -142,7 +143,7 @@ export class ExecutionEngine {
                (NOW()      AT TIME ZONE 'Asia/Kolkata')::date
          ORDER BY symbol, created_at DESC, id DESC
        ) AS latest_trades
-       WHERE side = 'BUY'`,
+       WHERE side IN ('BUY', 'SELL')`,
       [isPaperMode]
     ).catch(async (err) => {
       // opening_strategies column may not exist on old schema — retry without it
@@ -160,7 +161,7 @@ export class ExecutionEngine {
                    (NOW()      AT TIME ZONE 'Asia/Kolkata')::date
              ORDER BY symbol, created_at DESC, id DESC
            ) AS latest_trades
-           WHERE side = 'BUY'`,
+           WHERE side IN ('BUY', 'SELL')`,
           [isPaperMode]
         );
       }
@@ -202,7 +203,10 @@ export class ExecutionEngine {
         strategies = [row.strategy];
       }
 
+      const isShort = row.side === 'SELL';
       this._filledPositions.set(row.symbol, {
+        direction: isShort ? 'SELL' : 'BUY',
+        isShort,
         strategies,
         openingStrategy,
         entryPrice,
@@ -210,20 +214,23 @@ export class ExecutionEngine {
         quantity: parseInt(row.quantity, 10),
         timestamp: new Date(row.created_at).getTime(),
 
-        stopPrice: entryPrice * (1 - stopPct / 100),
+        // Levels are direction-aware (exit-strategies.js handles both)
+        stopPrice: isShort
+          ? entryPrice * (1 + stopPct / 100)    // above entry for shorts
+          : entryPrice * (1 - stopPct / 100),   // below entry for longs
         highWaterMark: entryPrice,
-        trailStopPrice: entryPrice * (1 - trailPct / 100),
+        trailStopPrice: isShort
+          ? entryPrice * (1 + trailPct / 100)
+          : entryPrice * (1 - trailPct / 100),
         trailPct,
         stopPct,
-
-        profitTargetPrice: entryPrice * (1 + targetPct / 100),
+        profitTargetPrice: isShort
+          ? entryPrice * (1 - targetPct / 100)
+          : entryPrice * (1 + targetPct / 100),
         profitTargetMode: 'FIXED_PCT',
-
         partialExitEnabled: false,
         partialExitDone: true,
-
         signalReversalEnabled: this._config?.SIGNAL_REVERSAL_ENABLED ?? true,
-
         hydratedFromDB: true,
       });
     }
@@ -350,7 +357,30 @@ export class ExecutionEngine {
           .filter(Boolean);
 
       this._lastSignalStrategies.set(symbol, firingStrategies);
+    } else if (finalSignal.signal === 'SELL') {
+      // A SELL signal can mean:
+      //   (a) Exit an existing long  — handled by executeOrder's SELL path
+      //   (b) Open a new short       — only if isShortEntry===true in consensus
+      const isShortEntry = consensusResult.isShortEntry === true ||
+        (consensusResult.convictionStrategy &&
+          !SHORT_INELIGIBLE_STRATEGIES.has(consensusResult.convictionStrategy) &&
+          consensusResult.isShortEntry !== false);
+
+      if (isShortEntry && !this._filledPositions.has(symbol)) {
+        // Opening a new short position — track strategies same as longs
+        const convictionStrategy = consensusResult.convictionStrategy || null;
+        const firingStrategies = convictionStrategy
+          ? [convictionStrategy]
+          : (consensusResult.details || [])
+            .filter(d => d.signal === 'SELL' && d.meetsFloor !== false &&
+              !d.suppressedByTime &&
+              !SHORT_INELIGIBLE_STRATEGIES.has(d.strategy))
+            .map(d => d.strategy)
+            .filter(Boolean);
+        this._lastSignalStrategies.set(symbol, firingStrategies);
+      }
     }
+
 
     order = await this.executeOrder({
       symbol,
@@ -492,9 +522,24 @@ export class ExecutionEngine {
       transitionOrder(order, ORDER_STATE.PLACED, { brokerId: result.orderId });
       transitionOrder(order, ORDER_STATE.FILLED);
 
-      // Fix 1: was `currentPrice` in pnl calculation
-      const pnl = (exitPrice - posCtx.entryPrice) * exitQty;
+      // SHORT P&L = (entryPrice - exitPrice) * qty  (profit when price falls)
+      // LONG  P&L = (exitPrice - entryPrice) * qty
+      const isShortPos = posCtx.isShort ?? posCtx.direction === 'SELL';
+      const grossPnl = isShortPos
+        ? (posCtx.entryPrice - exitPrice) * exitQty
+        : (exitPrice - posCtx.entryPrice) * exitQty;
+
+      const { netPnl, totalCost } = calcNetPnl({
+        entryPrice: posCtx.entryPrice,
+        exitPrice,
+        quantity: exitQty,
+      });
+      // For shorts, calcNetPnl returns grossPnl as (exit-entry)*qty which is
+      // negative when profitable (price went down). We override with correct sign.
+      const pnl = isShortPos ? grossPnl - totalCost : netPnl;
       order.pnl = pnl;
+      order.grossPnl = grossPnl;
+      order.costPaid = totalCost;
 
       if (isFullExit) {
         // Fix for post-restart credit: pass strategies explicitly before deleting from _filledPositions
@@ -602,12 +647,17 @@ export class ExecutionEngine {
     }
 
     if (params.side === 'SELL' && !this._filledPositions.has(params.symbol)) {
-      transitionOrder(order, ORDER_STATE.REJECTED, {
-        rejectionReason: `SELL rejected — no open position found for ${params.symbol} after DB hydration`,
-      });
-      log.warn({ symbol: params.symbol, orderId: order.id },
-        `SELL rejected — no open position found for ${params.symbol}`);
-      return order;
+      // Allow if this is an explicit short entry order
+      if (!params.isShortEntry) {
+        transitionOrder(order, ORDER_STATE.REJECTED, {
+          rejectionReason: `SELL rejected — no open position found for ${params.symbol} after DB hydration`,
+        });
+        log.warn({ symbol: params.symbol, orderId: order.id },
+          `SELL rejected — no open position found for ${params.symbol}`);
+        return order;
+      }
+      // isShortEntry=true: fall through to place a new short position
+      log.info({ symbol: params.symbol }, `Opening SHORT position for ${params.symbol}`);
     }
 
     // ─── Phase 1: Risk Engine Check ──────────────────────
@@ -756,21 +806,25 @@ export class ExecutionEngine {
 
         }
         else if (order.side === 'SELL') {
-          const posCtx = this._filledPositions.get(order.symbol);
-          if (posCtx) {
-            const pnl = (order.price - posCtx.price) * posCtx.quantity;
-            order.pnl = pnl;
+          const existingPos = this._filledPositions.get(order.symbol);
 
-            // FIX N2: signal-driven SELL now updates daily P&L and kill switch.
-            // Previously only forceExit() called recordTradePnL(), meaning signal-driven
-            // exits were invisible to the risk manager — daily loss limit and kill switch
-            // drawdown threshold could never trigger from a strategy-driven SELL.
+          if (existingPos && !existingPos.isShort) {
+            // ── Closing an existing LONG position ───────────────────────────
+            const posCtx = existingPos;
+            const { netPnl, grossPnl, totalCost } = calcNetPnl({
+              entryPrice: posCtx.price,
+              exitPrice: order.price,
+              quantity: posCtx.quantity,
+            });
+            const pnl = netPnl;
+            order.pnl = netPnl;
+            order.grossPnl = grossPnl;
+            order.costPaid = totalCost;
+
             await this.riskManager.recordTradePnL(pnl, order.symbol);
-
             this.recordPositionOutcome(order.symbol, pnl).catch((err) =>
               log.warn({ symbol: order.symbol, err: err.message }, 'Position outcome recording failed')
             );
-
             this._filledPositions.delete(order.symbol);
             this.riskManager.removePosition();
 
@@ -785,12 +839,81 @@ export class ExecutionEngine {
                 `📌 Reason: SIGNAL_EXIT\n` +
                 `📥 Entry:  ₹${posCtx.price.toFixed(2)}\n` +
                 `📤 Exit:   ₹${order.price.toFixed(2)}\n` +
-                `💰 P&amp;L:   ${pnlStr}\n` +
+                `💰 Net P&amp;L: ${pnlStr}\n` +
+                `📊 Gross:    ${order.grossPnl >= 0 ? '+' : ''}₹${Math.abs(order.grossPnl || pnl).toFixed(2)}\n` +
+                `💸 Charges:  ₹${(order.costPaid || 0).toFixed(2)}\n` +
                 `📦 Qty:    ${posCtx.quantity}\n` +
                 `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
               ).catch(() => { });
             }
+          } else if (!existingPos) {
+            // ── Opening a NEW SHORT position ─────────────────────────────────
+            const strategies = this._lastSignalStrategies.get(order.symbol) || [];
+            const stopPct = this._config?.STOP_LOSS_PCT ?? 1.0;
+            const trailPct = this._config?.TRAILING_STOP_PCT ?? 1.5;
+            const targetPct = this._config?.PROFIT_TARGET_PCT ?? 1.8;
+
+            const shortCtx = {
+              direction: 'SELL',
+              isShort: true,
+              strategies,
+              openingStrategy: strategies[0] || 'UNKNOWN',
+              entryPrice: order.price,
+              price: order.price,
+              quantity: order.quantity,
+              timestamp: Date.now(),
+
+              // SHORT stop: ABOVE entry
+              stopPrice: order.price * (1 + stopPct / 100),
+              // SHORT trail: starts above entry, ratchets DOWN
+              highWaterMark: order.price,   // for shorts = low-water mark
+              trailStopPrice: order.price * (1 + trailPct / 100),
+              trailPct,
+              stopPct,
+
+              // SHORT profit target: BELOW entry
+              profitTargetPrice: order.price * (1 - targetPct / 100),
+              profitTargetMode: 'FIXED_PCT',
+              partialExitEnabled: this._config?.PARTIAL_EXIT_ENABLED ?? true,
+              partialExitDone: false,
+              partialExitQty: 0,
+              signalReversalEnabled: this._config?.SIGNAL_REVERSAL_ENABLED ?? true,
+            };
+
+            this._filledPositions.set(order.symbol, shortCtx);
+            this.riskManager.addPosition();
+
+            // Initialise exit levels via position manager (ATR-based trail etc.)
+            if (this.positionManager) {
+              try {
+                const candles = this._fetchCandles
+                  ? await this._fetchCandles(order.symbol, 20).catch(() => [])
+                  : [];
+                const closes = candles.map(c => c.close);
+                const highs = candles.map(c => c.high);
+                const lows = candles.map(c => c.low);
+                await this.positionManager.initPosition(order.symbol, shortCtx, closes, highs, lows);
+              } catch (err) {
+                log.warn({ symbol: order.symbol, err: err.message },
+                  'initPosition failed for short — using config-based levels');
+              }
+            }
+
+            if (this.telegram?.enabled) {
+              const stopPrice = shortCtx.stopPrice;
+              const targetPrice = shortCtx.profitTargetPrice;
+              this.telegram.sendRaw(
+                `📉 <b>SHORT Position ENTRY — ${order.symbol}</b>\n\n` +
+                `📤 Entry:  ₹${order.price.toFixed(2)}\n` +
+                `📦 Qty:    ${order.quantity}\n` +
+                `🛑 Stop:   ₹${stopPrice.toFixed(2)} (above entry)\n` +
+                `🎯 Target: ₹${targetPrice.toFixed(2)} (below entry)\n` +
+                `🧠 Strats: ${strategies.join(', ')}\n` +
+                `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+              ).catch(() => { });
+            }
           }
+
         }
 
         await this._persistTrade(order).catch((err) =>
@@ -823,7 +946,7 @@ export class ExecutionEngine {
     }
 
     transitionOrder(order, ORDER_STATE.REJECTED, {
-      rejectionReason: `Broker unreachable after ${this.maxRetries} retries: ${lastError?.message}`,
+      rejectionReason: `Broker unreachable after ${this.maxRetries} retries: ${lastError?.message} `,
     });
     return order;
   }
@@ -848,7 +971,7 @@ export class ExecutionEngine {
       orderId: order.id, symbol: order.symbol,
       side: order.side, qty: order.quantity, price: order.price, mode: 'PAPER',
     }, '[PAPER] Order placed');
-    return { orderId: `PAPER-${order.id}`, status: 'COMPLETE', broker: 'paper' };
+    return { orderId: `PAPER - ${order.id} `, status: 'COMPLETE', broker: 'paper' };
   }
 
   /** @private */
@@ -1011,7 +1134,7 @@ export class ExecutionEngine {
             this.telegram.sendRaw(
               `⚠️ <b>Position Closed Externally — ${symbol}</b>\n` +
               `Removed from engine state via reconciliation.\n` +
-              `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+              `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} `
             ).catch(() => { });
           }
           reconciled.push(symbol);
@@ -1065,9 +1188,9 @@ export class ExecutionEngine {
 
       await query(
         `INSERT INTO trades
-           (order_id, symbol, side, quantity, price, pnl, strategy, status, paper_mode, opening_strategies, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
-         ON CONFLICT (order_id) DO NOTHING`,
+  (order_id, symbol, side, quantity, price, pnl, strategy, status, paper_mode, opening_strategies, created_at)
+VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+         ON CONFLICT(order_id) DO NOTHING`,
         [
           order.id, order.symbol, order.side, order.quantity,
           order.price, order.pnl || 0, order.strategy, order.state,
@@ -1078,9 +1201,9 @@ export class ExecutionEngine {
         if (err.message?.includes('opening_strategies') || err.message?.includes('column')) {
           return query(
             `INSERT INTO trades
-               (order_id, symbol, side, quantity, price, pnl, strategy, status, paper_mode, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-             ON CONFLICT (order_id) DO NOTHING`,
+  (order_id, symbol, side, quantity, price, pnl, strategy, status, paper_mode, created_at)
+VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+             ON CONFLICT(order_id) DO NOTHING`,
             [order.id, order.symbol, order.side, order.quantity,
             order.price, order.pnl || 0, order.strategy, order.state, this.paperMode]
           );
@@ -1105,8 +1228,8 @@ export class ExecutionEngine {
         const sig = detail.signal || 'HOLD';
         if (sig === 'HOLD' && !hasPosition) continue;
         await client.query(
-          `INSERT INTO signals (symbol, strategy, signal, confidence, acted_on, reason, price, created_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
+          `INSERT INTO signals(symbol, strategy, signal, confidence, acted_on, reason, price, created_at)
+VALUES($1, $2, $3, $4, $5, $6, $7, NOW())`,
           [symbol, detail.strategy || 'unknown', sig,
             detail.confidence || 0, false,
             (detail.reason || '').slice(0, 500), currentPrice || null]
@@ -1117,8 +1240,8 @@ export class ExecutionEngine {
       let consensusSignalId = null;
       if (conSig !== 'HOLD' || hasPosition) {
         const res = await client.query(
-          `INSERT INTO signals (symbol, strategy, signal, confidence, acted_on, reason, price, created_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) RETURNING id`,
+          `INSERT INTO signals(symbol, strategy, signal, confidence, acted_on, reason, price, created_at)
+VALUES($1, $2, $3, $4, $5, $6, $7, NOW()) RETURNING id`,
           [symbol, 'CONSENSUS', conSig, consensus.confidence || 0,
             false, (consensus.reason || '').slice(0, 500), currentPrice || null]
         );
@@ -1152,7 +1275,7 @@ export class ExecutionEngine {
           `UPDATE signals SET acted_on = true
            WHERE symbol = $1 AND strategy = 'CONSENSUS' AND signal = $2
              AND created_at = (
-               SELECT MAX(created_at) FROM signals
+  SELECT MAX(created_at) FROM signals
                WHERE symbol = $1 AND strategy = 'CONSENSUS' AND signal = $2
              )`,
           [symbol, signal]
@@ -1165,7 +1288,7 @@ export class ExecutionEngine {
 
   /** @private */
   async _alertConflict(symbol, consensusResult) {
-    const rateLimitKey = `conflict:alerted:${symbol}`;
+    const rateLimitKey = `conflict: alerted:${symbol} `;
     try {
       const alreadyAlerted = await this.redis.get(rateLimitKey);
       if (alreadyAlerted) return;
@@ -1173,10 +1296,10 @@ export class ExecutionEngine {
       const { buyStrategies, sellStrategies } = consensusResult.conflictDetails;
       const msg =
         `⚡ <b>Signal Conflict — ${symbol}</b>\n\n` +
-        `📈 BUY:  ${buyStrategies.join(', ')}\n` +
-        `📉 SELL: ${sellStrategies.join(', ')}\n\n` +
-        `Result: HOLD (strategies disagree)\n` +
-        `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`;
+        `📈 BUY:  ${buyStrategies.join(', ')} \n` +
+        `📉 SELL: ${sellStrategies.join(', ')} \n\n` +
+        `Result: HOLD(strategies disagree) \n` +
+        `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} `;
       await this.telegram.sendRaw(msg);
       log.info({ symbol, buyStrategies, sellStrategies }, 'Conflict alert sent via Telegram');
     } catch (err) {

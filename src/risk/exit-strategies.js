@@ -1,40 +1,37 @@
 /**
  * @fileoverview Exit Strategy Logic for Alpha8 Position Manager
  *
- * Pure functions — no Redis, no DB, no broker calls.
- * All I/O happens in position-manager.js. These functions
- * only decide WHETHER to exit and WHY.
+ * Supports both LONG and SHORT positions with full symmetry.
  *
- * EXIT PRIORITY ORDER (highest wins):
- *   1. STOP_LOSS          — hard floor, always checked first
- *   2. PROFIT_TARGET      — full exit at target
- *   3. PARTIAL_EXIT       — half exit at target (if partial mode enabled)
- *   4. TRAILING_STOP      — volatility-adjusted trail
- *   5. SIGNAL_REVERSAL    — opening strategy fires opposite signal
- *   6. TIME_EXIT          — max hold time on flat/losing positions
+ * SHORT POSITION MATH (inverted from long):
+ *   - Stop loss    : price ABOVE entry  (entry × (1 + stop%))
+ *   - Profit target: price BELOW entry  (entry × (1 - target%))
+ *   - Trail stop   : low-water mark — moves DOWN as price falls, never back up
+ *   - Break-even   : trail can never go ABOVE entry once profitable
+ *   - Signal reversal: opening strategy fires BUY (not SELL)
  *
- * STRATEGY-AWARE PROFIT TARGETS:
- *   RSI_MEAN_REVERSION    → fixed % target (mean-reversion snaps back to a level)
- *   EMA_CROSSOVER         → 2× risk/reward (momentum can run further)
- *   VWAP_MOMENTUM         → 2× risk/reward
- *   BREAKOUT_VOLUME       → 2× risk/reward
+ * EXIT PRIORITY ORDER (same for long and short):
+ *   1. STOP_LOSS
+ *   2. PROFIT_TARGET (full exit)
+ *   3. PARTIAL_EXIT
+ *   4. TRAILING_STOP
+ *   5. SIGNAL_REVERSAL
+ *   6. TIME_EXIT
  *
- * VOLATILITY-ADJUSTED TRAILING STOP:
- *   Base width = ATR % of price (computed from recent candles)
- *   Regime multiplier applied on top:
- *     TRENDING  × 1.0 (tight — ride the trend)
- *     SIDEWAYS  × 1.2 (slightly wider)
- *     VOLATILE  × 1.6 (wide — avoid noise stop-outs)
- *   Falls back to fixed TRAILING_STOP_PCT if ATR unavailable.
+ * STRATEGY SHORT ELIGIBILITY:
+ *   EMA_CROSSOVER     ✅ — bearish crossover is a textbook short
+ *   VWAP_MOMENTUM     ✅ — break below VWAP with volume
+ *   BREAKOUT_VOLUME   ✅ — breakdown below support with volume
+ *   RSI_MEAN_REVERSION ❌ — overbought shorts have poor R/R; stays as exit signal only
  */
 
 // ── Strategy classification ────────────────────────────────────────────────
 
-/** Strategies that use mean-reversion fixed % targets */
+/** Strategies that use mean-reversion fixed % targets (longs only) */
 const MEAN_REVERSION_STRATEGIES = new Set(['RSI_MEAN_REVERSION']);
 
-/** Strategies that use momentum risk/reward targets */
-const MOMENTUM_STRATEGIES = new Set([
+/** Strategies allowed to open short positions */
+export const SHORT_ELIGIBLE_STRATEGIES = new Set([
     'EMA_CROSSOVER',
     'VWAP_MOMENTUM',
     'BREAKOUT_VOLUME',
@@ -46,7 +43,7 @@ const REGIME_TRAIL_MULTIPLIER = {
     TRENDING: 1.0,
     SIDEWAYS: 1.2,
     VOLATILE: 1.6,
-    UNKNOWN: 1.2, // conservative default
+    UNKNOWN: 1.2,
 };
 
 // ═══════════════════════════════════════════════════════
@@ -55,24 +52,25 @@ const REGIME_TRAIL_MULTIPLIER = {
 
 /**
  * Compute all exit levels for a new position at entry time.
- * Called once when BUY is filled. Levels are stored in posCtx
- * and never recalculated (except trail stop which moves up).
+ * Works for both LONG ('BUY') and SHORT ('SELL') positions.
  *
  * @param {Object} params
  * @param {number}   params.entryPrice
  * @param {number}   params.quantity
- * @param {string}   params.openingStrategy   - which strategy fired the BUY
- * @param {string[]} params.allStrategies      - all strategies that contributed
- * @param {string}   params.regime             - current market regime
- * @param {number[]} [params.recentCloses]     - recent closes for ATR calc
+ * @param {'BUY'|'SELL'} params.direction      - 'BUY' for long, 'SELL' for short
+ * @param {string}   params.openingStrategy
+ * @param {string[]} params.allStrategies
+ * @param {string}   params.regime
+ * @param {number[]} [params.recentCloses]
  * @param {number[]} [params.recentHighs]
  * @param {number[]} [params.recentLows]
- * @param {Object}   params.config             - exit config (from live settings)
+ * @param {Object}   params.config
  * @returns {Object} exitLevels to merge into posCtx
  */
 export function computeExitLevels({
     entryPrice,
     quantity,
+    direction = 'BUY',
     openingStrategy,
     allStrategies,
     regime,
@@ -81,6 +79,8 @@ export function computeExitLevels({
     recentLows = [],
     config,
 }) {
+    const isShort = direction === 'SELL';
+
     const {
         stopLossPct,
         trailingStopPct,
@@ -91,24 +91,41 @@ export function computeExitLevels({
         signalReversalEnabled,
     } = config;
 
-    // Hard stop — always fixed at entry
-    const stopPrice = entryPrice * (1 - stopLossPct / 100);
+    // ── Stop loss ──────────────────────────────────────────────────────────
+    // LONG:  stop below entry  (entry × (1 - stop%))
+    // SHORT: stop above entry  (entry × (1 + stop%))
+    const stopPrice = isShort
+        ? entryPrice * (1 + stopLossPct / 100)
+        : entryPrice * (1 - stopLossPct / 100);
 
-    // Profit target — strategy-aware
+    // ── Profit target ──────────────────────────────────────────────────────
+    // RSI uses fixed % (mean reversion snaps back to a level)
+    // All other strategies use risk/reward multiplier
+    // SHORT: target is BELOW entry for both modes
     const targetMode = MEAN_REVERSION_STRATEGIES.has(openingStrategy)
         ? 'FIXED_PCT'
         : 'RISK_REWARD';
 
-    const profitTargetPrice = targetMode === 'FIXED_PCT'
-        ? entryPrice * (1 + profitTargetPct / 100)
-        : entryPrice + (entryPrice - stopPrice) * riskRewardRatio;
+    let profitTargetPrice;
+    if (isShort) {
+        profitTargetPrice = targetMode === 'FIXED_PCT'
+            ? entryPrice * (1 - profitTargetPct / 100)
+            : entryPrice - (stopPrice - entryPrice) * riskRewardRatio;
+        // stopPrice > entryPrice for shorts, so (stopPrice - entry) = risk distance
+    } else {
+        profitTargetPrice = targetMode === 'FIXED_PCT'
+            ? entryPrice * (1 + profitTargetPct / 100)
+            : entryPrice + (entryPrice - stopPrice) * riskRewardRatio;
+    }
 
-    // Partial exit quantity (floor so we always sell whole shares)
+    // ── Partial exit quantity ──────────────────────────────────────────────
     const partialQty = partialExitEnabled
         ? Math.max(1, Math.floor(quantity * (partialExitPct / 100)))
         : 0;
 
-    // Initial trail stop — use ATR if available, else fixed %
+    // ── Initial trail stop ─────────────────────────────────────────────────
+    // LONG:  trail starts below entry, moves UP
+    // SHORT: trail starts above entry, moves DOWN
     const atrPct = recentCloses.length >= 14
         ? computeAtrPct(recentHighs, recentLows, recentCloses)
         : null;
@@ -116,16 +133,28 @@ export function computeExitLevels({
     const trailMultiplier = REGIME_TRAIL_MULTIPLIER[regime] ?? REGIME_TRAIL_MULTIPLIER.UNKNOWN;
     const effectiveTrailPct = (atrPct != null ? atrPct : trailingStopPct) * trailMultiplier;
 
-    const initialTrailStop = entryPrice * (1 - effectiveTrailPct / 100);
+    const initialTrailStop = isShort
+        ? entryPrice * (1 + effectiveTrailPct / 100)   // above entry for shorts
+        : entryPrice * (1 - effectiveTrailPct / 100);  // below entry for longs
+
+    // ── Low-water mark (short equivalent of high-water mark) ──────────────
+    // LONG:  highWaterMark — the best (highest) price seen since entry
+    // SHORT: lowWaterMark  — the best (lowest)  price seen since entry
+    // We store it as 'highWaterMark' for compatibility; for shorts it holds
+    // the low-water value.
+    const waterMark = entryPrice;
 
     return {
+        direction,
+        isShort,
+
         // Stop loss
         stopPrice,
 
-        // Trailing stop (moves up, never down)
+        // Trailing stop (moves in favorable direction, never reverses)
         trailStopPrice: initialTrailStop,
         trailPct: effectiveTrailPct,
-        highWaterMark: entryPrice,
+        highWaterMark: waterMark,   // for longs: highest price; for shorts: lowest price
 
         // Profit target
         profitTargetPrice,
@@ -140,7 +169,7 @@ export function computeExitLevels({
         signalReversalEnabled,
         openingStrategy,
 
-        // Metadata for debugging
+        // Metadata
         entryAtrPct: atrPct,
         entryRegime: regime,
         entryTrailPct: effectiveTrailPct,
@@ -154,17 +183,17 @@ export function computeExitLevels({
 
 /**
  * Determine if and how a position should exit.
- * Called every scan cycle for each held position.
+ * Handles both LONG and SHORT positions transparently.
  *
  * @param {Object} params
  * @param {string}   params.symbol
- * @param {Object}   params.posCtx       - position context from _filledPositions
+ * @param {Object}   params.posCtx
  * @param {number}   params.currentPrice
  * @param {number[]} [params.recentCloses]
  * @param {number[]} [params.recentHighs]
  * @param {number[]} [params.recentLows]
- * @param {string}   [params.regime]     - current regime (may have changed since entry)
- * @param {Object}   [params.latestSignals] - { [strategy]: 'BUY'|'SELL'|'HOLD' }
+ * @param {string}   [params.regime]
+ * @param {Object}   [params.latestSignals]
  * @param {Object}   params.config
  * @returns {{ exit: boolean, partial: boolean, reason: string|null, qty: number }}
  */
@@ -180,16 +209,24 @@ export function evaluateExits({
     config,
 }) {
     const noExit = { exit: false, partial: false, reason: null, qty: posCtx.quantity };
+    const isShort = posCtx.isShort ?? posCtx.direction === 'SELL';
 
-    // ── Update trail stop before checking ─────────────────────────────────────
-    // Recompute trail width using latest ATR + current regime
-    // (regime may have shifted since position was opened)
-    const updatedLevels = updateTrailStop(posCtx, currentPrice, recentCloses,
-        recentHighs, recentLows, regime, config);
+    // ── Update trail stop before checking ─────────────────────────────────
+    const updatedLevels = updateTrailStop(
+        posCtx, currentPrice,
+        recentCloses, recentHighs, recentLows,
+        regime, config,
+    );
     Object.assign(posCtx, updatedLevels);
 
-    // ── 1. STOP_LOSS ─────────────────────────────────────────────────────────
-    if (currentPrice <= posCtx.stopPrice) {
+    // ── 1. STOP_LOSS ───────────────────────────────────────────────────────
+    // LONG:  stop fires when price drops BELOW stopPrice
+    // SHORT: stop fires when price rises ABOVE stopPrice
+    const stopHit = isShort
+        ? currentPrice >= posCtx.stopPrice
+        : currentPrice <= posCtx.stopPrice;
+
+    if (stopHit) {
         return {
             exit: true, partial: false,
             reason: 'STOP_LOSS',
@@ -198,16 +235,19 @@ export function evaluateExits({
                 trigger: posCtx.stopPrice,
                 current: currentPrice,
                 dropPct: pct(posCtx.entryPrice, currentPrice),
+                isShort,
             },
         };
     }
 
-    // ── 2. PROFIT_TARGET (full exit) ─────────────────────────────────────────
-    // Only fires if partial exit is disabled OR partial already done
-    if (
-        currentPrice >= posCtx.profitTargetPrice &&
-        (!posCtx.partialExitEnabled || posCtx.partialExitDone)
-    ) {
+    // ── 2. PROFIT_TARGET (full exit) ──────────────────────────────────────
+    // LONG:  target fires when price rises ABOVE targetPrice
+    // SHORT: target fires when price falls BELOW targetPrice
+    const targetHit = isShort
+        ? currentPrice <= posCtx.profitTargetPrice
+        : currentPrice >= posCtx.profitTargetPrice;
+
+    if (targetHit && (!posCtx.partialExitEnabled || posCtx.partialExitDone)) {
         return {
             exit: true, partial: false,
             reason: 'PROFIT_TARGET',
@@ -217,15 +257,16 @@ export function evaluateExits({
                 current: currentPrice,
                 gainPct: pct(posCtx.entryPrice, currentPrice),
                 mode: posCtx.profitTargetMode,
+                isShort,
             },
         };
     }
 
-    // ── 3. PARTIAL_EXIT ───────────────────────────────────────────────────────
+    // ── 3. PARTIAL_EXIT ───────────────────────────────────────────────────
     if (
         posCtx.partialExitEnabled &&
         !posCtx.partialExitDone &&
-        currentPrice >= posCtx.profitTargetPrice &&
+        targetHit &&
         posCtx.partialExitQty > 0 &&
         posCtx.partialExitQty < posCtx.quantity
     ) {
@@ -239,16 +280,23 @@ export function evaluateExits({
                 partialQty: posCtx.partialExitQty,
                 remainingQty: posCtx.quantity - posCtx.partialExitQty,
                 gainPct: pct(posCtx.entryPrice, currentPrice),
+                isShort,
             },
         };
     }
 
-    // ── 4. TRAILING_STOP ─────────────────────────────────────────────────────
-    // Only triggers after position has gone green (highWaterMark > entryPrice)
-    if (
-        currentPrice <= posCtx.trailStopPrice &&
-        posCtx.highWaterMark > posCtx.entryPrice
-    ) {
+    // ── 4. TRAILING_STOP ──────────────────────────────────────────────────
+    // LONG:  trail fires when price drops BELOW trailStopPrice AND was profitable
+    //        (highWaterMark > entryPrice)
+    // SHORT: trail fires when price rises ABOVE trailStopPrice AND was profitable
+    //        (lowWaterMark < entryPrice — stored in highWaterMark for shorts)
+    const trailHit = isShort
+        ? currentPrice >= posCtx.trailStopPrice &&
+        posCtx.highWaterMark < posCtx.entryPrice
+        : currentPrice <= posCtx.trailStopPrice &&
+        posCtx.highWaterMark > posCtx.entryPrice;
+
+    if (trailHit) {
         return {
             exit: true, partial: false,
             reason: 'TRAILING_STOP',
@@ -259,15 +307,21 @@ export function evaluateExits({
                 current: currentPrice,
                 lockedPnlPct: pct(posCtx.entryPrice, posCtx.trailStopPrice),
                 regime: posCtx.currentRegime || posCtx.entryRegime,
+                isShort,
             },
         };
     }
 
-    // ── 5. SIGNAL_REVERSAL ───────────────────────────────────────────────────
+    // ── 5. SIGNAL_REVERSAL ────────────────────────────────────────────────
+    // LONG:  opening strategy fires SELL → exit
+    // SHORT: opening strategy fires BUY  → cover
     if (posCtx.signalReversalEnabled && posCtx.openingStrategy) {
         const reversalSignal = latestSignals[posCtx.openingStrategy];
-        if (reversalSignal === 'SELL') {
-            const pnlPct = pct(posCtx.entryPrice, currentPrice);
+        const reversalHit = isShort
+            ? reversalSignal === 'BUY'
+            : reversalSignal === 'SELL';
+
+        if (reversalHit) {
             return {
                 exit: true, partial: false,
                 reason: 'SIGNAL_REVERSAL',
@@ -275,48 +329,41 @@ export function evaluateExits({
                 meta: {
                     strategy: posCtx.openingStrategy,
                     signal: reversalSignal,
-                    pnlPct,
+                    pnlPct: pct(posCtx.entryPrice, currentPrice),
+                    isShort,
                 },
             };
         }
     }
 
-    // ── 6. TIME_EXIT ─────────────────────────────────────────────────────────
+    // ── 6. TIME_EXIT ──────────────────────────────────────────────────────
     const holdMinutes = (Date.now() - posCtx.timestamp) / 60000;
-    const pnlPct = pct(posCtx.entryPrice, currentPrice);
+    const pnlPct = isShort
+        ? pct(currentPrice, posCtx.entryPrice)   // profit when price falls
+        : pct(posCtx.entryPrice, currentPrice);
     const maxHold = config.maxHoldMinutes ?? 90;
 
-    // Tier 1 (soft): flat or losing position past max hold → exit
+    // Tier 1 (soft): flat or losing past max hold → exit
     if (holdMinutes >= maxHold && pnlPct < 0.3) {
         return {
             exit: true, partial: false,
             reason: 'TIME_EXIT',
             qty: posCtx.quantity,
-            meta: {
-                holdMinutes: +holdMinutes.toFixed(1),
-                maxHold,
-                pnlPct,
-                tier: 'soft',
-            },
+            meta: { holdMinutes: +holdMinutes.toFixed(1), maxHold, pnlPct, tier: 'soft', isShort },
         };
     }
 
-    // L1 FIX — Tier 2 (hard): any position held more than 2× maxHold gets exited
-    // regardless of P&L — UNLESS trailing stop has moved above breakeven (meaning
-    // the trail will handle the exit and we should let profit run).
-    const trailAboveBreakeven = posCtx.trailStopPrice >= posCtx.entryPrice;
-    if (holdMinutes >= maxHold * 2 && !trailAboveBreakeven) {
+    // Tier 2 (hard): any position held > 2× maxHold (unless trail is in profit zone)
+    const trailInProfitZone = isShort
+        ? posCtx.trailStopPrice <= posCtx.entryPrice
+        : posCtx.trailStopPrice >= posCtx.entryPrice;
+
+    if (holdMinutes >= maxHold * 2 && !trailInProfitZone) {
         return {
             exit: true, partial: false,
             reason: 'TIME_EXIT',
             qty: posCtx.quantity,
-            meta: {
-                holdMinutes: +holdMinutes.toFixed(1),
-                maxHold,
-                pnlPct,
-                tier: 'hard', // hard timeout — exits profitable positions too
-                note: 'Exceeded 2× maxHoldMinutes with trail stop below breakeven — hard exit',
-            },
+            meta: { holdMinutes: +holdMinutes.toFixed(1), maxHold, pnlPct, tier: 'hard', isShort },
         };
     }
 
@@ -328,8 +375,9 @@ export function evaluateExits({
 // ═══════════════════════════════════════════════════════
 
 /**
- * Recompute and update trail stop for a position given current price.
- * Returns only the fields that changed — merge into posCtx.
+ * Recompute and ratchet trail stop given current price.
+ * For LONG:  trail ratchets UP   — only moves when price makes new highs.
+ * For SHORT: trail ratchets DOWN — only moves when price makes new lows.
  *
  * @param {Object}   posCtx
  * @param {number}   currentPrice
@@ -338,7 +386,7 @@ export function evaluateExits({
  * @param {number[]} recentLows
  * @param {string}   regime
  * @param {Object}   config
- * @returns {Partial<Object>} fields to merge into posCtx
+ * @returns {Partial<Object>}
  */
 export function updateTrailStop(
     posCtx, currentPrice,
@@ -346,33 +394,51 @@ export function updateTrailStop(
     regime, config,
 ) {
     const updates = {};
+    const isShort = posCtx.isShort ?? posCtx.direction === 'SELL';
 
-    if (currentPrice <= posCtx.highWaterMark) return updates;
+    // For longs, new high = new watermark.
+    // For shorts, new low = new watermark (stored in same highWaterMark field).
+    const newWatermark = isShort
+        ? currentPrice < posCtx.highWaterMark  // new low for shorts
+        : currentPrice > posCtx.highWaterMark; // new high for longs
 
-    // New high water mark
+    if (!newWatermark) return updates;
+
     updates.highWaterMark = currentPrice;
     updates.currentRegime = regime;
 
-    // Recompute trail width with latest ATR + regime
+    // Recompute trail width
     const atrPct = recentCloses.length >= 14
         ? computeAtrPct(recentHighs, recentLows, recentCloses)
         : null;
-
     const multiplier = REGIME_TRAIL_MULTIPLIER[regime] ?? REGIME_TRAIL_MULTIPLIER.UNKNOWN;
     const trailPct = atrPct != null
         ? atrPct * multiplier
         : (posCtx.trailPct ?? config.trailingStopPct);
 
-    let newTrailStop = currentPrice * (1 - trailPct / 100);
+    let newTrailStop = isShort
+        ? currentPrice * (1 + trailPct / 100)   // trail above current price for shorts
+        : currentPrice * (1 - trailPct / 100);  // trail below current price for longs
 
-    // Break-even protection — trail can never go below entry once 0.5% profitable
-    const isSignificantlyProfitable = currentPrice >= posCtx.entryPrice * 1.005;
-    if (isSignificantlyProfitable && newTrailStop < posCtx.entryPrice) {
-        newTrailStop = posCtx.entryPrice;
+    // Break-even protection — trail locked at entry once sufficiently profitable
+    const significantlyProfitable = isShort
+        ? currentPrice <= posCtx.entryPrice * 0.995   // 0.5% below entry for shorts
+        : currentPrice >= posCtx.entryPrice * 1.005;  // 0.5% above entry for longs
+
+    if (significantlyProfitable) {
+        if (isShort && newTrailStop > posCtx.entryPrice) {
+            newTrailStop = posCtx.entryPrice;
+        } else if (!isShort && newTrailStop < posCtx.entryPrice) {
+            newTrailStop = posCtx.entryPrice;
+        }
     }
 
-    // Trail stop only ever moves up
-    if (newTrailStop > posCtx.trailStopPrice) {
+    // Trail only ratchets in the favorable direction — never reverses
+    const trailImproved = isShort
+        ? newTrailStop < posCtx.trailStopPrice   // lower trail stop = more profit locked for short
+        : newTrailStop > posCtx.trailStopPrice;  // higher trail stop = more profit locked for long
+
+    if (trailImproved) {
         updates.trailStopPrice = newTrailStop;
         updates.trailPct = trailPct;
         updates.trailMultiplier = multiplier;
@@ -388,13 +454,6 @@ export function updateTrailStop(
 
 /**
  * Compute ATR as a percentage of current price.
- * Uses standard 14-period ATR formula.
- *
- * @param {number[]} highs
- * @param {number[]} lows
- * @param {number[]} closes
- * @param {number}   [period=14]
- * @returns {number|null} ATR as % of last close, or null if insufficient data
  */
 export function computeAtrPct(highs, lows, closes, period = 14) {
     if (
@@ -402,9 +461,7 @@ export function computeAtrPct(highs, lows, closes, period = 14) {
         highs.length < period + 1 ||
         lows.length < period + 1 ||
         closes.length < period + 1
-    ) {
-        return null;
-    }
+    ) return null;
 
     const trueRanges = [];
     for (let i = 1; i < closes.length; i++) {
@@ -414,7 +471,6 @@ export function computeAtrPct(highs, lows, closes, period = 14) {
         trueRanges.push(Math.max(hl, hpc, lpc));
     }
 
-    // Simple average of last `period` true ranges
     const recent = trueRanges.slice(-period);
     const atr = recent.reduce((a, b) => a + b, 0) / recent.length;
     const last = closes[closes.length - 1];
