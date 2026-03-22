@@ -308,8 +308,7 @@ export function createApiHandler(deps) {
       const ksStatus = killSwitch.getStatus();
 
       // Remove the non-existent daily_summary query
-      let tradeStats = { count: 0, wins: 0, losses: 0, filled: 0, rejected: 0, totalPnl: 0 };
-      try {
+      let tradeStats = { count: 0, wins: 0, losses: 0, filled: 0, rejected: 0, totalPnl: 0 }; try {
         const today = new Date().toISOString().split('T')[0];
         const result = await query(`
                 SELECT
@@ -349,6 +348,7 @@ export function createApiHandler(deps) {
         };
       } catch { /* OK — no trades yet */ }
 
+      const roiData = riskManager.getDailyRoi();
       json(res, {
         pnl: tradeStats.totalPnl || 0,
         pnlPct: (tradeStats.totalPnl / config.TRADING_CAPITAL * 100) || 0,
@@ -365,6 +365,10 @@ export function createApiHandler(deps) {
         killSwitchReason: ksStatus.reason,
         bestTrade: null,
         worstTrade: null,
+        dailyRoi:          roiData.dailyRoi,
+        totalCashRequired: roiData.totalCashRequired,
+        currentDeployment: roiData.currentDeployment,
+        peakDeployment:    roiData.peakDeployment,
       });
     } catch (err) {
       log.error({ err }, 'Error in /api/summary');
@@ -585,6 +589,8 @@ export function createApiHandler(deps) {
         strategy: t.strategy,
         status: t.status,
         orderId: t.order_id,
+        capitalDeployed: t.capital_deployed ? parseFloat(t.capital_deployed) : null,
+        tradeRoi:        t.trade_roi        ? parseFloat(t.trade_roi)        : null,
       }));
 
       json(res, { trades });

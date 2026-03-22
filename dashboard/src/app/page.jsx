@@ -86,6 +86,9 @@ export default function DashboardPage() {
                 <ErrorBoundary>
                     <DrawdownCard data={summary.data} loading={summary.loading} />
                 </ErrorBoundary>
+                <ErrorBoundary>
+                    <DailyRoiCard data={summary.data} loading={summary.loading} />
+                </ErrorBoundary>
             </div>
 
             {/* Health + Kill Switch Row */}
@@ -175,6 +178,31 @@ function DrawdownCard({ data, loading }) {
             <div className="text-xs text-[var(--text-muted)] mt-2">
                 Capital: {formatINR(data?.capital)}
             </div>
+        </div>
+    );
+}
+
+function DailyRoiCard({ data, loading }) {
+    if (loading) return <SkeletonCard />;
+    const roi = data?.dailyRoi ?? 0;
+    const deployed = data?.totalCashRequired ?? 0;
+    const current = data?.currentDeployment ?? 0;
+    return (
+        <div className={`card ${roi >= 0 ? 'pulse-green' : 'pulse-red'}`}>
+            <div className="text-xs text-[var(--text-muted)] uppercase tracking-wider mb-2">
+                Daily ROI
+            </div>
+            <div className={`text-3xl font-bold ${roi >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                {roi >= 0 ? '+' : ''}{roi.toFixed(2)}%
+            </div>
+            <div className="text-xs text-[var(--text-muted)] mt-2">
+                on {formatINR(deployed)} cash used
+            </div>
+            {current > 0 && (
+                <div className="text-xs mt-1 text-yellow-400">
+                    {formatINR(current)} currently deployed
+                </div>
+            )}
         </div>
     );
 }

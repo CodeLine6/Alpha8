@@ -70,11 +70,17 @@ export class MarketScheduler {
     this.dataFeed = deps.dataFeed || null;
     this.telegram = deps.telegram || null;
 
-    this.getWatchlist = deps.getWatchlist || (async () => []);
-    this.getNiftyCandles = deps.getNiftyCandles || (async () => []);
-    this.getOpenPositions = deps.getOpenPositions || (async () => []);
-    this.sendReport = deps.sendReport || (async () => { });
-    this.healthCheck = deps.healthCheck || (async () => ({ broker: true, redis: true, db: true }));
+    this.getWatchlist        = deps.getWatchlist        || (async () => []);
+    this.getNiftyCandles     = deps.getNiftyCandles     || (async () => []);
+    this.getOpenPositions    = deps.getOpenPositions    || (async () => []);
+    this.sendReport          = deps.sendReport          || (async () => { });
+    this.healthCheck         = deps.healthCheck         || (async () => ({ broker: true, redis: true, db: true }));
+
+    // Intraday regime data providers (wired by index.js)
+    // fetchNiftyIntraday → async () => Candle[]  (60 × 5-min Nifty candles, Layer 2 ADX)
+    // fetchNiftyOHLC     → async () => { high, low } | null  (today's range, Layer 1)
+    this.fetchNiftyIntraday  = deps.fetchNiftyIntraday  || (async () => []);
+    this.fetchNiftyOHLC      = deps.fetchNiftyOHLC      || (async () => null);
 
     this._cronJobs = [];
     this._scanning = false;
@@ -353,6 +359,12 @@ export class MarketScheduler {
     this._scanInProgress = true;
     this._scanCount++;
 
+    // ── PRE-STEP: Refresh intraday regime ─────────────────────────────────
+    // Runs before STEP 0 (clearRecentExits) so the regime is current before
+    // any position exit checks or entry signals are evaluated this cycle.
+    // Non-blocking on failure — errors are caught inside _updateRegimeIntraday.
+    await this._updateRegimeIntraday();
+
     try {
       // ── STEP 0: Clear exits from the PREVIOUS scan cycle ─────────────────
       //
@@ -549,6 +561,7 @@ export class MarketScheduler {
     }
 
     const riskStatus = this.riskManager.getStatus();
+    const roiData = this.riskManager.getDailyRoi();
     const summary = {
       date: new Date().toISOString().split('T')[0],
       pnl: riskStatus.dailyPnL,
@@ -557,6 +570,9 @@ export class MarketScheduler {
       losses: riskStatus.losses || 0,
       openPositions: this.engine.getOpenPositionCount(),
       mode: this.engine.paperMode ? 'PAPER' : 'LIVE',
+      dailyRoi:          roiData.dailyRoi,
+      totalCashRequired: roiData.totalCashRequired,
+      peakDeployment:    roiData.peakDeployment,
     };
 
     await this.sendReport(summary).catch(err =>
@@ -581,11 +597,47 @@ export class MarketScheduler {
     return this.shadowRecorder.fillPriceOutcomes();
   }
 
+  /**
+   * Update the 20-day avg daily range baseline from Nifty 50 daily candles.
+   *
+   * Called every 30 minutes by the existing '* /30 9-15 * * 1-5' cron (harmless
+   * repetition — the baseline only needs to be computed once per day at 9 AM).
+   * Does NOT perform full regime classification; that happens in
+   * _updateRegimeIntraday() which runs every 5 minutes.
+   */
   async _updateRegime() {
     if (!this.pipeline?.regimeDetector) return;
     const niftyCandles = await this.getNiftyCandles().catch(() => []);
     if (!niftyCandles.length) return;
+    // update() now stores only the daily baseline (avg_daily_range), not the
+    // full regime. Full classification is done by updateIntraday() each scan.
     return this.pipeline.regimeDetector.update(niftyCandles);
+  }
+
+  /**
+   * Two-layer intraday regime classification.
+   *
+   * Fetches fresh 5-minute Nifty candles (Layer 2 ADX) and today's intraday
+   * OHLC (Layer 1 range-ratio), then delegates to regimeDetector.updateIntraday().
+   *
+   * Called at the very start of each strategy scan cycle — before clearRecentExits,
+   * position checks, and entry signals — so every trade decision in the cycle
+   * uses an up-to-date regime classification.
+   *
+   * Fail-open: if either data fetch fails, the detector falls back to the
+   * existing Redis cache or TRENDING (full size).
+   */
+  async _updateRegimeIntraday() {
+    if (!this.pipeline?.regimeDetector) return;
+    try {
+      const [intradayCandles, todayOHLC] = await Promise.all([
+        this.fetchNiftyIntraday().catch(() => []),
+        this.fetchNiftyOHLC().catch(() => null),
+      ]);
+      return await this.pipeline.regimeDetector.updateIntraday(intradayCandles, todayOHLC);
+    } catch (err) {
+      log.warn({ err: err.message }, 'Intraday regime update failed — cached regime unchanged');
+    }
   }
 
   getStatus() {

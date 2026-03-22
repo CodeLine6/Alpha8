@@ -1,5 +1,5 @@
 import { config } from './config/env.js';
-import { TIMEZONE, MARKET_HOLIDAYS_YEAR } from './config/constants.js';
+import { TIMEZONE, MARKET_HOLIDAYS_YEAR, REGIME_INTRADAY_CANDLES } from './config/constants.js';
 import { createLogger } from './lib/logger.js';
 import { initShutdownHandlers, registerShutdown } from './lib/shutdown.js';
 import { initDatabase, checkDatabaseHealth, query } from './lib/db.js';
@@ -450,7 +450,13 @@ async function main() {
       }
     });
 
+    let _loginInProgress = false;
     telegram.onCommand('/login', async () => {
+      if (_loginInProgress) {
+        telegram.sendRaw('⏳ <b>Login already in progress</b>\nPlease wait for the current authentication to finish.');
+        return;
+      }
+      _loginInProgress = true;
       log.info('Manual login triggered via Telegram');
       telegram.sendRaw('🔐 <b>Manual Login Triggered</b>\nAttempting Zerodha authentication...');
 
@@ -481,8 +487,11 @@ async function main() {
       } catch (err) {
         log.error({ err: err.message }, 'Manual login command failed');
         telegram.sendRaw(`❌ <b>Login command error</b>\n${err.message}`);
+      } finally {
+        _loginInProgress = false;
       }
     });
+
 
     telegram.onCommand('/set', async (text) => {
       // Usage: /set STOP_LOSS_PCT 0.8
@@ -804,6 +813,44 @@ async function main() {
     }
   }
 
+  // ─── Nifty 50 Intraday Candles Provider ──────────────────
+  // Fetches 60 five-minute candles for Layer 2 ADX in the intraday regime detector.
+  // Short cache (60 s) so each scan cycle sees a fresh slice of the session.
+  async function fetchNiftyIntraday() {
+    if (!broker) return [];
+    try {
+      return await fetchRecentCandles({
+        broker,
+        instrumentToken: NIFTY50_INSTRUMENT_TOKEN,
+        symbol: 'NIFTY 50',
+        interval: '5minute',
+        count: REGIME_INTRADAY_CANDLES,
+      });
+    } catch (err) {
+      log.warn({ err: err.message }, 'Failed to fetch Nifty intraday candles — regime will use cache');
+      return [];
+    }
+  }
+
+  // ─── Nifty 50 Today's OHLC Provider ──────────────────────
+  // Returns today's intraday high/low for Layer 1 range-ratio calculation.
+  // Uses broker.getQuote() which returns live intraday OHLC (ohlc.high / ohlc.low).
+  async function fetchNiftyOHLC() {
+    if (!broker) return null;
+    try {
+      const quote = await broker.getQuote(['NSE:NIFTY 50']);
+      const q = quote?.['NSE:NIFTY 50'];
+      if (!q) return null;
+      const high = q.ohlc?.high ?? q.high ?? null;
+      const low  = q.ohlc?.low  ?? q.low  ?? null;
+      if (high == null || low == null) return null;
+      return { high, low };
+    } catch (err) {
+      log.warn({ err: err.message }, 'Failed to fetch Nifty OHLC — Layer 1 range-ratio skipped this cycle');
+      return null;
+    }
+  }
+
   // ─── Open Positions Provider ───────────────────────────
   async function getOpenPositions() {
     if (!config.LIVE_TRADING) {
@@ -876,6 +923,12 @@ async function main() {
       } catch { /* */ }
     }
 
+    const roiLine = summary.totalCashRequired > 0
+      ? `\n📈 Daily ROI: ${summary.dailyRoi >= 0 ? '+' : ''}${summary.dailyRoi?.toFixed(2)}%` +
+        ` on ₹${(summary.totalCashRequired || 0).toLocaleString('en-IN')} cash used` +
+        `\n🏔️  Peak deployed: ₹${(summary.peakDeployment || 0).toLocaleString('en-IN')}`
+      : '';
+
     const msg =
       `📊 <b>Alpha8 Daily Report</b>\n` +
       `${summary.mode === 'PAPER' ? '🟢 Paper' : '🔴 Live'} Trading\n\n` +
@@ -884,11 +937,13 @@ async function main() {
       `✅ Wins: ${summary.wins || 0}\n` +
       `❌ Losses: ${summary.losses || 0}\n` +
       `🔘 Open: ${summary.openPositions || 0}` +
+      roiLine +
       watchlistLine +
       `\n\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`;
 
     await telegram.sendRaw(msg);
   }
+
 
   // ─── Initialize Market Scheduler ───────────────────────
   const scheduler = new MarketScheduler({
@@ -907,6 +962,9 @@ async function main() {
     getOpenPositions,
     sendReport,
     healthCheck,
+    // Intraday regime data providers
+    fetchNiftyIntraday,
+    fetchNiftyOHLC,
   });
 
   scheduler.start();

@@ -31,9 +31,11 @@ export default function HistoryPage() {
 
     const exportCSV = () => {
         if (!trades.length) return;
-        const headers = ['Date', 'Symbol', 'Side', 'Qty', 'Price', 'P&L', 'Strategy', 'Status'];
+        const headers = ['Date', 'Symbol', 'Side', 'Qty', 'Price', 'P&L', 'Capital Deployed', 'ROI %', 'Strategy', 'Status'];
         const rows = trades.map((t) => [
-            t.date, t.symbol, t.side, t.quantity, t.price, t.pnl, t.strategy, t.status,
+            t.date, t.symbol, t.side, t.quantity, t.price, t.pnl,
+            t.capitalDeployed ?? '', t.tradeRoi != null ? t.tradeRoi.toFixed(4) : '',
+            t.strategy, t.status,
         ]);
         const csv = [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
         const blob = new Blob([csv], { type: 'text/csv' });
@@ -120,6 +122,8 @@ export default function HistoryPage() {
                                         <th>Qty</th>
                                         <th>Price</th>
                                         <th>P&L</th>
+                                        <th>Deployed</th>
+                                        <th>ROI</th>
                                         <th>Strategy</th>
                                         <th>Status</th>
                                     </tr>
@@ -137,6 +141,12 @@ export default function HistoryPage() {
                                             <td>{trade.quantity}</td>
                                             <td>{formatINR(trade.price)}</td>
                                             <td className={`font-medium ${pnlColor(trade.pnl)}`}>{formatINR(trade.pnl)}</td>
+                                            <td className="text-xs text-[var(--text-muted)]">
+                                                {trade.capitalDeployed != null ? formatINR(trade.capitalDeployed) : '—'}
+                                            </td>
+                                            <td className={`text-xs font-medium ${trade.tradeRoi == null ? '' : trade.tradeRoi >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                                {trade.tradeRoi != null ? `${trade.tradeRoi >= 0 ? '+' : ''}${trade.tradeRoi.toFixed(2)}%` : '—'}
+                                            </td>
                                             <td className="text-xs">{trade.strategy}</td>
                                             <td>
                                                 <span className={`badge ${trade.status === 'FILLED' ? 'badge-green' :

@@ -233,6 +233,12 @@ export class ExecutionEngine {
         signalReversalEnabled: this._config?.SIGNAL_REVERSAL_ENABLED ?? true,
         hydratedFromDB: true,
       });
+
+      // Restore current deployment so daily ROI denominator stays accurate after restart.
+      // loadFromRedis() already restored _availablePool and _totalCashRequired;
+      // hydratePositions() re-opens deployment for any still-open positions.
+      const hydratedTradeSize = entryPrice * parseInt(row.quantity, 10);
+      this.riskManager.openDeployment(hydratedTradeSize);
     }
 
     const count = this._filledPositions.size;
@@ -552,6 +558,12 @@ export class ExecutionEngine {
         this.riskManager.removePosition();
         await this.riskManager.recordTradePnL(pnl, symbol);
 
+        // ROI: return deployed capital back to pool on full exit
+        const fullExitSize = posCtx.entryPrice * exitQty;
+        this.riskManager.closeDeployment(fullExitSize, pnl);
+        order.tradeRoi = fullExitSize > 0 ? +((pnl / fullExitSize) * 100).toFixed(4) : 0;
+        order.capitalDeployed = fullExitSize;
+
         const signalId = this._pendingSignalIds.get(symbol);
         if (signalId) {
           this._markSignalActedOn(signalId, symbol, 'SELL').catch(() => { });
@@ -565,6 +577,13 @@ export class ExecutionEngine {
         // posCtx.quantity is updated by _executePartialExit() in position-manager
         // only if this returns success:true.
         await this.riskManager.recordTradePnL(pnl, symbol);
+
+        // ROI: return the partial portion of deployed capital back to pool
+        const partialExitSize = posCtx.entryPrice * exitQty;
+        this.riskManager.closeDeployment(partialExitSize, pnl);
+        order.tradeRoi = partialExitSize > 0 ? +((pnl / partialExitSize) * 100).toFixed(4) : 0;
+        order.capitalDeployed = partialExitSize;
+
         log.info({
           symbol,
           partialQty: exitQty,
@@ -790,6 +809,11 @@ export class ExecutionEngine {
 
           this.riskManager.addPosition();
 
+          // ROI: track fresh cash deployed for this position
+          const buyTradeSize = order.price * order.quantity;
+          this.riskManager.openDeployment(buyTradeSize);
+          order.capitalDeployed = buyTradeSize;
+
           if (this.telegram?.enabled) {
             const stopPrice = posCtx.stopPrice;
             const targetPrice = posCtx.profitTargetPrice;
@@ -828,24 +852,38 @@ export class ExecutionEngine {
             this._filledPositions.delete(order.symbol);
             this.riskManager.removePosition();
 
+            // ROI: return deployed capital (+ or − P&L) back to the pool
+            const sellTradeSize = posCtx.price * posCtx.quantity;
+            this.riskManager.closeDeployment(sellTradeSize, pnl);
+            const sellTradeRoi = sellTradeSize > 0 ? (pnl / sellTradeSize) * 100 : 0;
+            order.tradeRoi = +sellTradeRoi.toFixed(4);
+            order.capitalDeployed = sellTradeSize;
+            order.isShortClose = false; // this is a long close
+
             if (this.telegram?.enabled) {
               const emoji = pnl >= 0 ? '✅' : '🛑';
               // Fix 39: P&L → P&amp;L (was unescaped & causing silent Telegram drop)
               const pnlStr = pnl >= 0
                 ? `+₹${pnl.toFixed(2)}`
                 : `-₹${Math.abs(pnl).toFixed(2)}`;
+              const roiStr = order.tradeRoi >= 0
+                ? `+${order.tradeRoi.toFixed(2)}%`
+                : `${order.tradeRoi.toFixed(2)}%`;
               this.telegram.sendRaw(
                 `${emoji} <b>Position EXIT — ${order.symbol}</b>\n\n` +
                 `📌 Reason: SIGNAL_EXIT\n` +
                 `📥 Entry:  ₹${posCtx.price.toFixed(2)}\n` +
                 `📤 Exit:   ₹${order.price.toFixed(2)}\n` +
                 `💰 Net P&amp;L: ${pnlStr}\n` +
+                `📈 Trade ROI: ${roiStr}\n` +
+                `💵 Deployed:  ₹${sellTradeSize.toLocaleString('en-IN')}\n` +
                 `📊 Gross:    ${order.grossPnl >= 0 ? '+' : ''}₹${Math.abs(order.grossPnl || pnl).toFixed(2)}\n` +
                 `💸 Charges:  ₹${(order.costPaid || 0).toFixed(2)}\n` +
                 `📦 Qty:    ${posCtx.quantity}\n` +
                 `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
               ).catch(() => { });
             }
+
           } else if (!existingPos) {
             // ── Opening a NEW SHORT position ─────────────────────────────────
             const strategies = this._lastSignalStrategies.get(order.symbol) || [];
@@ -882,6 +920,11 @@ export class ExecutionEngine {
 
             this._filledPositions.set(order.symbol, shortCtx);
             this.riskManager.addPosition();
+
+            // ROI: track fresh cash deployed for this short position
+            const shortTradeSize = order.price * order.quantity;
+            this.riskManager.openDeployment(shortTradeSize);
+            order.capitalDeployed = shortTradeSize;
 
             // Initialise exit levels via position manager (ATR-based trail etc.)
             if (this.positionManager) {
@@ -1188,17 +1231,17 @@ export class ExecutionEngine {
 
       await query(
         `INSERT INTO trades
-  (order_id, symbol, side, quantity, price, pnl, strategy, status, paper_mode, opening_strategies, created_at)
-VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+  (order_id, symbol, side, quantity, price, pnl, strategy, status, paper_mode, opening_strategies, capital_deployed, created_at)
+VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
          ON CONFLICT(order_id) DO NOTHING`,
         [
           order.id, order.symbol, order.side, order.quantity,
           order.price, order.pnl || 0, order.strategy, order.state,
-          this.paperMode, openingStrategies,
+          this.paperMode, openingStrategies, order.capitalDeployed ?? null,
         ]
       ).catch(async (err) => {
-        // opening_strategies column may not exist yet — retry without it
-        if (err.message?.includes('opening_strategies') || err.message?.includes('column')) {
+        // opening_strategies or capital_deployed column may not exist yet — retry without them
+        if (err.message?.includes('opening_strategies') || err.message?.includes('capital_deployed') || err.message?.includes('column')) {
           return query(
             `INSERT INTO trades
   (order_id, symbol, side, quantity, price, pnl, strategy, status, paper_mode, created_at)
@@ -1210,11 +1253,34 @@ VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
         }
         throw err;
       });
+
+      // For SELL closes (LONG exit or SHORT cover): back-fill trade_roi on the original entry row.
+      // The original entry row has side='BUY' for longs, side='SELL' for shorts.
+      if (order.side === 'SELL' && order.tradeRoi != null) {
+        // order.isShortClose is set before _filledPositions.delete() in _placeWithRetry/forceExit
+        const entrySide = order.isShortClose ? 'SELL' : 'BUY';
+        query(
+          `UPDATE trades
+           SET trade_roi = $1
+           WHERE symbol    = $2
+             AND side      = $3
+             AND status    = 'FILLED'
+             AND paper_mode = $4
+             AND (created_at AT TIME ZONE 'Asia/Kolkata')::date =
+                 (NOW()       AT TIME ZONE 'Asia/Kolkata')::date
+           ORDER BY created_at DESC
+           LIMIT 1`,
+          [order.tradeRoi, order.symbol, entrySide, this.paperMode]
+        ).catch(err => log.warn({ symbol: order.symbol, err: err.message },
+          'Failed to back-fill trade_roi on entry row'));
+      }
+
       log.debug({ orderId: order.id, symbol: order.symbol }, 'Trade persisted to DB');
     } catch (err) {
       log.error({ orderId: order.id, err: err.message }, 'CRITICAL: Trade DB write failed');
     }
   }
+
 
   /** @private */
   async _persistSignals(symbol, consensus, currentPrice = null) {

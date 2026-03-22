@@ -59,7 +59,8 @@ export const REGIME_THRESHOLDS = {
     TRENDING: 1.8,
     SIDEWAYS: 2.0,
     VOLATILE: 2.5,
-    UNKNOWN: 2.0,
+    NEUTRAL:  2.0,   // intraday: directionless but not extreme; normal size, tighter bar
+    UNKNOWN:  2.0,
 };
 
 /**

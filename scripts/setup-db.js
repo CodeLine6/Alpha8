@@ -185,6 +185,10 @@ const MIGRATIONS = [
   `ALTER TABLE shadow_signals ADD COLUMN IF NOT EXISTS paper_mode BOOLEAN NOT NULL DEFAULT false;`,
   `CREATE INDEX IF NOT EXISTS idx_shadow_paper_mode ON shadow_signals(paper_mode, strategy, created_at DESC);`,
 
+  // ROI tracking columns
+  `ALTER TABLE trades ADD COLUMN IF NOT EXISTS capital_deployed NUMERIC(14,2);`,
+  `ALTER TABLE trades ADD COLUMN IF NOT EXISTS trade_roi NUMERIC(8,4);`,
+
 ];
 
 // ─── Seed data ──────────────────────────────────────────────────────────────

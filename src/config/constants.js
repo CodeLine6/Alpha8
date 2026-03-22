@@ -100,3 +100,16 @@ export const MARKET_HOLIDAYS_2026 = Object.freeze([
   '2026-11-27', // Gurunanak Jayanti
   '2026-12-25', // Christmas
 ]);
+
+// ─── Intraday Regime Detection ───────────────────────────
+/** Number of 5-minute Nifty candles used for intraday ADX (Layer 2) */
+export const REGIME_INTRADAY_CANDLES = 60;  // covers ~5 hours of data
+
+/** Number of completed sessions used to compute the avg daily range baseline */
+export const REGIME_DAILY_BASELINE = 20;
+
+/** range_ratio threshold above which the session is classified VOLATILE (all trading blocked) */
+export const REGIME_VOLATILE_RATIO = 1.8;
+
+/** range_ratio threshold above which position size is reduced to 0.7x (elevated warning) */
+export const REGIME_WARN_RATIO = 1.3;

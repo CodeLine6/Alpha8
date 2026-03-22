@@ -302,7 +302,13 @@ export class BrokerManager {
     try {
       await this.primary.getProfile();
       return true;
-    } catch {
+    } catch (err) {
+      const msg = (err.message || '').toLowerCase();
+      const isTokenErr = msg.includes('token') || msg.includes('session') ||
+        msg.includes('unauthorized') ||
+        (err.response?.status === 403) ||
+        (err.response?.status === 401);
+      if (isTokenErr) return true;
       return false;
     }
   }

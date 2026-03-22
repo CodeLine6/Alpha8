@@ -88,6 +88,16 @@ export class RiskManager {
     /** @type {number} Total value of orders placed but not yet filled/cancelled */
     this._pendingExposureValue = 0;
 
+    // ─── Capital deployment tracking (daily ROI) ─────────
+    /** Cash returned from closed trades, available to re-use */
+    this._availablePool = 0;
+    /** Total fresh cash drawn from wallet today — the ROI denominator */
+    this._totalCashRequired = 0;
+    /** Capital currently locked in open positions */
+    this._currentDeployment = 0;
+    /** Peak simultaneous deployment (informational) */
+    this._peakDeployment = 0;
+
     // Derived limits — recomputed on every refreshLiveSettings() call
     this._recomputeLimits();
 
@@ -202,12 +212,19 @@ export class RiskManager {
           this._tradeCount = stored.tradeCount || 0;
           this._wins = stored.wins || 0;
           this._losses = stored.losses || 0;
+          // Restore deployment tracking state
+          this._availablePool     = stored.availablePool     || 0;
+          this._totalCashRequired = stored.totalCashRequired || 0;
+          this._currentDeployment = stored.currentDeployment || 0;
+          this._peakDeployment    = stored.peakDeployment    || 0;
           log.warn({
             dailyPnL: this._dailyPnL,
             openPositions: this._openPositionCount,
             tradeCount: this._tradeCount,
             wins: this._wins,
             losses: this._losses,
+            totalCashRequired: this._totalCashRequired,
+            currentDeployment: this._currentDeployment,
           }, 'Risk manager state RESTORED from Redis');
         } else {
           log.info('Redis risk state is from a different day — starting fresh');
@@ -295,6 +312,10 @@ export class RiskManager {
         tradeCount: this._tradeCount,
         wins: this._wins,
         losses: this._losses,
+        availablePool:     this._availablePool,
+        totalCashRequired: this._totalCashRequired,
+        currentDeployment: this._currentDeployment,
+        peakDeployment:    this._peakDeployment,
       });
     } catch (err) {
       log.error({ err: err.message }, 'Failed to persist risk state to Redis');
@@ -496,8 +517,79 @@ export class RiskManager {
     this._wins = 0;
     this._losses = 0;
     this._pendingExposureValue = 0;
+    this._availablePool     = 0;
+    this._totalCashRequired = 0;
+    this._currentDeployment = 0;
+    this._peakDeployment    = 0;
     this._persistToRedis().catch(() => { });
     log.info({ capital: this.capital }, 'Risk manager daily state reset');
+  }
+
+  // ═══════════════════════════════════════════════════════
+  // CAPITAL DEPLOYMENT TRACKING
+  // ═══════════════════════════════════════════════════════
+
+  /**
+   * Called when a new position opens (BUY fill or short SELL fill).
+   * Draws from the available pool first, then fresh cash if pool insufficient.
+   * @param {number} tradeSize - entry_price × quantity
+   */
+  openDeployment(tradeSize) {
+    const fromPool  = Math.min(this._availablePool, tradeSize);
+    const freshCash = tradeSize - fromPool;
+    this._availablePool     -= fromPool;
+    this._totalCashRequired += freshCash;
+    this._currentDeployment += tradeSize;
+    if (this._currentDeployment > this._peakDeployment) {
+      this._peakDeployment = this._currentDeployment;
+    }
+    log.debug({
+      tradeSize, fromPool, freshCash,
+      totalCashRequired: this._totalCashRequired,
+      currentDeployment: this._currentDeployment,
+    }, 'Deployment opened');
+    this._persistToRedis().catch(() => {});
+  }
+
+  /**
+   * Called when a position fully or partially closes.
+   * Returns capital + P&L back to the pool (floors at 0).
+   * @param {number} tradeSize - entry_price × quantity of the closed portion
+   * @param {number} netPnl    - net P&L of the trade (negative for loss)
+   */
+  closeDeployment(tradeSize, netPnl) {
+    const returned          = tradeSize + netPnl;
+    this._availablePool    += Math.max(0, returned);
+    this._currentDeployment = Math.max(0, this._currentDeployment - tradeSize);
+    log.debug({
+      tradeSize, netPnl, returned,
+      availablePool:     this._availablePool,
+      currentDeployment: this._currentDeployment,
+    }, 'Deployment closed');
+    this._persistToRedis().catch(() => {});
+  }
+
+  /**
+   * Compute daily ROI based on total fresh cash required from wallet.
+   * @returns {{ dailyRoi, totalCashRequired, currentDeployment, peakDeployment, totalPnl }}
+   */
+  getDailyRoi() {
+    if (this._totalCashRequired <= 0) {
+      return {
+        dailyRoi:          0,
+        totalCashRequired: 0,
+        currentDeployment: this._currentDeployment,
+        peakDeployment:    this._peakDeployment,
+        totalPnl:          this._dailyPnL,
+      };
+    }
+    return {
+      dailyRoi:          +((this._dailyPnL / this._totalCashRequired) * 100).toFixed(2),
+      totalCashRequired: this._totalCashRequired,
+      currentDeployment: this._currentDeployment,
+      peakDeployment:    this._peakDeployment,
+      totalPnl:          this._dailyPnL,
+    };
   }
 
   /**
@@ -562,6 +654,8 @@ export class RiskManager {
         maxPositionCount: this._baseMaxPositionCount,
         killSwitchDrawdownPct: this._baseKillSwitchDrawdownPct,
       },
+      // Daily ROI (spread from getDailyRoi)
+      ...this.getDailyRoi(),
     };
   }
 }
