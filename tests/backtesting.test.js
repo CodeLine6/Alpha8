@@ -68,7 +68,7 @@ function makeTradingDay(isoDate, { trend = 'up', basePrice = 100 } = {}) {
 
   for (let h = 9; h <= 15; h++) {
     const startM = h === 9 ? 15 : 0;
-    const endM = h === 15 ? 10 : 55;
+    const endM = h === 15 ? 15 : 55;
     for (let m = startM; m <= endM; m += 5) {
       times.push(`${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`);
     }
@@ -418,7 +418,7 @@ describe('BacktestEngine', () => {
       expect(engine.initialCapital).toBe(100000);
     });
 
-    it('resolves "all" to all 4 strategies', () => {
+    it('resolves "all" to all active strategies', () => {
       const engine = new BacktestEngine({
         symbol: 'TEST',
         strategies: ['all'],
@@ -497,14 +497,16 @@ describe('BacktestEngine', () => {
     });
 
     it('triggers stop loss when candle low crosses below stop price', async () => {
-      // Open a position, then the next candle has a very low 'low'
-      const seq = [...Array(25).fill('HOLD'), 'BUY', ...Array(50).fill('HOLD')];
+      // BUY fires at the 1st signal call (i=25, right after warmup=26) so the
+      // injected crash candle at index 26 is the very next candle processed.
+      const seq = ['BUY', ...Array(50).fill('HOLD')];
       const engine = await createEngineWithMock(seq);
 
       // Build custom candles with a crash after the 26th candle
       const candles = makeTradingDay('2024-01-15');
 
-      // After warm-up, inject a crash candle that goes -2% below open (triggering stop)
+      // After warm-up (i=25), inject a crash candle at index 26 that goes -2%
+      // below entry — well below the 1% stop-loss threshold.
       const buyIdx = 25;
       if (candles[buyIdx + 1]) {
         const crashPrice = candles[buyIdx].close * 0.98; // 2% below entry (stop is at 1% below)
@@ -844,11 +846,15 @@ describe('Integration: full backtest pipeline', () => {
     expect(metrics.equityCurve).toHaveLength(trades.length + 1);
   });
 
-  it('ALL_STRATEGIES exports correct list', () => {
-    expect(ALL_STRATEGIES).toContain('EMA_CROSSOVER');
-    expect(ALL_STRATEGIES).toContain('RSI_MEAN_REVERSION');
+  it('ALL_STRATEGIES exports correct list (v1.1: ORB + BAVI replace EMA + RSI)', () => {
+    // Active strategies in consensus (v1.1)
+    expect(ALL_STRATEGIES).toContain('ORB');
+    expect(ALL_STRATEGIES).toContain('BAVI');
     expect(ALL_STRATEGIES).toContain('VWAP_MOMENTUM');
     expect(ALL_STRATEGIES).toContain('BREAKOUT_VOLUME');
     expect(ALL_STRATEGIES).toHaveLength(4);
+    // EMA and RSI are no longer active (files retained, not in STRATEGY_MAP)
+    expect(ALL_STRATEGIES).not.toContain('EMA_CROSSOVER');
+    expect(ALL_STRATEGIES).not.toContain('RSI_MEAN_REVERSION');
   });
 });

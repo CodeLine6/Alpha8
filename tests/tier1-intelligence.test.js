@@ -64,9 +64,9 @@ function makeEngine({ consensus, pipeline = null, paperMode = true } = {}) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe('Task 1 — STRATEGY_GROUPS export', () => {
-    test('REVERSAL group contains EMA_CROSSOVER and RSI_MEAN_REVERSION', () => {
-        expect(STRATEGY_GROUPS.REVERSAL).toContain('EMA_CROSSOVER');
-        expect(STRATEGY_GROUPS.REVERSAL).toContain('RSI_MEAN_REVERSION');
+    test('REVERSAL group contains ORB and BAVI (v1.1)', () => {
+        expect(STRATEGY_GROUPS.REVERSAL).toContain('ORB');
+        expect(STRATEGY_GROUPS.REVERSAL).toContain('BAVI');
         expect(STRATEGY_GROUPS.REVERSAL).toHaveLength(2);
     });
 
@@ -81,7 +81,7 @@ describe('Task 1 — STRATEGY_GROUPS export', () => {
 describe('Task 1 — Grouped Consensus mode (groupedConsensus: true)', () => {
     test('REVERSAL BUY + MOMENTUM BUY → BUY signal', () => {
         const consensus = new SignalConsensus({ groupedConsensus: true, minConfidence: 40 });
-        consensus.addStrategy(mockStrategy('RSI_MEAN_REVERSION', 'BUY', 80));
+        consensus.addStrategy(mockStrategy('BAVI', 'BUY', 80));            // REVERSAL group
         consensus.addStrategy(mockStrategy('VWAP_MOMENTUM', 'BUY', 70));
 
         const result = consensus.evaluate([]);
@@ -94,8 +94,8 @@ describe('Task 1 — Grouped Consensus mode (groupedConsensus: true)', () => {
 
     test('REVERSAL SELL + MOMENTUM SELL → SELL signal', () => {
         const consensus = new SignalConsensus({ groupedConsensus: true, minConfidence: 40 });
-        consensus.addStrategy(mockStrategy('EMA_CROSSOVER', 'SELL', 75));
-        consensus.addStrategy(mockStrategy('BREAKOUT_VOLUME', 'SELL', 65));
+        consensus.addStrategy(mockStrategy('ORB', 'SELL', 75));          // REVERSAL group
+        consensus.addStrategy(mockStrategy('BREAKOUT_VOLUME', 'SELL', 65)); // MOMENTUM group
 
         const result = consensus.evaluate([]);
 
@@ -135,10 +135,10 @@ describe('Task 1 — Grouped Consensus mode (groupedConsensus: true)', () => {
         expect(result.signal).toBe('HOLD');
     });
 
-    test('EMA BUY + Breakout BUY → BUY (one each from reversal + momentum)', () => {
+    test('ORB BUY + Breakout BUY → BUY (one each from reversal + momentum)', () => {
         const consensus = new SignalConsensus({ groupedConsensus: true, minConfidence: 40 });
-        consensus.addStrategy(mockStrategy('EMA_CROSSOVER', 'BUY', 75));
-        consensus.addStrategy(mockStrategy('BREAKOUT_VOLUME', 'BUY', 70));
+        consensus.addStrategy(mockStrategy('ORB', 'BUY', 75));            // REVERSAL group
+        consensus.addStrategy(mockStrategy('BREAKOUT_VOLUME', 'BUY', 70)); // MOMENTUM group
 
         const result = consensus.evaluate([]);
 
@@ -147,10 +147,10 @@ describe('Task 1 — Grouped Consensus mode (groupedConsensus: true)', () => {
 
     test('All 4 agree BUY → BUY with correct groupVotes', () => {
         const consensus = new SignalConsensus({ groupedConsensus: true, minConfidence: 40 });
-        consensus.addStrategy(mockStrategy('EMA_CROSSOVER', 'BUY', 70));
-        consensus.addStrategy(mockStrategy('RSI_MEAN_REVERSION', 'BUY', 75));
-        consensus.addStrategy(mockStrategy('VWAP_MOMENTUM', 'BUY', 68));
-        consensus.addStrategy(mockStrategy('BREAKOUT_VOLUME', 'BUY', 80));
+        consensus.addStrategy(mockStrategy('ORB', 'BUY', 70));            // REVERSAL group
+        consensus.addStrategy(mockStrategy('BAVI', 'BUY', 75));            // REVERSAL group
+        consensus.addStrategy(mockStrategy('VWAP_MOMENTUM', 'BUY', 68));  // MOMENTUM group
+        consensus.addStrategy(mockStrategy('BREAKOUT_VOLUME', 'BUY', 80)); // MOMENTUM group
 
         const result = consensus.evaluate([]);
 
@@ -162,7 +162,7 @@ describe('Task 1 — Grouped Consensus mode (groupedConsensus: true)', () => {
     test('Low-confidence signals (below minConfidence) do not count toward group vote', () => {
         const consensus = new SignalConsensus({ groupedConsensus: true, minConfidence: 60 });
         // Reversal at 85 (counts) + Momentum at 30 (too low → doesn't count)
-        consensus.addStrategy(mockStrategy('RSI_MEAN_REVERSION', 'BUY', 85));
+        consensus.addStrategy(mockStrategy('BAVI', 'BUY', 85));            // REVERSAL group
         consensus.addStrategy(mockStrategy('VWAP_MOMENTUM', 'BUY', 30)); // below threshold
 
         const result = consensus.evaluate([]);

@@ -45,33 +45,44 @@ const log = createLogger('signal-consensus');
 // ── Confidence floors ─────────────────────────────────────────────────────────
 
 const CONFIDENCE_FLOORS = {
-  EMA_CROSSOVER: 55,
-  RSI_MEAN_REVERSION: 55,
-  VWAP_MOMENTUM: 45,
-  BREAKOUT_VOLUME: 45,
+  ORB:              55,   // Opening Range Breakout — range-confirmed, reliable
+  BAVI:             50,   // Bid-Ask Volume Imbalance — tick-based, reliable early
+  VWAP_MOMENTUM:    45,
+  BREAKOUT_VOLUME:  45,
 };
 const DEFAULT_FLOOR = 40;
 
 // ── Open-window noise suppression ─────────────────────────────────────────────
 
-const OPEN_WINDOW_SUPPRESSED = new Set(['EMA_CROSSOVER', 'BREAKOUT_VOLUME']);
+// ── Open-window noise suppression ─────────────────────────────────────────────
+// BAVI is suppressed until 9:30 — needs enough ticks (≥ 50) to be reliable.
+// ORB self-suppresses via its own time check (OR incomplete until 9:45) —
+// adding it here is redundant and would prevent the strategy's own HOLD reason.
+const OPEN_WINDOW_SUPPRESSED = new Set(['BAVI']);
 const OPEN_WINDOW_END_MINUTES = 15;
 
 // ── Strategy groups ───────────────────────────────────────────────────────────
-
+//
+// REVERSAL: ORB (opening range breakout) + BAVI (order-flow imbalance)
+// MOMENTUM: VWAP_MOMENTUM + BREAKOUT_VOLUME — unchanged
+//
+// Cross-group consensus rule is unchanged:
+//   BUY  consensus requires ≥1 REVERSAL AND ≥1 MOMENTUM to agree.
+//   SELL consensus (short entry) requires the same cross-group agreement.
+//   ORB + BAVI alone → HOLD (same group).
+//   VWAP + Breakout alone → HOLD (same group).
 export const STRATEGY_GROUPS = {
-  REVERSAL: ['EMA_CROSSOVER', 'RSI_MEAN_REVERSION'],
+  REVERSAL: ['ORB', 'BAVI'],
   MOMENTUM: ['VWAP_MOMENTUM', 'BREAKOUT_VOLUME'],
 };
 
 // ── Short selling eligibility ─────────────────────────────────────────────────
 //
-// RSI_MEAN_REVERSION is excluded from OPENING short positions.
-// Overbought stocks can stay overbought for days in strong uptrends —
-// shorting into momentum is how accounts blow up.
-// RSI SELL signals remain valid as EXIT triggers for existing LONG positions.
-
-export const SHORT_INELIGIBLE_STRATEGIES = new Set(['RSI_MEAN_REVERSION']);
+// ORB:  bearish breakdown below OR low is a textbook short setup.
+// BAVI: seller-dominated order flow with price below VWAP is short-eligible.
+// RSI is no longer in consensus — removed from this set.
+export const SHORT_INELIGIBLE_STRATEGIES = new Set();
+// (empty — all four active consensus strategies can open short positions)
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

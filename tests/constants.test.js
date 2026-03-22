@@ -38,12 +38,17 @@ describe('Constants', () => {
     expect(SIGNAL.HOLD).toBe('HOLD');
   });
 
-  test('All 4 strategies should be defined', () => {
-    expect(Object.keys(STRATEGY)).toHaveLength(4);
+  test('All strategies should be defined (6 total: 4 legacy + ORB + BAVI)', () => {
+    expect(Object.keys(STRATEGY)).toHaveLength(6);
+    // Legacy (retained — files not deleted)
     expect(STRATEGY.EMA_CROSSOVER).toBeDefined();
     expect(STRATEGY.RSI_MEAN_REVERSION).toBeDefined();
+    // Unchanged active
     expect(STRATEGY.VWAP_MOMENTUM).toBeDefined();
     expect(STRATEGY.BREAKOUT_VOLUME).toBeDefined();
+    // New active strategies (v1.1)
+    expect(STRATEGY.ORB).toBeDefined();
+    expect(STRATEGY.BAVI).toBeDefined();
   });
 
   test('Market holidays should be an array of date strings', () => {

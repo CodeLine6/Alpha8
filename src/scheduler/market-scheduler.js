@@ -70,6 +70,12 @@ export class MarketScheduler {
     this.dataFeed = deps.dataFeed || null;
     this.telegram = deps.telegram || null;
 
+    // ORB/BAVI integration (v1.1)
+    this.baviAdapter    = deps.baviAdapter    || null;  // setSymbol() called per scan
+    this.rsiStrategy    = deps.rsiStrategy    || null;  // long-exit helper
+    this.tickClassifier = deps.tickClassifier || null;  // reset at session start
+    this.rollingTickBuf = deps.rollingTickBuf || null;  // reset at session start
+
     this.getWatchlist        = deps.getWatchlist        || (async () => []);
     this.getNiftyCandles     = deps.getNiftyCandles     || (async () => []);
     this.getOpenPositions    = deps.getOpenPositions    || (async () => []);
@@ -301,6 +307,15 @@ export class MarketScheduler {
         log.error({ err: err.message }, 'Data feed connect failed')
       );
     }
+    // Reset tick classification state for new trading session
+    if (this.tickClassifier) {
+      this.tickClassifier.resetAll();
+      log.info('Tick classifier reset for new session');
+    }
+    if (this.rollingTickBuf) {
+      this.rollingTickBuf.resetAll();
+      log.info('Rolling tick buffer reset for new session');
+    }
     this._scanning = true;
     if (this.engine.reconcilePositions) {
       this.engine.reconcilePositions(this.broker).catch(() => { });
@@ -450,6 +465,10 @@ export class MarketScheduler {
       const latestSignals = {};
       for (const item of heldItems) {
         try {
+          // Set BAVI adapter symbol BEFORE calling evaluate() so it reads
+          // the correct tick window for this symbol.
+          if (this.baviAdapter) this.baviAdapter.setSymbol(item.symbol);
+
           const result = this.engine.consensus.evaluate(item.candles);
           for (const detail of (result.details || [])) {
             if (
@@ -460,6 +479,16 @@ export class MarketScheduler {
             ) {
               latestSignals[detail.strategy] = detail.signal;
             }
+          }
+
+          // Add RSI signal separately: it is NOT in the consensus pool but
+          // is consumed by the RSI_OVERBOUGHT_EXIT rule in exit-strategies.js
+          if (this.rsiStrategy) {
+            try {
+              const rsiResult = this.rsiStrategy.analyze(item.candles);
+              latestSignals.RSI_MEAN_REVERSION = rsiResult.signal;
+              latestSignals._RSI_CONFIDENCE    = rsiResult.confidence;
+            } catch { /* RSI failure is non-critical */ }
           }
         } catch (err) {
           log.warn({ symbol: item.symbol, err: err.message }, 'Phase 1 signal collection failed');
@@ -579,6 +608,11 @@ export class MarketScheduler {
       log.error({ err: err.message }, 'Daily report failed')
     );
 
+    // Daily shadow-period promotion check for ORB and BAVI
+    await this._checkStrategyPromotion().catch(err =>
+      log.warn({ err: err.message }, 'Strategy promotion check failed (non-critical)')
+    );
+
     this.riskManager.resetDaily();
     this.engine.resetDaily();
     this._scanning = false;
@@ -637,6 +671,71 @@ export class MarketScheduler {
       return await this.pipeline.regimeDetector.updateIntraday(intradayCandles, todayOHLC);
     } catch (err) {
       log.warn({ err: err.message }, 'Intraday regime update failed — cached regime unchanged');
+    }
+  }
+
+  /**
+   * 5-Day Shadow Run Promotion Check
+   *
+   * After the ORB+BAVI shadow period (5 trading days, >= 10 total signals,
+   * >= 45% win rate at 30-min horizon), fires a Telegram notification
+   * suggesting promotion to live trading.
+   *
+   * Queries the `shadow_signals` table populated by the ShadowRecorder.
+   * Fails silently if DB is unavailable or table doesn't exist.
+   *
+   * Called from _postMarket() each evening.
+   */
+  async _checkStrategyPromotion() {
+    if (!this.shadowRecorder) return;
+    if (!this.telegram?.enabled) return;
+
+    try {
+      const db = this.shadowRecorder.db;
+      if (!db) return;
+
+      // Query performance summary for ORB and BAVI over last 10 days
+      const rows = await db.query(`
+        SELECT
+          strategy,
+          COUNT(*)                                            AS signal_count,
+          SUM(CASE WHEN outcome_30min = 'WIN' THEN 1 ELSE 0 END) AS wins_30min,
+          COUNT(DISTINCT DATE(created_at))                   AS trading_days
+        FROM shadow_signals
+        WHERE strategy IN ('ORB', 'BAVI')
+          AND created_at >= CURRENT_DATE - INTERVAL '9 days'
+          AND signal != 'HOLD'
+        GROUP BY strategy
+      `).catch(() => null);
+
+      if (!rows?.rows?.length) return;
+
+      const promotionCandidates = [];
+      for (const row of rows.rows) {
+        const { strategy, signal_count, wins_30min, trading_days } = row;
+        const winRate = signal_count > 0 ? wins_30min / signal_count : 0;
+        log.info({ strategy, signal_count, wins_30min, winRate, trading_days }, 'Shadow promotion check');
+
+        if (trading_days >= 5 && signal_count >= 10 && winRate >= 0.45) {
+          promotionCandidates.push({ strategy, signal_count, wins_30min, winRate, trading_days });
+        }
+      }
+
+      if (promotionCandidates.length === 0) return;
+
+      const lines = promotionCandidates.map(p =>
+        `  • <b>${p.strategy}</b>: ${p.wins_30min}/${p.signal_count} wins ` +
+        `(${(p.winRate * 100).toFixed(0)}%) over ${p.trading_days} days`
+      ).join('\n');
+
+      await this.telegram.sendRaw(
+        `🎯 <b>Strategy Promotion Eligible</b>\n` +
+        `The following strategies have passed shadow criteria:\n${lines}\n\n` +
+        `Shadow period complete. Review performance before enabling live trading.\n` +
+        `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+      );
+    } catch (err) {
+      log.warn({ err: err.message }, '_checkStrategyPromotion: non-critical error');
     }
   }
 

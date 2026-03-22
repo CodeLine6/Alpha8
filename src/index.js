@@ -20,7 +20,11 @@ import {
   RSIMeanReversionStrategy,
   VWAPMomentumStrategy,
   BreakoutVolumeStrategy,
+  ORBStrategy,
+  BAVIStrategy,
 } from './strategies/index.js';
+import { TickClassifier }    from './data/tick-classifier.js';
+import { RollingTickBuffer } from './data/rolling-tick-buffer.js';
 import { createApiHandler } from './api/backend-api.js';
 import { EnhancedSignalPipeline } from './intelligence/enhanced-pipeline.js';
 import { SymbolScout } from './intelligence/symbol-scout.js';
@@ -236,6 +240,31 @@ async function main() {
     log.info('ℹ️  Tick feed skipped — no broker connection');
   }
 
+  // ─── Tick Classification Singletons ────────────────────
+  // TickClassifier applies Lee-Ready rule to each raw tick.
+  // RollingTickBuffer stores the last 200 classified ticks per symbol.
+  // Both are reset at market open each day.
+  const tickClassifier = new TickClassifier();
+  const rollingTickBuf = new RollingTickBuffer({ windowSize: 200 });
+
+  // Wire tick classification into the tick feed (if available)
+  if (tickFeed) {
+    tickFeed.on('ticks', (ticks) => {
+      for (const tick of ticks) {
+        // Reverse-lookup tradingsymbol from instrument_token via tickFeed.symbolMap
+        // symbolMap is { tradingsymbol: instrument_token_string }
+        const token = tick.instrument_token?.toString() ?? tick.symbol;
+        const symbol = tickFeed.symbolMap
+          ? Object.keys(tickFeed.symbolMap).find(s => tickFeed.symbolMap[s] === token)
+          : token;
+        if (!symbol) continue;
+        const classified = tickClassifier.classify(symbol, tick);
+        rollingTickBuf.push(symbol, classified);
+      }
+    });
+    log.info('✅ Tick classifier + rolling buffer wired into tick feed');
+  }
+
   // ─── Initialize Risk Manager ───────────────────────────
   const riskManager = new RiskManager({
     capital: config.TRADING_CAPITAL,
@@ -275,11 +304,46 @@ async function main() {
   if (redisHealthy) {
     await consensus.refreshParams().catch(err => log.warn({ err: err.message }, 'Initial consensus param refresh failed'));
   }
-  consensus.addStrategy(new EMACrossoverStrategy());
-  consensus.addStrategy(new RSIMeanReversionStrategy());
+
+  // ── Active consensus strategies (v1.1: ORB + BAVI replace EMA + RSI) ────────
+  // EMA and RSI files are NOT deleted — they may be re-enabled later.
+  // rsiStrategy is kept alive as a long-exit helper (RSI_OVERBOUGHT_EXIT).
+
+  // Instantiate all strategies
+  const orbStrategy  = new ORBStrategy({ getLiveSetting: redisHealthy ? getLiveSetting : null });
+  const baviStrategy = new BAVIStrategy({ getLiveSetting: redisHealthy ? getLiveSetting : null });
+  const rsiStrategy  = new RSIMeanReversionStrategy();  // exit helper only — NOT added to consensus
+  // (EMACrossoverStrategy is NOT instantiated — file retained but not used)
+
+  /**
+   * BAVIAdapter wraps BAVIStrategy so the consensus engine can call it with
+   * the standard analyze(candles) signature, while internally passing the
+   * RollingTickBuffer and current symbol.
+   *
+   * IMPORTANT: baviAdapter.setSymbol(symbol) MUST be called before each
+   * consensus.evaluate(candles) call. The scheduler does this in _strategyScan.
+   */
+  class BAVIAdapter {
+    constructor(baviStrategy, tickBuffer) {
+      this.name       = 'BAVI';
+      this.minCandles = baviStrategy.minCandles;
+      this._strategy  = baviStrategy;
+      this._tickBuf   = tickBuffer;
+      this._symbol    = null;
+    }
+    setSymbol(symbol) { this._symbol = symbol; return this; }
+    analyze(candles)  { return this._strategy.analyze(candles, this._tickBuf, this._symbol); }
+    async refreshParams() { return this._strategy.refreshParams(); }
+  }
+  const baviAdapter = new BAVIAdapter(baviStrategy, rollingTickBuf);
+
+  // Register active strategies with consensus engine
+  consensus.addStrategy(orbStrategy);
+  consensus.addStrategy(baviAdapter);
   consensus.addStrategy(new VWAPMomentumStrategy());
   consensus.addStrategy(new BreakoutVolumeStrategy());
-  log.info(`✅ Signal consensus: ${consensus.strategies.length} strategies loaded (Super Conviction: ${superConvictionEnabled ? 'ON' : 'OFF'})`);
+  log.info(`✅ Signal consensus: ${consensus.strategies.length} strategies loaded — ORB, BAVI, VWAP, Breakout (Super Conviction: ${superConvictionEnabled ? 'ON' : 'OFF'})`);
+  log.info('ℹ️  RSI retained as long-exit helper (RSI_OVERBOUGHT_EXIT) — NOT in consensus voting');
 
   // ─── Initialize Enhanced Signal Pipeline ───────────────
   let pipeline = null;
@@ -951,12 +1015,13 @@ async function main() {
     riskManager,
     engine,
     pipeline,
-    scout,             // ← NEW: passes scout for nightly job
+    scout,             // ← passes scout for nightly job
     shadowRecorder,
     intradayDecay,     // Feature 7: resetDay() at market open
     positionManager,   // Position management: stop/trail/time exits before each scan
     broker,
     dataFeed: tickFeed,
+    telegram,          // For strategy promotion alerts (Task 7)
     getWatchlist,
     getNiftyCandles,
     getOpenPositions,
@@ -965,6 +1030,11 @@ async function main() {
     // Intraday regime data providers
     fetchNiftyIntraday,
     fetchNiftyOHLC,
+    // ORB/BAVI integration (Task 6 & 5)
+    baviAdapter,       // setSymbol() called per scan before consensus.evaluate()
+    rsiStrategy,       // Long-exit helper: RSI_OVERBOUGHT_EXIT in latestSignals
+    tickClassifier,    // Reset at market open each day
+    rollingTickBuf,    // Reset at market open each day
   });
 
   scheduler.start();

@@ -57,10 +57,20 @@ function createScheduler(overrides = {}) {
     retryDelayMs: 10,
   });
 
+  // Mock stubs for ORB/BAVI integration deps
+  const baviAdapter   = { setSymbol: jest.fn(), analyze: jest.fn(() => ({ signal: 'HOLD', confidence: 0, reason: 'mock', strategy: 'BAVI', timestamp: new Date().toISOString() })) };
+  const rsiStrategy   = { analyze: jest.fn(() => ({ signal: 'HOLD', confidence: 0, reason: 'mock', strategy: 'RSI', timestamp: new Date().toISOString() })) };
+  const tickClassifier = { resetAll: jest.fn(), classifyTick: jest.fn() };
+  const rollingTickBuf = { resetAll: jest.fn(), addTick: jest.fn(), getBuffer: jest.fn(() => []) };
+
   const scheduler = new MarketScheduler({
     killSwitch: ks,
     riskManager: rm,
     engine,
+    baviAdapter,
+    rsiStrategy,
+    tickClassifier,
+    rollingTickBuf,
     healthCheck: jest.fn(async () => ({ broker: true, redis: true, db: true })),
     getWatchlist: jest.fn(async () => []),
     getOpenPositions: jest.fn(async () => []),

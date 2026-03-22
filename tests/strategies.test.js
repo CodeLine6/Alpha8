@@ -9,6 +9,8 @@ import { RSIMeanReversionStrategy } from '../src/strategies/rsi-reversion.js';
 import { VWAPMomentumStrategy } from '../src/strategies/vwap-momentum.js';
 import { BreakoutVolumeStrategy } from '../src/strategies/breakout-volume.js';
 import { BaseStrategy } from '../src/strategies/base-strategy.js';
+import { ORBStrategy } from '../src/strategies/orb-strategy.js';
+import { BAVIStrategy } from '../src/strategies/bavi-strategy.js';
 
 // ─── Deterministic PRNG (Linear Congruential Generator) ───
 // Eliminates flaky tests caused by Math.random() producing data
@@ -406,19 +408,25 @@ describe('BreakoutVolumeStrategy', () => {
 // ─── Cross-Strategy Consistency ─────────────────────────
 
 describe('Strategy Signal Consistency', () => {
-  const strategies = [
+  // ORB and BAVI always return HOLD when given flat candles with no timestamps,
+  // so include them only in graceful-failure tests (not signal-shape tests).
+  const activeStrategies = [
     new EMACrossoverStrategy(),
     new RSIMeanReversionStrategy(),
     new VWAPMomentumStrategy({ anchorToday: false }),
     new BreakoutVolumeStrategy(),
+    new ORBStrategy(),
+    new BAVIStrategy(),
   ];
 
   test('all strategies should return valid signal shapes', () => {
     const candles = generateFlatCandles(100, 35);
 
-    strategies.forEach((strategy) => {
+    // EMA, RSI, VWAP, Breakout work with bare candles
+    [new EMACrossoverStrategy(), new RSIMeanReversionStrategy(),
+     new VWAPMomentumStrategy({ anchorToday: false }), new BreakoutVolumeStrategy()
+    ].forEach((strategy) => {
       const signal = strategy.analyze(candles);
-
       expect(['BUY', 'SELL', 'HOLD']).toContain(signal.signal);
       expect(signal.confidence).toBeGreaterThanOrEqual(0);
       expect(signal.confidence).toBeLessThanOrEqual(100);
@@ -430,17 +438,149 @@ describe('Strategy Signal Consistency', () => {
   });
 
   test('all strategies should handle empty candles gracefully', () => {
-    strategies.forEach((strategy) => {
+    activeStrategies.forEach((strategy) => {
       const signal = strategy.analyze([]);
       expect(signal.signal).toBe('HOLD');
-      expect(signal.reason).toContain('Insufficient');
     });
   });
 
   test('all strategies should handle null candles gracefully', () => {
-    strategies.forEach((strategy) => {
+    activeStrategies.forEach((strategy) => {
       const signal = strategy.analyze(null);
       expect(signal.signal).toBe('HOLD');
     });
+  });
+});
+
+// ─── ORB Strategy ────────────────────────────────────────
+
+/**
+ * Build IST-timestamped candles for ORB tests.
+ * minuteOffset = minutes after 09:15 IST (negative = before market).
+ */
+function makeORBCandles(specs) {
+  // 9:15 AM IST = 3:45 AM UTC
+  const base = new Date();
+  base.setUTCHours(3, 45, 0, 0);
+  return specs.map(({ minuteOffset = 0, open, high, low, close, volume }) => ({
+    date:   new Date(base.getTime() + minuteOffset * 60000).toISOString(),
+    open:   open   ?? 100,
+    high:   high   ?? 101,
+    low:    low    ?? 99,
+    close:  close  ?? 100,
+    volume: volume ?? 10000,
+  }));
+}
+
+describe('ORBStrategy', () => {
+  const strategy = new ORBStrategy();
+
+  test('HOLD with insufficient data', () => {
+    expect(strategy.analyze([]).signal).toBe('HOLD');
+    expect(strategy.analyze(null).signal).toBe('HOLD');
+    expect(strategy.analyze([]).reason).toContain('Insufficient');
+  });
+
+  test('HOLD when OR is not yet complete (< 6 candles in 9:15-9:44)', () => {
+    // Need >= minCandles (17) so the Insufficient guard doesn't fire first:
+    // 14 prior candles (before 09:15) + 3 OR candles (09:15–09:25) = 17 total.
+    // OR check requires 6 candles, so OR incomplete HOLD should trigger.
+    const candles = makeORBCandles([
+      ...Array.from({ length: 14 }, (_, i) => ({ minuteOffset: -(70 - i * 5), close: 100 })),
+      { minuteOffset: 0,  high: 100.8, low: 99.5, close: 100.2, volume: 10000 },
+      { minuteOffset: 5,  high: 101.0, low: 99.6, close: 100.5, volume: 10000 },
+      { minuteOffset: 10, high: 101.2, low: 99.7, close: 100.6, volume: 10000 },
+    ]);
+    const signal = strategy.analyze(candles);
+    expect(signal.signal).toBe('HOLD');
+    expect(signal.reason).toContain('OR incomplete');
+    expect(signal.strategy).toBe('ORB');
+  });
+
+  test('BUY on upward breakout above OR high with volume', () => {
+    // OR range: high=101.5, low=99.5 → range ~2.0% (within 0.3–3.0%)
+    // Breakout candle closes at 102 (> orHigh=101.5) with 2.75x avg volume
+    const orHigh = 101.5;
+    const priorSpecs = Array.from({ length: 10 }, (_, i) => ({
+      minuteOffset: -(50 - i * 5), close: 100, volume: 8000,
+    }));
+    const orSpecs = Array.from({ length: 6 }, (_, i) => ({
+      minuteOffset: i * 5, high: orHigh, low: 99.5, close: 100.5, volume: 10000,
+    }));
+    const breakoutCandle = { minuteOffset: 30, open: 101.5, high: 103, low: 101, close: 102.2, volume: 22000 };
+    const signal = strategy.analyze(makeORBCandles([...priorSpecs, ...orSpecs, breakoutCandle]));
+    expect(signal.signal).toBe('BUY');
+    expect(signal.confidence).toBeGreaterThanOrEqual(55);
+    expect(signal.strategy).toBe('ORB');
+    expect(signal.meta.orHigh).toBe(orHigh);
+  });
+
+  test('SELL on breakdown below OR low with volume', () => {
+    // OR range: high=100.5, low=98.5 → range ~2.0% (within 0.3–3.0%)
+    // Breakdown candle closes at 97 (< orLow=98.5) with 2.75x avg volume
+    const orLow = 98.5;
+    const priorSpecs = Array.from({ length: 10 }, (_, i) => ({
+      minuteOffset: -(50 - i * 5), close: 100, volume: 8000,
+    }));
+    const orSpecs = Array.from({ length: 6 }, (_, i) => ({
+      minuteOffset: i * 5, high: 100.5, low: orLow, close: 99.5, volume: 10000,
+    }));
+    const breakdownCandle = { minuteOffset: 30, open: 98.5, high: 99, low: 96, close: 97.0, volume: 22000 };
+    const signal = strategy.analyze(makeORBCandles([...priorSpecs, ...orSpecs, breakdownCandle]));
+    expect(signal.signal).toBe('SELL');
+    expect(signal.strategy).toBe('ORB');
+  });
+
+  test('accepts custom parameters', () => {
+    const custom = new ORBStrategy({ orbWindowCandles: 4, minRangePct: 0.5, volumeMultiplier: 2.0 });
+    expect(custom.orbWindowCandles).toBe(4);
+    expect(custom.minRangePct).toBe(0.5);
+    expect(custom.volumeMultiplier).toBe(2.0);
+  });
+});
+
+// ─── BAVI Strategy ───────────────────────────────────────
+
+describe('BAVIStrategy', () => {
+  const strategy = new BAVIStrategy();
+
+  test('HOLD in backtest mode (null tick buffer)', () => {
+    const candles = generateFlatCandles(100, 10);
+    const signal = strategy.analyze(candles, null, null);
+    expect(signal.signal).toBe('HOLD');
+    expect(signal.reason).toContain('tick buffer');
+    expect(signal.strategy).toBe('BAVI');
+  });
+
+  test('HOLD with null candles', () => {
+    expect(strategy.analyze(null, null, null).signal).toBe('HOLD');
+  });
+
+  test('HOLD with no symbol provided', () => {
+    const signal = strategy.analyze(generateFlatCandles(100, 10), {}, null);
+    expect(signal.signal).toBe('HOLD');
+    expect(signal.reason).toContain('tick buffer');
+  });
+
+  test('HOLD with insufficient candles', () => {
+    const signal = strategy.analyze(
+      [{ open: 100, high: 101, low: 99, close: 100, volume: 1000 }],
+      null, null
+    );
+    expect(signal.signal).toBe('HOLD');
+  });
+
+  test('correct signal shape when HOLD', () => {
+    const signal = strategy.analyze(null, null, null);
+    expect(signal).toHaveProperty('signal', 'HOLD');
+    expect(signal).toHaveProperty('confidence', 0);
+    expect(signal).toHaveProperty('reason');
+    expect(signal).toHaveProperty('strategy', 'BAVI');
+  });
+
+  test('accepts custom parameters', () => {
+    const custom = new BAVIStrategy({ imbalanceThreshold: 0.45, minTickCount: 100 });
+    expect(custom.imbalanceThreshold).toBe(0.45);
+    expect(custom.minTickCount).toBe(100);
   });
 });

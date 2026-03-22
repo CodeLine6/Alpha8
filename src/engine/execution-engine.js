@@ -916,10 +916,10 @@ export class ExecutionEngine {
             ).catch(() => { });
           }
 
-          } // end if (existingPos?.isShort)
-
           // Fix BUG-19: store openOrderId so _persistTrade can UPDATE by order_id
           posCtx.openOrderId = order.id;
+
+          } // end if (existingPos?.isShort)
 
         } // end if (order.side === 'BUY')
         else if (order.side === 'SELL') {

@@ -8,6 +8,12 @@
  *   - Square-off covers both longs (SELL) and shorts (BUY-to-cover)
  *   - RSI SELL signals are EXCLUDED from opening new short positions
  *
+ * Strategy integration v1.1:
+ *   - EMA_CROSSOVER replaced by ORB (Opening Range Breakout)
+ *   - RSI_MEAN_REVERSION replaced by BAVI (Bid-Ask Volume Imbalance)
+ *   - BAVI returns HOLD in backtest (tickBuffer=null — requires live feed)
+ *     Backtest reports will show 0 BAVI signals. This is correct behavior.
+ *
  * BUG #17 FIX retained: SQUARE_OFF_TIME imported from constants.js
  */
 
@@ -18,19 +24,29 @@ import { SHORT_INELIGIBLE_STRATEGIES } from '../engine/signal-consensus.js';
 import { calcTradeCost } from '../lib/brokerage.js';
 
 const STRATEGY_MAP = {
-  'EMA_CROSSOVER': () => import('../strategies/ema-crossover.js'),
+  // Active consensus strategies (v1.1)
+  'ORB':              () => import('../strategies/orb-strategy.js'),
+  // BAVI: bid-ask volume imbalance from live tick feed.
+  //   Returns HOLD in backtest (tickBuffer=null). 0 signals expected in reports.
+  'BAVI':             () => import('../strategies/bavi-strategy.js'),
+  'VWAP_MOMENTUM':    () => import('../strategies/vwap-momentum.js'),
+  'BREAKOUT_VOLUME':  () => import('../strategies/breakout-volume.js'),
+  // Legacy strategies (not in consensus — files retained for backtesting and tests)
+  'EMA_CROSSOVER':      () => import('../strategies/ema-crossover.js'),
   'RSI_MEAN_REVERSION': () => import('../strategies/rsi-reversion.js'),
-  'VWAP_MOMENTUM': () => import('../strategies/vwap-momentum.js'),
-  'BREAKOUT_VOLUME': () => import('../strategies/breakout-volume.js'),
 };
 
-export const ALL_STRATEGIES = Object.keys(STRATEGY_MAP);
+// Active consensus strategies (what 'all' resolves to in backtests)
+export const ALL_STRATEGIES = ['ORB', 'BAVI', 'VWAP_MOMENTUM', 'BREAKOUT_VOLUME'];
 
 const WARMUP_CANDLES = {
-  'EMA_CROSSOVER': 25,
-  'RSI_MEAN_REVERSION': 16,
-  'VWAP_MOMENTUM': 5,
-  'BREAKOUT_VOLUME': 22,
+  'ORB':               7,    // 6 OR candles + 1 signal candle minimum
+  'BAVI':              5,    // minimal candles (relies on tick buffer, not candle count)
+  'VWAP_MOMENTUM':     5,
+  'BREAKOUT_VOLUME':   22,
+  // Legacy
+  'EMA_CROSSOVER':     26,   // slow EMA period
+  'RSI_MEAN_REVERSION': 15,  // RSI period
 };
 
 // Fix BUG-14: module-level constants removed; values now come from constructor config

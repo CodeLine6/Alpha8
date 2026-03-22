@@ -30,9 +30,12 @@
 /** Strategies that use mean-reversion fixed % targets (longs only) */
 const MEAN_REVERSION_STRATEGIES = new Set(['RSI_MEAN_REVERSION']);
 
-/** Strategies allowed to open short positions */
+/** Strategies allowed to open short positions.
+ * ORB and BAVI replace EMA_CROSSOVER (v1.1). RSI is now a long-exit helper only.
+ */
 export const SHORT_ELIGIBLE_STRATEGIES = new Set([
-    'EMA_CROSSOVER',
+    'ORB',
+    'BAVI',
     'VWAP_MOMENTUM',
     'BREAKOUT_VOLUME',
 ]);
@@ -341,7 +344,28 @@ export function evaluateExits({
         }
     }
 
-    // ── 6. TIME_EXIT ──────────────────────────────────────────────────────
+    // ── 5b. RSI EXIT HELPER (longs only) ────────────────────────────────────
+    // RSI overbought (SELL signal) exits long positions even if the opening
+    // strategy has not reversed. RSI is not in consensus - it cannot open
+    // new shorts; it only closes existing long positions.
+    // Only fires on CONFIDENT RSI signals (>= 65) to avoid false triggers.
+    if (!isShort && latestSignals?.RSI_MEAN_REVERSION === 'SELL') {
+        const rsiConfidence = latestSignals?._RSI_CONFIDENCE ?? 0;
+        if (rsiConfidence >= 65) {
+            return {
+                exit: true, partial: false,
+                reason: 'RSI_OVERBOUGHT_EXIT',
+                qty:    posCtx.quantity,
+                meta: {
+                    rsiSignal:     'SELL',
+                    rsiConfidence,
+                    pnlPct:        pct(posCtx.entryPrice, currentPrice),
+                },
+            };
+        }
+    }
+
+    // -- 6. TIME_EXIT --------------------------------------------------------
     const holdMinutes = (Date.now() - posCtx.timestamp) / 60000;
     const pnlPct = isShort
         ? pct(currentPrice, posCtx.entryPrice)   // profit when price falls
