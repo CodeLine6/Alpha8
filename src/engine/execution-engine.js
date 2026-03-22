@@ -234,11 +234,11 @@ export class ExecutionEngine {
         hydratedFromDB: true,
       });
 
-      // Restore current deployment so daily ROI denominator stays accurate after restart.
-      // loadFromRedis() already restored _availablePool and _totalCashRequired;
-      // hydratePositions() re-opens deployment for any still-open positions.
+      // Fix BUG-11: restoreDeployment does NOT add to _totalCashRequired.
+      // openDeployment() would double-count the denominator — cash was already
+      // counted before the restart. This method only restores _currentDeployment.
       const hydratedTradeSize = entryPrice * parseInt(row.quantity, 10);
-      this.riskManager.openDeployment(hydratedTradeSize);
+      this.riskManager.restoreDeployment(hydratedTradeSize);
     }
 
     const count = this._filledPositions.size;
@@ -390,10 +390,11 @@ export class ExecutionEngine {
 
     order = await this.executeOrder({
       symbol,
-      side: finalSignal.signal,
-      quantity: adjustedQty,
-      price: currentPrice,
-      strategy: finalSignal.reason || consensusResult.reason,
+      side:         finalSignal.signal,
+      quantity:     adjustedQty,
+      price:        currentPrice,
+      strategy:     finalSignal.reason || consensusResult.reason,
+      isShortEntry: consensusResult.isShortEntry ?? false,   // Fix BUG-01: was missing, causing all short entries to be rejected
     });
 
     acted = (order.state === (this.paperMode ? 'FILLED' : 'PLACED') || order.state === 'FILLED');
@@ -452,10 +453,14 @@ export class ExecutionEngine {
     log.info({ symbol, pnl, outcome, strategies }, 'Recording position outcome for adaptive weights');
 
     for (const strategy of strategies) {
+      // Call pipeline.recordTradeOutcome for each strategy (adaptive perf tracking)
+      if (this.pipeline.recordTradeOutcome) {
+        await this.pipeline.recordTradeOutcome(strategy, 'BUY', symbol, pnl);
+      }
       if (this.pipeline.adaptiveWeights) {
         await this.pipeline.adaptiveWeights.recordOutcome({
           strategy, signal: 'BUY', symbol, outcome, pnl,
-          paperMode: this.paperMode, // S6 FIX: pass paper mode flag
+          paperMode: this.paperMode,
         });
       }
     }
@@ -492,23 +497,32 @@ export class ExecutionEngine {
     const exitQty = qty ?? posCtx.quantity;
     const isFullExit = qty === null || qty === undefined || qty >= posCtx.quantity;
 
-    // Fix 1: was `currentPrice` (undefined) — now correctly uses `exitPrice`
-    const unrealisedPnL = (exitPrice - posCtx.entryPrice) * exitQty;
+    // Fix Bug 7: Determine position direction — needed for order side and P&L sign
+    const isShortPos = posCtx.isShort ?? posCtx.direction === 'SELL';
+
+    // Fix Bug 1 (prior fix): was `currentPrice` (undefined) — correctly uses `exitPrice`
+    const unrealisedPnL = isShortPos
+      ? (posCtx.entryPrice - exitPrice) * exitQty   // short profits when price falls
+      : (exitPrice - posCtx.entryPrice) * exitQty;
 
     log.warn({
       symbol, reason,
       entryPrice: posCtx.entryPrice,
-      exitPrice,                         // Fix 1: was `currentPrice`
+      exitPrice,
       quantity: exitQty,
       isFullExit,
+      isShort: isShortPos,
       unrealisedPnL: unrealisedPnL.toFixed(2),
     }, `🚨 Position manager forcing exit: ${symbol} — ${reason}`);
 
+    // Fix Bug 7: Use BUY to cover a short, SELL to close a long
+    const coverSide = isShortPos ? 'BUY' : 'SELL';
+
     const order = createOrder({
       symbol,
-      side: 'SELL',
+      side: coverSide,
       quantity: exitQty,
-      price: exitPrice,                  // Fix 1: was `currentPrice`
+      price: exitPrice,
       strategy: reason,
     });
 
@@ -528,22 +542,25 @@ export class ExecutionEngine {
       transitionOrder(order, ORDER_STATE.PLACED, { brokerId: result.orderId });
       transitionOrder(order, ORDER_STATE.FILLED);
 
-      // SHORT P&L = (entryPrice - exitPrice) * qty  (profit when price falls)
-      // LONG  P&L = (exitPrice - entryPrice) * qty
-      const isShortPos = posCtx.isShort ?? posCtx.direction === 'SELL';
-      const grossPnl = isShortPos
-        ? (posCtx.entryPrice - exitPrice) * exitQty
-        : (exitPrice - posCtx.entryPrice) * exitQty;
-
-      const { netPnl, totalCost } = calcNetPnl({
-        entryPrice: posCtx.entryPrice,
-        exitPrice,
-        quantity: exitQty,
-      });
-      // For shorts, calcNetPnl returns grossPnl as (exit-entry)*qty which is
-      // negative when profitable (price went down). We override with correct sign.
-      const pnl = isShortPos ? grossPnl - totalCost : netPnl;
-      order.pnl = pnl;
+      // Fix Bug 3 & 7: Compute P&L correctly for both long and short positions.
+      // For longs: use calcNetPnl (includes cost calculation, returns signed grossPnl + netPnl).
+      // For shorts: calcNetPnl's grossPnl sign is inverted (exit-entry)*qty which is negative
+      //   when profitable. Use explicit calcTradeCost for each leg instead.
+      let pnl, grossPnl, totalCost;
+      if (isShortPos) {
+        grossPnl  = (posCtx.entryPrice - exitPrice) * exitQty;  // positive = profitable short
+        // Short entry was a SELL, exit is a BUY
+        const entryCost = calcTradeCost({ side: 'SELL', price: posCtx.entryPrice, quantity: exitQty });
+        const exitCost  = calcTradeCost({ side: 'BUY',  price: exitPrice,         quantity: exitQty });
+        totalCost = entryCost.total + exitCost.total;
+        pnl       = grossPnl - totalCost;
+      } else {
+        const costs = calcNetPnl({ entryPrice: posCtx.entryPrice, exitPrice, quantity: exitQty });
+        grossPnl  = costs.grossPnl;
+        totalCost = costs.totalCost;
+        pnl       = costs.netPnl;
+      }
+      order.pnl      = pnl;
       order.grossPnl = grossPnl;
       order.costPaid = totalCost;
 
@@ -578,11 +595,11 @@ export class ExecutionEngine {
         // only if this returns success:true.
         await this.riskManager.recordTradePnL(pnl, symbol);
 
-        // ROI: return the partial portion of deployed capital back to pool
-        const partialExitSize = posCtx.entryPrice * exitQty;
-        this.riskManager.closeDeployment(partialExitSize, pnl);
-        order.tradeRoi = partialExitSize > 0 ? +((pnl / partialExitSize) * 100).toFixed(4) : 0;
-        order.capitalDeployed = partialExitSize;
+        // Fix BUG-18: use exitQty (partial quantity), NOT posCtx.quantity (full size)
+        const partialTradeSize = posCtx.entryPrice * exitQty;
+        this.riskManager.closeDeployment(partialTradeSize, pnl);
+        order.tradeRoi = partialTradeSize > 0 ? +((pnl / partialTradeSize) * 100).toFixed(4) : 0;
+        order.capitalDeployed = partialTradeSize;
 
         log.info({
           symbol,
@@ -639,13 +656,20 @@ export class ExecutionEngine {
       return order;
     }
 
+    // Fix Bug 4: Allow BUY if covering an existing SHORT position.
+    // A short position is stored with isShort:true. A BUY on it is a cover, not a dupe.
     if (params.side === 'BUY' && this._filledPositions.has(params.symbol)) {
-      transitionOrder(order, ORDER_STATE.REJECTED, {
-        rejectionReason: `Already holding position in ${params.symbol}`,
-      });
-      log.warn({ symbol: params.symbol, orderId: order.id },
-        'Order REJECTED — already holding position for symbol');
-      return order;
+      const existing = this._filledPositions.get(params.symbol);
+      if (!existing.isShort) {
+        transitionOrder(order, ORDER_STATE.REJECTED, {
+          rejectionReason: `Already holding LONG position in ${params.symbol}`,
+        });
+        log.warn({ symbol: params.symbol, orderId: order.id },
+          'Order REJECTED — already holding LONG position for symbol');
+        return order;
+      }
+      // existing.isShort === true — fall through to place BUY-to-cover
+      log.info({ symbol: params.symbol }, `Covering SHORT position for ${params.symbol}`);
     }
 
     if (params.side === 'BUY' && this.holdingsManager) {
@@ -761,10 +785,70 @@ export class ExecutionEngine {
         transitionOrder(order, ORDER_STATE.FILLED);
 
         if (order.side === 'BUY') {
-          const strategies = this._lastSignalStrategies.get(order.symbol) || [];
-          const stopPct = this._config?.STOP_LOSS_PCT ?? 1.0;
-          const trailPct = this._config?.TRAILING_STOP_PCT ?? 1.5;
-          const targetPct = this._config?.PROFIT_TARGET_PCT ?? 1.8;
+          const existingPos = this._filledPositions.get(order.symbol);
+
+          if (existingPos?.isShort) {
+            // ── Fix Bug 5: Covering a SHORT position ────────────────────────
+            const grossPnl  = (existingPos.entryPrice - order.price) * existingPos.quantity;
+            // Short entry was SELL, exit (cover) is BUY
+            const entryCost = calcTradeCost({ side: 'SELL', price: existingPos.entryPrice, quantity: existingPos.quantity });
+            const exitCost  = calcTradeCost({ side: 'BUY',  price: order.price,            quantity: existingPos.quantity });
+            const totalCost = entryCost.total + exitCost.total;
+            const pnl       = grossPnl - totalCost;
+
+            order.pnl         = pnl;
+            order.grossPnl    = grossPnl;
+            order.costPaid    = totalCost;
+            order.isShortClose = true; // for _persistTrade back-fill
+            order.tradeRoi    = existingPos.entryPrice > 0
+              ? +((pnl / (existingPos.entryPrice * existingPos.quantity)) * 100).toFixed(4)
+              : 0;
+            order.capitalDeployed = existingPos.entryPrice * existingPos.quantity;
+            // Fix BUG-19: carry entry order_id so _persistTrade can UPDATE by exact row
+            order.openEntryOrderId = existingPos.openOrderId ?? null;
+
+            await this.riskManager.recordTradePnL(pnl, order.symbol);
+            // Fix Bug 14: pass existingPos.strategies explicitly so the correct
+            // strategies that opened the short get credited for the outcome.
+            this.recordPositionOutcome(order.symbol, pnl, existingPos.strategies).catch(() => {});
+            this._filledPositions.delete(order.symbol);
+            this.riskManager.removePosition();
+
+            // ROI: return deployed capital back to pool on cover
+            const shortTradeSize = existingPos.entryPrice * existingPos.quantity;
+            this.riskManager.closeDeployment(shortTradeSize, pnl);
+
+            this._recentlyExited.add(order.symbol);
+
+            const signalId = this._pendingSignalIds.get(order.symbol);
+            if (signalId) {
+              this._markSignalActedOn(signalId, order.symbol, 'BUY').catch(() => {});
+              this._pendingSignalIds.delete(order.symbol);
+            }
+
+            if (this.telegram?.enabled) {
+              const emoji  = pnl >= 0 ? '✅' : '🛑';
+              const pnlStr = pnl >= 0 ? `+₹${pnl.toFixed(2)}` : `-₹${Math.abs(pnl).toFixed(2)}`;
+              // Fix Bug 19: label SHORT covers distinctly from LONG exits
+              this.telegram.sendRaw(
+                `${emoji} <b>SHORT Covered — ${order.symbol}</b>\n\n` +
+                `📋 Reason: SIGNAL_COVER\n` +
+                `📌 Direction: SHORT (covered)\n` +
+                `📤 Short entry: ₹${existingPos.entryPrice.toFixed(2)}\n` +
+                `📥 Cover:       ₹${order.price.toFixed(2)}\n` +
+                `💰 Net P&amp;L:   ${pnlStr}\n` +
+                `💸 Charges:     ₹${totalCost.toFixed(2)}\n` +
+                `📦 Qty:         ${existingPos.quantity}\n` +
+                `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+              ).catch(() => {});
+            }
+
+          } else {
+            // ── Opening a new LONG position ──────────────────────────────────
+            const strategies = this._lastSignalStrategies.get(order.symbol) || [];
+            const stopPct = this._config?.STOP_LOSS_PCT ?? 1.0;
+            const trailPct = this._config?.TRAILING_STOP_PCT ?? 1.5;
+            const targetPct = this._config?.PROFIT_TARGET_PCT ?? 1.8;
 
           const posCtx = {
             strategies,
@@ -794,13 +878,17 @@ export class ExecutionEngine {
 
           if (this.positionManager) {
             try {
-              const candles = this._fetchCandles
+              const rawCandles = this._fetchCandles
                 ? await this._fetchCandles(order.symbol, 20).catch(() => [])
                 : [];
-              const closes = candles.map(c => c.close);
-              const highs = candles.map(c => c.high);
-              const lows = candles.map(c => c.low);
-              await this.positionManager.initPosition(order.symbol, posCtx, closes, highs, lows);
+              // Fix BUG-08: initPosition expects candle objects, not separate arrays
+              const candles = rawCandles.map(c => ({
+                close: c.close,
+                high:  c.high  ?? c.close,
+                low:   c.low   ?? c.close,
+                open:  c.open  ?? c.close,
+              }));
+              await this.positionManager.initPosition(order.symbol, posCtx, candles);
             } catch (err) {
               log.warn({ symbol: order.symbol, err: err.message },
                 'initPosition failed — using config-based fallback levels');
@@ -809,9 +897,9 @@ export class ExecutionEngine {
 
           this.riskManager.addPosition();
 
-          // ROI: track fresh cash deployed for this position
+          // ROI: track fresh cash deployed for this position (optional — method may not exist)
           const buyTradeSize = order.price * order.quantity;
-          this.riskManager.openDeployment(buyTradeSize);
+          this.riskManager.openDeployment?.(buyTradeSize);
           order.capitalDeployed = buyTradeSize;
 
           if (this.telegram?.enabled) {
@@ -828,7 +916,12 @@ export class ExecutionEngine {
             ).catch(() => { });
           }
 
-        }
+          } // end if (existingPos?.isShort)
+
+          // Fix BUG-19: store openOrderId so _persistTrade can UPDATE by order_id
+          posCtx.openOrderId = order.id;
+
+        } // end if (order.side === 'BUY')
         else if (order.side === 'SELL') {
           const existingPos = this._filledPositions.get(order.symbol);
 
@@ -846,19 +939,23 @@ export class ExecutionEngine {
             order.costPaid = totalCost;
 
             await this.riskManager.recordTradePnL(pnl, order.symbol);
-            this.recordPositionOutcome(order.symbol, pnl).catch((err) =>
+            // Pass grossPnl to strategy outcome tracking so paper/live results are comparable
+            // (netPnl varies by brokerage; grossPnl reflects the actual trade performance)
+            this.recordPositionOutcome(order.symbol, grossPnl).catch((err) =>
               log.warn({ symbol: order.symbol, err: err.message }, 'Position outcome recording failed')
             );
             this._filledPositions.delete(order.symbol);
             this.riskManager.removePosition();
 
-            // ROI: return deployed capital (+ or − P&L) back to the pool
+            // ROI: return deployed capital back to the pool (optional — method may not exist)
             const sellTradeSize = posCtx.price * posCtx.quantity;
-            this.riskManager.closeDeployment(sellTradeSize, pnl);
+            this.riskManager.closeDeployment?.(sellTradeSize, pnl);
             const sellTradeRoi = sellTradeSize > 0 ? (pnl / sellTradeSize) * 100 : 0;
             order.tradeRoi = +sellTradeRoi.toFixed(4);
             order.capitalDeployed = sellTradeSize;
             order.isShortClose = false; // this is a long close
+            // Fix BUG-19: carry entry order_id forward so _persistTrade can UPDATE by exact row
+            order.openEntryOrderId = posCtx.openOrderId ?? null;
 
             if (this.telegram?.enabled) {
               const emoji = pnl >= 0 ? '✅' : '🛑';
@@ -891,6 +988,14 @@ export class ExecutionEngine {
             const trailPct = this._config?.TRAILING_STOP_PCT ?? 1.5;
             const targetPct = this._config?.PROFIT_TARGET_PCT ?? 1.8;
 
+            // Fix Bug 13: Determine strategy-aware profit target mode BEFORE building shortCtx.
+            // RSI_MEAN_REVERSION targets a mean-reversion band (FIXED_PCT);
+            // all other strategies use risk:reward ratio (RISK_REWARD).
+            const SHORT_FIXED_PCT_STRATEGIES = new Set(['RSI_MEAN_REVERSION']);
+            const shortProfitTargetMode = strategies.some(s => SHORT_FIXED_PCT_STRATEGIES.has(s))
+              ? 'FIXED_PCT'
+              : 'RISK_REWARD';
+
             const shortCtx = {
               direction: 'SELL',
               isShort: true,
@@ -911,7 +1016,7 @@ export class ExecutionEngine {
 
               // SHORT profit target: BELOW entry
               profitTargetPrice: order.price * (1 - targetPct / 100),
-              profitTargetMode: 'FIXED_PCT',
+              profitTargetMode: shortProfitTargetMode,  // Fix Bug 13
               partialExitEnabled: this._config?.PARTIAL_EXIT_ENABLED ?? true,
               partialExitDone: false,
               partialExitQty: 0,
@@ -921,21 +1026,28 @@ export class ExecutionEngine {
             this._filledPositions.set(order.symbol, shortCtx);
             this.riskManager.addPosition();
 
-            // ROI: track fresh cash deployed for this short position
+            // Fix BUG-19: store openOrderId for short entry
+            shortCtx.openOrderId = order.id;
+
+            // ROI: track fresh cash deployed for this short position (optional — method may not exist)
             const shortTradeSize = order.price * order.quantity;
-            this.riskManager.openDeployment(shortTradeSize);
+            this.riskManager.openDeployment?.(shortTradeSize);
             order.capitalDeployed = shortTradeSize;
 
             // Initialise exit levels via position manager (ATR-based trail etc.)
             if (this.positionManager) {
               try {
-                const candles = this._fetchCandles
+                const rawCandles = this._fetchCandles
                   ? await this._fetchCandles(order.symbol, 20).catch(() => [])
                   : [];
-                const closes = candles.map(c => c.close);
-                const highs = candles.map(c => c.high);
-                const lows = candles.map(c => c.low);
-                await this.positionManager.initPosition(order.symbol, shortCtx, closes, highs, lows);
+                // Fix BUG-08: initPosition expects candle objects, not separate arrays
+                const candles = rawCandles.map(c => ({
+                  close: c.close,
+                  high:  c.high  ?? c.close,
+                  low:   c.low   ?? c.close,
+                  open:  c.open  ?? c.close,
+                }));
+                await this.positionManager.initPosition(order.symbol, shortCtx, candles);
               } catch (err) {
                 log.warn({ symbol: order.symbol, err: err.message },
                   'initPosition failed for short — using config-based levels');
@@ -1254,25 +1366,39 @@ VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
         throw err;
       });
 
-      // For SELL closes (LONG exit or SHORT cover): back-fill trade_roi on the original entry row.
-      // The original entry row has side='BUY' for longs, side='SELL' for shorts.
-      if (order.side === 'SELL' && order.tradeRoi != null) {
-        // order.isShortClose is set before _filledPositions.delete() in _placeWithRetry/forceExit
-        const entrySide = order.isShortClose ? 'SELL' : 'BUY';
-        query(
-          `UPDATE trades
-           SET trade_roi = $1
-           WHERE symbol    = $2
-             AND side      = $3
-             AND status    = 'FILLED'
-             AND paper_mode = $4
-             AND (created_at AT TIME ZONE 'Asia/Kolkata')::date =
-                 (NOW()       AT TIME ZONE 'Asia/Kolkata')::date
-           ORDER BY created_at DESC
-           LIMIT 1`,
-          [order.tradeRoi, order.symbol, entrySide, this.paperMode]
-        ).catch(err => log.warn({ symbol: order.symbol, err: err.message },
-          'Failed to back-fill trade_roi on entry row'));
+      // Fix BUG-19: back-fill trade_roi on the original entry row.
+      // For LONG exit (SELL close): entry row has side='BUY', openOrderId stored at BUY fill.
+      // For SHORT cover (BUY close): entry row has side='SELL', openOrderId stored at short SELL fill.
+      const isSellClose = order.side === 'SELL' && !order.isShortClose;
+      const isBuyCover  = order.side === 'BUY'  && order.isShortClose;
+
+      if ((isSellClose || isBuyCover) && order.tradeRoi != null) {
+        // Prefer UPDATE by order_id (exact match, immune to race conditions)
+        const entryOrderId = order.openEntryOrderId ?? null;  // set from posCtx.openOrderId in close path
+        if (entryOrderId) {
+          query(
+            `UPDATE trades SET trade_roi = $1, gross_pnl = $2 WHERE order_id = $3`,
+            [order.tradeRoi, order.grossPnl ?? null, entryOrderId]
+          ).catch(err => log.warn({ symbol: order.symbol, err: err.message },
+            'Fix BUG-19: trade_roi update by order_id failed'));
+        } else {
+          // Fallback: symbol+date (used for forceExit paths where openOrderId may be unavailable)
+          const entrySide = isBuyCover ? 'SELL' : 'BUY';
+          query(
+            `UPDATE trades
+             SET trade_roi = $1
+             WHERE symbol    = $2
+               AND side      = $3
+               AND status    = 'FILLED'
+               AND paper_mode = $4
+               AND (created_at AT TIME ZONE 'Asia/Kolkata')::date =
+                   (NOW()       AT TIME ZONE 'Asia/Kolkata')::date
+             ORDER BY created_at DESC
+             LIMIT 1`,
+            [order.tradeRoi, order.symbol, entrySide, this.paperMode]
+          ).catch(err => log.warn({ symbol: order.symbol, err: err.message },
+            'Fix BUG-19 fallback: trade_roi symbol+date update failed'));
+        }
       }
 
       log.debug({ orderId: order.id, symbol: order.symbol }, 'Trade persisted to DB');
@@ -1284,44 +1410,55 @@ VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
 
   /** @private */
   async _persistSignals(symbol, consensus, currentPrice = null) {
-    const pool = getPool();
-    const client = await pool.connect();
     try {
-      const hasPosition = this._filledPositions.has(symbol);
-      await client.query('BEGIN');
+      // Fix: move getPool() inside try/catch so 'pool not initialized' is caught
+      // and returns null instead of throwing an uncaught exception (e.g. in tests).
+      const pool = getPool();
+      const client = await pool.connect();
+      try {
+        const hasPosition = this._filledPositions.has(symbol);
+        await client.query('BEGIN');
+        // Fix Bug 8: Prevent slow writes from holding the pool connection indefinitely.
+        await client.query("SET LOCAL statement_timeout = 5000");
 
-      for (const detail of (consensus.details || [])) {
-        const sig = detail.signal || 'HOLD';
-        if (sig === 'HOLD' && !hasPosition) continue;
-        await client.query(
-          `INSERT INTO signals(symbol, strategy, signal, confidence, acted_on, reason, price, created_at)
+        for (const detail of (consensus.details || [])) {
+          const sig = detail.signal || 'HOLD';
+          // Fix Bug 20: Skip HOLD signals unconditionally.
+          if (sig === 'HOLD') continue;
+          await client.query(
+            `INSERT INTO signals(symbol, strategy, signal, confidence, acted_on, reason, price, created_at)
 VALUES($1, $2, $3, $4, $5, $6, $7, NOW())`,
-          [symbol, detail.strategy || 'unknown', sig,
-            detail.confidence || 0, false,
-            (detail.reason || '').slice(0, 500), currentPrice || null]
-        );
-      }
+            [symbol, detail.strategy || 'unknown', sig,
+              detail.confidence || 0, false,
+              (detail.reason || '').slice(0, 500), currentPrice || null]
+          );
+        }
 
-      const conSig = consensus.signal || 'HOLD';
-      let consensusSignalId = null;
-      if (conSig !== 'HOLD' || hasPosition) {
-        const res = await client.query(
-          `INSERT INTO signals(symbol, strategy, signal, confidence, acted_on, reason, price, created_at)
+        const conSig = consensus.signal || 'HOLD';
+        let consensusSignalId = null;
+        if (conSig !== 'HOLD' || this._filledPositions.has(symbol)) {
+          const res = await client.query(
+            `INSERT INTO signals(symbol, strategy, signal, confidence, acted_on, reason, price, created_at)
 VALUES($1, $2, $3, $4, $5, $6, $7, NOW()) RETURNING id`,
-          [symbol, 'CONSENSUS', conSig, consensus.confidence || 0,
-            false, (consensus.reason || '').slice(0, 500), currentPrice || null]
-        );
-        consensusSignalId = res.rows?.[0]?.id ?? null;
-      }
+            [symbol, 'CONSENSUS', conSig, consensus.confidence || 0,
+              false, (consensus.reason || '').slice(0, 500), currentPrice || null]
+          );
+          consensusSignalId = res.rows?.[0]?.id ?? null;
+        }
 
-      await client.query('COMMIT');
-      return consensusSignalId;
+        await client.query('COMMIT');
+        return consensusSignalId;
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => { });
+        log.error({ symbol, err: err.message }, 'Failed to persist signals to DB');
+        return null;
+      } finally {
+        client.release();
+      }
     } catch (err) {
-      await client.query('ROLLBACK').catch(() => { });
+      // Catches getPool() or pool.connect() failures (e.g. pool not initialized in tests)
       log.error({ symbol, err: err.message }, 'Failed to persist signals to DB');
       return null;
-    } finally {
-      client.release(); // ← ALWAYS release the connection
     }
   }
 

@@ -129,66 +129,58 @@ export class KillSwitch {
       return { consistent: true, action: 'No Redis — skipped' };
     }
 
-    try {
-      const stored = await this._cacheGet(REDIS_KEY);
-      const redisEngaged = stored?.engaged === true;
-      const memoryEngaged = this._engaged;
+    // Fix Bug 11: A single transient Redis timeout at startup should not permanently
+    // engage the kill switch. Retry once after 500ms before treating it as a genuine failure.
+    const MAX_INTEGRITY_ATTEMPTS = 2;
+    const RETRY_DELAY_MS = 500;
 
-      // Case 1: Both agree → consistent
-      if (redisEngaged === memoryEngaged) {
-        log.info({
-          memoryEngaged,
-          redisEngaged,
-        }, 'Kill switch integrity check PASSED — states match');
-        return { consistent: true, action: 'States match' };
-      }
+    for (let attempt = 1; attempt <= MAX_INTEGRITY_ATTEMPTS; attempt++) {
+      try {
+        const stored = await this._cacheGet(REDIS_KEY);
+        const redisEngaged = stored?.engaged === true;
+        const memoryEngaged = this._engaged;
 
-      // Case 2: Redis says engaged, memory says not → ENGAGE (fail-safe)
-      if (redisEngaged && !memoryEngaged) {
+        // Case 1: Both agree → consistent
+        if (redisEngaged === memoryEngaged) {
+          log.info({ memoryEngaged, redisEngaged }, 'Kill switch integrity check PASSED — states match');
+          return { consistent: true, action: 'States match' };
+        }
+
+        // Case 2: Redis says engaged, memory says not → ENGAGE (fail-safe)
+        if (redisEngaged && !memoryEngaged) {
+          this._engaged = true;
+          this._reason = stored.reason || 'Integrity check: Redis-memory conflict';
+          this._engagedAt = stored.engagedAt || new Date().toISOString();
+          this._drawdownPct = stored.drawdownPct || 0;
+          log.error({ memoryEngaged, redisEngaged, action: 'ENGAGED (fail-safe)' },
+            '🛑 INTEGRITY CONFLICT: Redis=engaged, Memory=not → engaging fail-safe');
+          return { consistent: false, action: 'ENGAGED — Redis had engaged state that memory lost' };
+        }
+
+        // Case 3: Memory says engaged, Redis says not → persist to Redis
+        if (memoryEngaged && !redisEngaged) {
+          log.error({ memoryEngaged, redisEngaged, action: 'PERSISTING memory state to Redis' },
+            '⚠ INTEGRITY CONFLICT: Memory=engaged, Redis=not → persisting to Redis');
+          await this._persistToRedis();
+          return { consistent: false, action: 'PERSISTED — memory state written to Redis' };
+        }
+      } catch (err) {
+        if (attempt < MAX_INTEGRITY_ATTEMPTS) {
+          // Fix Bug 11: First failure might be a transient timeout — retry before engaging.
+          log.warn({ err: err.message, attempt },
+            `Kill switch integrity check failed (attempt ${attempt}/${MAX_INTEGRITY_ATTEMPTS}) — retrying...`);
+          await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+          continue;
+        }
+
+        // Both attempts failed — genuine connection problem, engage fail-safe
+        log.error({ err: err.message },
+          '🛑 INTEGRITY CHECK FAILED after retry: Redis unreachable — engaging fail-safe');
         this._engaged = true;
-        this._reason = stored.reason || 'Integrity check: Redis-memory conflict';
-        this._engagedAt = stored.engagedAt || new Date().toISOString();
-        this._drawdownPct = stored.drawdownPct || 0;
-
-        log.error({
-          memoryEngaged,
-          redisEngaged,
-          action: 'ENGAGED (fail-safe)',
-        }, '🛑 INTEGRITY CONFLICT: Redis=engaged, Memory=not → engaging fail-safe');
-
-        return {
-          consistent: false,
-          action: 'ENGAGED — Redis had engaged state that memory lost',
-        };
+        this._reason = `Integrity check failed after ${MAX_INTEGRITY_ATTEMPTS} attempts: Redis unreachable (${err.message})`;
+        this._engagedAt = new Date().toISOString();
+        return { consistent: false, action: 'ENGAGED — Redis unreachable after retry, fail-safe triggered' };
       }
-
-      // Case 3: Memory says engaged, Redis says not → persist to Redis
-      if (memoryEngaged && !redisEngaged) {
-        log.error({
-          memoryEngaged,
-          redisEngaged,
-          action: 'PERSISTING memory state to Redis',
-        }, '⚠ INTEGRITY CONFLICT: Memory=engaged, Redis=not → persisting to Redis');
-
-        await this._persistToRedis();
-
-        return {
-          consistent: false,
-          action: 'PERSISTED — memory state written to Redis',
-        };
-      }
-    } catch (err) {
-      // Redis unreachable during integrity check → ENGAGE (fail-safe)
-      log.error({ err: err.message }, '🛑 INTEGRITY CHECK FAILED: Redis unreachable — engaging fail-safe');
-
-      this._engaged = true;
-      this._reason = `Integrity check failed: Redis unreachable (${err.message})`;
-      this._engagedAt = new Date().toISOString();
-
-      return {
-        consistent: false,
-        action: 'ENGAGED — Redis unreachable, fail-safe triggered',
-      };
     }
 
     return { consistent: true, action: 'No conflict detected' };

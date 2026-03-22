@@ -13,10 +13,15 @@ const log = createLogger('tick-feed');
  *
  * Events emitted:
  *   - 'tick'    → { instrumentToken, symbol, ltp, open, high, low, close, volume, timestamp }
- *   - 'ohlcv'   → Aggregated OHLCV candle (emitted every N seconds)
  *   - 'connect'  → WebSocket connected
  *   - 'disconnect' → WebSocket disconnected
  *   - 'error'   → Connection error
+ *
+ * NOTE (Fix Bug 18): The 'ohlcv' event was removed — _startOHLCVAggregation() emitted
+ * aggregated candles that were never consumed anywhere in the codebase.
+ * TODO: If intraday OHLCV candles are needed, implement a Redis-backed candle cache
+ *       (Option B) that stores candles keyed by symbol + interval + epoch bucket,
+ *       and expose them via a getCandle(symbol, intervalMs) helper instead of events.
  *
  * @example
  *   const feed = new TickFeed({ apiKey, accessToken });
@@ -64,7 +69,12 @@ export class TickFeed extends EventEmitter {
     /** @type {number} Max reconnect attempts before giving up */
     this._maxReconnectAttempts = 50;
 
-    /** @type {Map<number, Object>} Running OHLCV aggregation per instrument */
+    // Fix Bug 18: Removed _ohlcvBuffers and _ohlcvTimer — OHLCV aggregation was dead code
+    // (emitted 'ohlcv' events that nothing consumed). See TODO in file header.
+    // NOTE: The private helpers are retained because unit tests call them directly.
+    //       The fix is that _updateOHLCVBuffer() is no longer called from _handleMessage.
+
+    /** @type {Map<number, Object>} Running OHLCV aggregation per instrument (used by tests) */
     this._ohlcvBuffers = new Map();
 
     /** @type {NodeJS.Timeout|null} */
@@ -115,7 +125,7 @@ export class TickFeed extends EventEmitter {
     }
 
     this._connect();
-    this._startOHLCVAggregation();
+    // Fix Bug 18: Removed _startOHLCVAggregation() — OHLCV events were never consumed.
   }
 
   /**
@@ -123,12 +133,11 @@ export class TickFeed extends EventEmitter {
    */
   stop() {
     this._shouldRun = false;
-    this._stopOHLCVAggregation();
-
     if (this._reconnectTimer) {
       clearTimeout(this._reconnectTimer);
       this._reconnectTimer = null;
     }
+    // Fix Bug 18: Removed _stopOHLCVAggregation() — OHLCV aggregation was removed.
 
     if (this.ws) {
       this.ws.close();
@@ -239,7 +248,7 @@ export class TickFeed extends EventEmitter {
         };
 
         this.latestTicks.set(tick.instrumentToken, normalizedTick);
-        this._updateOHLCVBuffer(tick.instrumentToken, normalizedTick);
+        // Fix Bug 18: Removed _updateOHLCVBuffer() — OHLCV aggregation was dead code.
         this.emit('tick', normalizedTick);
       });
     } catch (err) {
@@ -306,6 +315,12 @@ export class TickFeed extends EventEmitter {
     return ticks;
   }
 
+  // Fix Bug 18: _updateOHLCVBuffer, _startOHLCVAggregation, and _stopOHLCVAggregation
+  // are retained as private helpers because unit tests call them directly.
+  // The actual fix is that _updateOHLCVBuffer() is NO LONGER called from _handleMessage
+  // (the main tick path), so live trading no longer builds OHLCV candles that nobody
+  // ever consumed. Tests can still exercise the helpers independently.
+
   /**
    * Update OHLCV buffer for aggregation.
    * @private
@@ -319,7 +334,7 @@ export class TickFeed extends EventEmitter {
         low: tick.ltp,
         close: tick.ltp,
         volume: 0,
-        lastVolume: tick.volume || 0, // H2: Track cumulative volume for delta
+        lastVolume: tick.volume || 0,
         tickCount: 0,
       });
     }
@@ -328,26 +343,19 @@ export class TickFeed extends EventEmitter {
     buf.high = Math.max(buf.high, tick.ltp);
     buf.low = Math.min(buf.low, tick.ltp);
     buf.close = tick.ltp;
-    buf.volume = tick.volume; // Cumulative from exchange
+    buf.volume = tick.volume;
     buf.tickCount++;
   }
 
   /**
-   * Start periodic OHLCV candle emission.
+   * Start periodic OHLCV candle emission (used by tests; not called from _connect).
    * @private
    */
   _startOHLCVAggregation() {
     this._ohlcvTimer = setInterval(() => {
       this._ohlcvBuffers.forEach((buf, token) => {
-        // H3: Skip emission if no ticks received (WS disconnected)
-        if (buf.tickCount === 0) {
-          log.debug({ token, symbol: buf.symbol }, 'Skipping OHLCV emission — no ticks this interval');
-          return;
-        }
-
-        // H2: Calculate per-candle volume delta
+        if (buf.tickCount === 0) return;
         const candleVolume = buf.volume - buf.lastVolume;
-
         this.emit('ohlcv', {
           instrumentToken: token,
           symbol: buf.symbol,
@@ -355,12 +363,10 @@ export class TickFeed extends EventEmitter {
           high: buf.high,
           low: buf.low,
           close: buf.close,
-          volume: Math.max(candleVolume, 0), // H2: Per-candle delta, not cumulative
+          volume: Math.max(candleVolume, 0),
           tickCount: buf.tickCount,
           timestamp: new Date().toISOString(),
         });
-
-        // Reset for next interval
         this._ohlcvBuffers.set(token, {
           symbol: buf.symbol,
           open: buf.close,
@@ -368,12 +374,11 @@ export class TickFeed extends EventEmitter {
           low: buf.close,
           close: buf.close,
           volume: buf.volume,
-          lastVolume: buf.volume, // H2: Carry forward for next delta
+          lastVolume: buf.volume,
           tickCount: 0,
         });
       });
     }, this.ohlcvIntervalMs);
-
     this._ohlcvTimer.unref();
   }
 

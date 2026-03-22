@@ -48,7 +48,10 @@ export class RiskManager {
    * @param {Function} [config.getLiveSetting] - Optional live settings reader fn(key, fallback)
    */
   constructor(config) {
-    this.capital = config.capital;
+    // Fix Bug 16: _sessionCapital is locked at startup and drives daily-loss / kill-switch limits.
+    // config.capital (and live TRADING_CAPITAL overrides) only affect per-trade position sizing.
+    this._sessionCapital = config.capital;  // immutable after construction
+    this.capital = config.capital;           // sizing capital — may be overridden live
     this.killSwitch = config.killSwitch;
 
     // Base values from config/env — used as fallback when no live override is set
@@ -73,7 +76,7 @@ export class RiskManager {
     this._cacheGet = config.cacheGet || null;
     this._cacheSet = config.cacheSet || null;
 
-    // ─── Daily PnL tracking ──────────────────────────────
+    // ─── Daily PnL tracking ────────────────────────────
     /** @type {number} Running realized + unrealized PnL for today */
     this._dailyPnL = 0;
 
@@ -88,7 +91,7 @@ export class RiskManager {
     /** @type {number} Total value of orders placed but not yet filled/cancelled */
     this._pendingExposureValue = 0;
 
-    // ─── Capital deployment tracking (daily ROI) ─────────
+    // ─── Capital deployment tracking (daily ROI) ───────────
     /** Cash returned from closed trades, available to re-use */
     this._availablePool = 0;
     /** Total fresh cash drawn from wallet today — the ROI denominator */
@@ -103,6 +106,7 @@ export class RiskManager {
 
     log.info({
       capital: this.capital,
+      sessionCapital: this._sessionCapital,
       maxDailyLoss: `${this.maxDailyLossPct}% (₹${this._maxDailyLossAmount})`,
       perTradeStop: `${this.perTradeStopLossPct}% (₹${this._perTradeMaxLoss})`,
       maxPositions: this.maxPositionCount,
@@ -144,13 +148,17 @@ export class RiskManager {
       this.maxCapitalExposurePct = await this._getLiveSetting('MAX_CAPITAL_EXPOSURE_PCT', this.maxCapitalExposurePct);
       this.maxPositionPct = await this._getLiveSetting('MAX_POSITION_VALUE_PCT', this._baseMaxPositionPct);
 
-      // Capital override — only affects position sizing, NOT today's P&L tracking
+      // Fix Bug 16: TRADING_CAPITAL override only updates sizing capital.
+      // _sessionCapital (and thus daily-loss / kill-switch money amounts) never change mid-session.
       const liveCapital = await this._getLiveSetting('TRADING_CAPITAL', this.capital);
       if (liveCapital !== this.capital) {
-        log.info({ prev: this.capital, next: liveCapital }, 'Capital overridden via live settings');
-        this.capital = liveCapital;
+        log.info({ prev: this.capital, next: liveCapital }, 'Sizing capital overridden via live settings (session limits unchanged)');
+        this.capital = liveCapital;  // affects position sizing only
+        // Do NOT call _recomputeLimits() here — limits use _sessionCapital, not this.capital
       }
 
+      // Recompute only pct-based risk params (maxDailyLossPct etc.) — NOT the capital base.
+      // This is called after all other params are updated so percentages take effect.
       this._recomputeLimits();
 
       const overrides = {};
@@ -180,9 +188,15 @@ export class RiskManager {
    * @private
    */
   _recomputeLimits() {
-    this._maxDailyLossAmount = this.capital * (this.maxDailyLossPct / 100);
-    this._killSwitchAmount = this.capital * (this.killSwitchDrawdownPct / 100);
-    this._perTradeMaxLoss = this.capital * (this.perTradeStopLossPct / 100);
+    // Fix Bug 16: Daily-loss and kill-switch amounts are anchored to _sessionCapital
+    // (the capital at session start), not the live-overridable sizing capital.
+    // This prevents a mid-session TRADING_CAPITAL override from retroactively
+    // changing how much loss is acceptable for the day.
+    const limitBase = this._sessionCapital ?? this.capital; // _sessionCapital added by Bug 16 fix
+    this._maxDailyLossAmount   = limitBase * (this.maxDailyLossPct      / 100);
+    this._killSwitchAmount     = limitBase * (this.killSwitchDrawdownPct / 100);
+    // Per-trade max loss and exposure use sizing capital (this.capital) — intentional.
+    this._perTradeMaxLoss      = this.capital * (this.perTradeStopLossPct  / 100);
     this._maxCapitalExposureAmount = this.capital * (this.maxCapitalExposurePct / 100);
   }
 
@@ -306,7 +320,10 @@ export class RiskManager {
     if (!this._cacheSet) return;
     try {
       await this._cacheSet('risk:daily_state', {
-        date: new Date().toISOString().split('T')[0],
+        // Fix Bug 10: Use IST date so loadFromRedis (which also uses IST) sees the same
+        // date key across midnight UTC (= 05:30 IST). UTC date caused state to reset
+        // at 05:30 IST every day instead of at the actual IST midnight.
+        date: new Date().toLocaleString('en-CA', { timeZone: 'Asia/Kolkata' }).split(',')[0],
         dailyPnL: this._dailyPnL,
         openPositionCount: this._openPositionCount,
         tradeCount: this._tradeCount,
@@ -468,7 +485,7 @@ export class RiskManager {
       wins: this._wins,
       losses: this._losses,
     };
-    this._cacheSet('risk:daily_state', state).catch(() => { });
+    if (this._cacheSet) this._cacheSet('risk:daily_state', state).catch(() => { });
 
     // Re-fetch kill switch threshold in case it was live-overridden
     // _killSwitchAmount is always in sync because _recomputeLimits() is called
@@ -566,6 +583,31 @@ export class RiskManager {
       availablePool:     this._availablePool,
       currentDeployment: this._currentDeployment,
     }, 'Deployment closed');
+    this._persistToRedis().catch(() => {});
+  }
+
+  /**
+   * Fix BUG-11: Restore deployment tracking after a server restart.
+   *
+   * Use ONLY inside hydratePositions(). loadFromRedis() already restored
+   * _totalCashRequired (the ROI denominator) from Redis. Calling openDeployment()
+   * here would draw from _availablePool and add fresh cash again, DOUBLING the
+   * denominator and halving daily ROI.
+   *
+   * This method ONLY restores _currentDeployment / _peakDeployment so the gauge
+   * shows the correct "capital locked in positions" value — without touching
+   * _totalCashRequired or _availablePool.
+   *
+   * @param {number} tradeSize - entry_price × quantity of the restored position
+   */
+  restoreDeployment(tradeSize) {
+    this._currentDeployment += tradeSize;
+    if (this._currentDeployment > this._peakDeployment) {
+      this._peakDeployment = this._currentDeployment;
+    }
+    log.debug({ tradeSize, currentDeployment: this._currentDeployment },
+      'Fix BUG-11: Deployment restored (no fresh cash charged)');
+    // Do NOT touch _totalCashRequired or _availablePool
     this._persistToRedis().catch(() => {});
   }
 

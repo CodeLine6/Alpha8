@@ -307,25 +307,14 @@ export function createApiHandler(deps) {
       const riskStatus = riskManager.getStatus();
       const ksStatus = killSwitch.getStatus();
 
-      // Remove the non-existent daily_summary query
-      let tradeStats = { count: 0, wins: 0, losses: 0, filled: 0, rejected: 0, totalPnl: 0 }; try {
-        const today = new Date().toISOString().split('T')[0];
-        const result = await query(`
-                SELECT
-                    COUNT(*) as count,
-                    COUNT(*) FILTER (WHERE pnl > 0)             as wins,
-                    COUNT(*) FILTER (WHERE pnl < 0)             as losses,
-                    COUNT(*) FILTER (WHERE status = 'FILLED')   as filled,
-                    COUNT(*) FILTER (WHERE status = 'REJECTED') as rejected,
-                    COALESCE(SUM(pnl), 0)                       as total_pnl
-                FROM trades
-                WHERE (created_at AT TIME ZONE 'Asia/Kolkata')::date = $1::date
-            `, [today]);
-        dbSummary = result.rows[0] || null;
-      } catch { /* DB may not have today's entry yet */ }
-
+      // Fix Bug 1: Removed dead first try/catch that assigned to undeclared `dbSummary`
+      // (would throw ReferenceError in strict-mode ESM on every call).
+      // Fix Bug 2: Use IST date and timezone-aware SQL comparison so trades recorded
+      // at 09:30 IST (UTC day boundary) are correctly included.
+      let tradeStats = { count: 0, wins: 0, losses: 0, filled: 0, rejected: 0, totalPnl: 0 };
       try {
-        const today = new Date().toISOString().split('T')[0];
+        // Fix Bug 2: IST date instead of UTC
+        const today = new Date().toLocaleString('en-CA', { timeZone: 'Asia/Kolkata' }).split(',')[0];
         const result = await query(`
           SELECT
             COUNT(*) as count,
@@ -335,7 +324,7 @@ export function createApiHandler(deps) {
             COUNT(*) FILTER (WHERE status = 'REJECTED') as rejected,
             COALESCE(SUM(pnl), 0)                       as total_pnl
           FROM trades
-          WHERE created_at::date = $1
+          WHERE (created_at AT TIME ZONE 'Asia/Kolkata')::date = ($1::date)
         `, [today]);
         const row = result.rows[0];
         tradeStats = {
@@ -552,12 +541,14 @@ export function createApiHandler(deps) {
       const values = [];
       let paramIdx = 1;
 
+      // Fix Bug 12: Use timezone-aware date comparison so trades created around midnight
+      // IST (= 18:30 UTC) are included in the correct local day's results.
       if (params.startDate) {
-        conditions.push(`created_at >= $${paramIdx++}`);
+        conditions.push(`(created_at AT TIME ZONE 'Asia/Kolkata')::date >= $${paramIdx++}::date`);
         values.push(params.startDate);
       }
       if (params.endDate) {
-        conditions.push(`created_at <= $${paramIdx++}::date + interval '1 day'`);
+        conditions.push(`(created_at AT TIME ZONE 'Asia/Kolkata')::date <= $${paramIdx++}::date`);
         values.push(params.endDate);
       }
       if (params.strategy) {

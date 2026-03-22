@@ -14,6 +14,8 @@
 import { groupByDay, toISTTimeString } from './historical-data-fetcher.js';
 import { SQUARE_OFF_TIME } from '../config/constants.js';
 import { SHORT_INELIGIBLE_STRATEGIES } from '../engine/signal-consensus.js';
+// Fix BUG-15: import brokerage.js function instead of duplicating fee constants
+import { calcTradeCost } from '../lib/brokerage.js';
 
 const STRATEGY_MAP = {
   'EMA_CROSSOVER': () => import('../strategies/ema-crossover.js'),
@@ -31,9 +33,8 @@ const WARMUP_CANDLES = {
   'BREAKOUT_VOLUME': 22,
 };
 
-const STOP_LOSS_PCT = 0.01;   // 1% — same for longs and shorts
-const RISK_PER_TRADE_PCT = 0.01;   // 1% of capital risked per trade
-const MAX_POSITION_PCT = 0.20;   // 20% max capital in any position
+// Fix BUG-14: module-level constants removed; values now come from constructor config
+// (see this.stopLossPct, this.riskPerTradePct, this.maxPositionPct below)
 
 export class BacktestEngine {
   constructor(config) {
@@ -44,6 +45,10 @@ export class BacktestEngine {
     this.minConsensus = config.minConsensus ?? 2;
     this.allowShorts = config.allowShorts ?? true;   // ← NEW: toggle shorts on/off
     this.logger = config.logger ?? console.log;
+    // Fix BUG-14: read from config so backtest matches live system settings
+    this.stopLossPct    = (config.stopLossPct    ?? config.STOP_LOSS_PCT    ?? 0.01);
+    this.riskPerTradePct = (config.riskPerTradePct ?? config.RISK_PER_TRADE_PCT ?? 0.01);
+    this.maxPositionPct  = (config.maxPositionPct  ?? config.MAX_POSITION_PCT  ?? 0.20);
 
     this.capital = this.initialCapital;
     this.position = null;   // { direction: 'BUY'|'SELL', entryPrice, stopLoss, quantity, ... }
@@ -217,16 +222,15 @@ export class BacktestEngine {
     const entryPrice = candle.close;
     const isShort = direction === 'SELL';
 
-    // Stop loss: below entry for longs, above entry for shorts
+    // Fix BUG-14: use this.stopLossPct (from config) instead of hardcoded STOP_LOSS_PCT
     const stopLoss = isShort
-      ? entryPrice * (1 + STOP_LOSS_PCT)
-      : entryPrice * (1 - STOP_LOSS_PCT);
+      ? entryPrice * (1 + this.stopLossPct)
+      : entryPrice * (1 - this.stopLossPct);
 
-    // Position sizing: risk = stop-distance × quantity
-    const riskAmount = this.capital * RISK_PER_TRADE_PCT;
-    const stopDistance = entryPrice * STOP_LOSS_PCT;
+    const riskAmount  = this.capital * this.riskPerTradePct;
+    const stopDistance = entryPrice * this.stopLossPct;
     let quantity = Math.floor(riskAmount / stopDistance);
-    const maxByCapital = Math.floor((this.capital * MAX_POSITION_PCT) / entryPrice);
+    const maxByCapital = Math.floor((this.capital * this.maxPositionPct) / entryPrice);
     quantity = Math.min(quantity, maxByCapital);
     quantity = Math.max(quantity, 1);
 
@@ -261,13 +265,13 @@ export class BacktestEngine {
     const pnlPct = ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100
       * (isShort ? -1 : 1);
 
-    // Transaction costs (both legs — entry and exit)
-    // For shorts: entry was a SELL order, exit is a BUY order
+    // Fix BUG-15: use calcTradeCost from brokerage.js instead of _calcLegCost
+    // This ensures backtest fees always stay in sync with live trading fees.
     const entryCostSide = isShort ? 'SELL' : 'BUY';
-    const exitCostSide = isShort ? 'BUY' : 'SELL';
-    const entryCost = _calcLegCost(entryCostSide, pos.entryPrice, pos.quantity);
-    const exitCost = _calcLegCost(exitCostSide, exitPrice, pos.quantity);
-    const totalCost = entryCost + exitCost;
+    const exitCostSide  = isShort ? 'BUY'  : 'SELL';
+    const entryCost = calcTradeCost({ side: entryCostSide, price: pos.entryPrice, quantity: pos.quantity });
+    const exitCost  = calcTradeCost({ side: exitCostSide,  price: exitPrice,      quantity: pos.quantity });
+    const totalCost = entryCost.total + exitCost.total;
     const netPnl = grossPnl - totalCost;
 
     const trade = {
@@ -308,22 +312,16 @@ export class BacktestEngine {
     const instances = {};
     for (const name of this.strategyNames) {
       const mod = await STRATEGY_MAP[name]();
-      const StratClass = mod.default ?? mod[Object.keys(mod)[0]];
+      // Fix BUG-20: require default export — prevents wrong named export when module has multiple
+      const StratClass = mod.default;
+      if (typeof StratClass !== 'function') {
+        throw new Error(`Strategy module "${name}" must have a default export (got ${typeof StratClass})`);
+      }
       instances[name] = new StratClass();
     }
     return instances;
   }
 }
 
-// ── Internal: lightweight cost calculator (mirrors src/lib/brokerage.js) ─────
-
-function _calcLegCost(side, price, quantity) {
-  const value = price * quantity;
-  const brokerage = Math.min(20, value * 0.0003);
-  const stt = side === 'SELL' ? value * 0.00025 : 0;
-  const exchangeFee = value * 0.0000345;
-  const sebiFee = value * 0.000001;
-  const stampDuty = side === 'BUY' ? value * 0.00003 : 0;
-  const gst = (brokerage + exchangeFee + sebiFee) * 0.18;
-  return brokerage + stt + exchangeFee + sebiFee + stampDuty + gst;
-}
+// Fix BUG-15: _calcLegCost removed — replaced by calcTradeCost from ../lib/brokerage.js
+// Removing the duplicate prevents fee constants from silently diverging when brokerage.js is updated.

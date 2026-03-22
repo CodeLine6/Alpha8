@@ -117,10 +117,17 @@ export async function executeSquareOff({ broker, riskManager, engine, getOpenPos
         // Fallback for live mode if engine is out-of-sync with broker
         if (!isPaperMode && broker) {
           log.warn({ symbol }, 'Engine out-of-sync: forceExit failed, attempting manual broker exit');
+
+          // Fix Bug 6: determine correct exit side from broker quantity sign.
+          // Kite returns negative netQuantity for short positions.
+          const rawQty    = pos.quantity || pos.netQuantity || 0;
+          const isShort   = rawQty < 0;
+          const coverSide = isShort ? 'BUY' : 'SELL';
+
           const squareOffResult = await broker.placeOrder({
             symbol,
             exchange: 'NSE',
-            side: 'SELL',
+            side: coverSide,  // Fix Bug 6: BUY to cover shorts, SELL to close longs
             quantity: qty,
             orderType: 'MARKET',
             product: 'MIS',
@@ -128,9 +135,12 @@ export async function executeSquareOff({ broker, riskManager, engine, getOpenPos
 
           const finalPrice = squareOffResult?.price || squareOffResult?.average_price || exitPrice;
           const entryPrice = pos.average_price || pos.buyPrice || 0;
-          const pnl = (finalPrice - entryPrice) * qty;
+          // Fix Bug 6: P&L direction-aware
+          const pnl = isShort
+            ? (entryPrice - finalPrice) * qty  // short profits when price falls
+            : (finalPrice - entryPrice) * qty;
 
-          await riskManager.recordTradePnL(pnl, symbol).catch(() => { });
+          await riskManager.recordTradePnL(pnl, symbol).catch(() => {});
           await riskManager.removePosition();
 
           squaredOff.push({ symbol, qty, pnl, squareOffPrice: finalPrice });

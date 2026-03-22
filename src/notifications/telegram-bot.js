@@ -217,7 +217,19 @@ export class TelegramBot {
           }
         }
       } catch (err) {
-        log.debug({ err: err.message }, 'Telegram getUpdates polled');
+        // Fix Bug 9: Auth failures (401/403) are operator-critical — must be visible in production.
+        // Previously logged at DEBUG which meant they were invisible after startup.
+        const status = err.response?.status;
+        if (status === 401 || status === 403) {
+          log.error({
+            err: err.message,
+            status,
+          }, 'Telegram polling AUTH FAILURE — check bot token and chatId immediately');
+        } else if (status && status >= 400) {
+          log.warn({ err: err.message, status }, 'Telegram getUpdates HTTP error');
+        } else {
+          log.debug({ err: err.message }, 'Telegram getUpdates error (transient)');
+        }
       }
 
       await this._delay(intervalMs);
@@ -282,10 +294,16 @@ export class TelegramBot {
 
     return new Promise((resolve) => {
       this._queue.push({ text, resolve });
-      // M5: catch prevents _draining flag deadlock on unexpected errors
+      // Fix Bug 23: _drain() catch resets the flag but previously didn't retry,
+      // so messages following an error were stuck in the queue forever.
+      // The fix is in _drain's catch block — it schedules a retry if queue is non-empty.
       this._drain().catch((err) => {
         this._draining = false;
-        log.error({ err: err.message }, 'Telegram drain error — flag reset');
+        log.error({ err: err.message }, 'Telegram drain error — scheduling retry');
+        // Retry after 1s for any remaining queued messages
+        if (this._queue.length > 0) {
+          setTimeout(() => this._drain().catch(() => {}), 1000);
+        }
       });
     });
   }

@@ -196,7 +196,7 @@ function DailyRoiCard({ data, loading }) {
                 {roi >= 0 ? '+' : ''}{roi.toFixed(2)}%
             </div>
             <div className="text-xs text-[var(--text-muted)] mt-2">
-                on {formatINR(deployed)} cash used
+                on {formatINR(deployed)} fresh capital used {/* Fix BUG-22: was 'cash used'; totalCashRequired = fresh wallet draws, the ROI denominator */}
             </div>
             {current > 0 && (
                 <div className="text-xs mt-1 text-yellow-400">

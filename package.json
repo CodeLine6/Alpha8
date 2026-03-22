@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "nodemon src/index.js",
     "start": "node src/index.js",
-    "test": "npx --node-options=--experimental-vm-modules jest --forceExit",
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --forceExit",
     "migrate": "node scripts/setup-db.js",
     "backtest": "node scripts/backtest.js",
     "dashboard": "next dev src/dashboard -p 4000",

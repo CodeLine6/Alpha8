@@ -81,15 +81,20 @@ export function computeExitLevels({
 }) {
     const isShort = direction === 'SELL';
 
-    const {
-        stopLossPct,
-        trailingStopPct,
-        profitTargetPct,
-        riskRewardRatio,
-        partialExitEnabled,
-        partialExitPct,
-        signalReversalEnabled,
-    } = config;
+    const stopLossPct         = config.stopLossPct         ?? config.STOP_LOSS_PCT         ?? 1.0;
+    const trailingStopPct     = config.trailingStopPct     ?? config.TRAILING_STOP_PCT     ?? 1.5;
+    const profitTargetPct     = config.profitTargetPct     ?? config.PROFIT_TARGET_PCT     ?? 1.8;
+    // Fix BUG-09: riskRewardRatio may be stored under different key names; default to 2.0
+    const riskRewardRatio     = config.riskRewardRatio
+      ?? config.RISK_REWARD_RATIO
+      ?? config.riskReward
+      ?? 2.0;
+    const partialExitEnabled  = config.partialExitEnabled  ?? config.PARTIAL_EXIT_ENABLED  ?? true;
+    const partialExitPct      = config.partialExitPct      ?? config.PARTIAL_EXIT_PCT      ?? 50;
+    // Fix BUG-10: signalReversalEnabled must default to true; undefined would disable reversal exits
+    const signalReversalEnabled = config.signalReversalEnabled
+      ?? config.SIGNAL_REVERSAL_ENABLED
+      ?? true;   // core feature — default ON
 
     // ── Stop loss ──────────────────────────────────────────────────────────
     // LONG:  stop below entry  (entry × (1 - stop%))

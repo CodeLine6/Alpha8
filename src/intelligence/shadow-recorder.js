@@ -142,7 +142,12 @@ export class ShadowRecorder {
         FROM shadow_signals
         WHERE
           (price_after_15min IS NULL AND created_at < NOW() - INTERVAL '15 minutes')
-          OR (price_after_30min IS NULL AND created_at < NOW() - INTERVAL '30 minutes')
+          -- Fix Bug 15: Add 90-minute staleness guard for the 30-min window.
+          -- After a restart the current LTP is NOT reliable as the price
+          -- "30 minutes after the signal" if more than 90 minutes have passed.
+          OR (price_after_30min IS NULL
+              AND created_at < NOW() - INTERVAL '30 minutes'
+              AND created_at > NOW() - INTERVAL '90 minutes')
           OR (price_after_60min IS NULL AND created_at < NOW() - INTERVAL '60 minutes')
           OR (
             price_eod IS NULL

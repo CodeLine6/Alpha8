@@ -111,6 +111,9 @@ export class SignalConsensus {
     if (!this._getLiveSetting) return;
     try {
       this.superConvictionThreshold = await this._getLiveSetting('SUPER_CONVICTION_THRESHOLD', 80);
+      // Fix BUG-17: also refresh minConfidence and minAgreement so /set commands take effect
+      this.minConfidence = await this._getLiveSetting('MIN_CONFIDENCE', this.minConfidence);
+      this.minAgreement  = await this._getLiveSetting('MIN_AGREEMENT',  this.minAgreement);
     } catch (err) {
       log.warn({ err: err.message }, 'Failed to refresh SignalConsensus params');
     }
@@ -498,79 +501,14 @@ export class SignalConsensus {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // weightedConsensusWithWeights()  — called by EnhancedSignalPipeline
+  // weightedConsensusWithWeights() — REMOVED (Fix Bug 17)
   // ─────────────────────────────────────────────────────────────────────────
-
-  /**
-   * Fix B: Signals with meetsFloor===false or suppressedByTime===true are
-   * skipped so pipeline Gate 1 is at least as strict as grouped consensus.
-   *
-   * @param {Array}              signals   - consensusResult.details[]
-   * @param {Map<string,number>} weights   - from AdaptiveWeightManager
-   * @param {number}             threshold - regime-adjusted minimum weight sum
-   */
-  weightedConsensusWithWeights(signals, weights, threshold = 2.0) {
-    if (!signals || signals.length === 0) return null;
-
-    let buyWeight = 0;
-    let sellWeight = 0;
-
-    for (const sig of signals) {
-      // Fix B: skip suppressed signals — they don't vote
-      if (sig.meetsFloor === false) continue;
-      if (sig.suppressedByTime === true) continue;
-
-      const w = weights.get(sig.strategy) ?? 1.0;
-      if (sig.signal === 'BUY') buyWeight += w;
-      if (sig.signal === 'SELL') sellWeight += w;
-    }
-
-    log.debug({
-      threshold,
-      buyWeight: Math.round(buyWeight * 100) / 100,
-      sellWeight: Math.round(sellWeight * 100) / 100,
-    }, 'Weighted consensus threshold check');
-
-    if (buyWeight >= threshold) {
-      const buys = signals.filter(
-        s => s.signal === 'BUY' && s.meetsFloor !== false && !s.suppressedByTime
-      );
-      if (buys.length === 0) return null;
-      const best = buys.reduce((m, s) => s.confidence > m.confidence ? s : m, buys[0]);
-      return {
-        ...best,
-        weightedScore: Math.round(buyWeight * 100) / 100,
-        votingSummary: this._voteSummary(signals, weights),
-      };
-    }
-
-    if (sellWeight >= threshold) {
-      const sells = signals.filter(
-        s => s.signal === 'SELL' &&
-          s.meetsFloor !== false &&
-          !s.suppressedByTime
-      );
-      if (sells.length === 0) return null;
-      const best = sells.reduce((m, s) => s.confidence > m.confidence ? s : m, sells[0]);
-      return {
-        ...best,
-        weightedScore: Math.round(sellWeight * 100) / 100,
-        votingSummary: this._voteSummary(signals, weights),
-      };
-    }
-
-    log.debug({ threshold, buyWeight, sellWeight },
-      'Weighted consensus blocked — weights below threshold');
-    return null;
-  }
-
-  /**
-   * Async wrapper — fetches weights then calls weightedConsensusWithWeights.
-   */
-  async weightedConsensus(signals, threshold = 2.0) {
-    if (!signals || signals.length === 0) return null;
-    return this.weightedConsensusWithWeights(signals, new Map(), threshold);
-  }
+  //
+  // This method was a duplicate of AdaptiveWeightManager.weightedConsensusWithWeights().
+  // The canonical implementation lives in src/intelligence/adaptive-weights.js.
+  // EnhancedSignalPipeline should call AdaptiveWeightManager.weightedConsensusWithWeights()
+  // directly. Having two implementations risked divergence.
+  //
 
   // ─────────────────────────────────────────────────────────────────────────
   // Private helpers
