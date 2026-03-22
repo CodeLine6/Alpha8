@@ -36,6 +36,17 @@ const log = createLogger('historical-data');
  * @param {boolean} [params.forceRefresh=false] - Skip cache, fetch fresh
  * @returns {Promise<Candle[]>} Array of OHLCV candle objects
  */
+/**
+ * Returns true if the current IST time is within the Kite API availability window.
+ * Kite historical data API is only reliably available 08:30–15:45 IST.
+ * Calling it outside this window causes circuit breaker trips — skip to Yahoo fallback instead.
+ */
+function isMarketHoursIST() {
+  const now = new Date();
+  const istTime = now.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour12: false });
+  return istTime >= '08:30:00' && istTime <= '15:45:00';
+}
+
 export async function fetchHistoricalData({
   broker,
   instrumentToken,
@@ -61,14 +72,21 @@ export async function fetchHistoricalData({
     }
   }
 
-  // Fetch from broker API
+  // Fetch from broker API — only inside market hours to avoid circuit breaker trips
   let candles;
-  try {
-    log.info({ symbol, interval, from, to }, 'Fetching historical data from broker');
-    const rawData = await broker.getHistoricalData(instrumentToken, interval, from, to);
-    candles = normalizeKiteCandles(rawData);
-  } catch (brokerErr) {
-    log.warn({ err: brokerErr.message }, 'Broker historical data failed, trying Yahoo Finance');
+  if (broker && isMarketHoursIST()) {
+    try {
+      log.info({ symbol, interval, from, to }, 'Fetching historical data from broker');
+      const rawData = await broker.getHistoricalData(instrumentToken, interval, from, to);
+      candles = normalizeKiteCandles(rawData);
+    } catch (brokerErr) {
+      log.warn({ err: brokerErr.message }, 'Broker historical data failed, trying Yahoo Finance');
+      candles = await fetchYahooFinanceFallback(symbol, from, to, interval);
+    }
+  } else {
+    if (broker && !isMarketHoursIST()) {
+      log.debug({ symbol, interval }, 'Outside market hours — using Yahoo Finance (skipping broker to avoid circuit breaker)');
+    }
     candles = await fetchYahooFinanceFallback(symbol, from, to, interval);
   }
 
@@ -82,6 +100,7 @@ export async function fetchHistoricalData({
 
   return candles;
 }
+
 
 /**
  * Normalize Kite Connect historical data response to standard Candle format.

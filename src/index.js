@@ -655,12 +655,24 @@ async function main() {
 
       telegram.onCommand('/watchlist', async () => {
         try {
+          // DB-pinned = symbols saved via dashboard (settings key 'watchlist')
+          let dbPinned = [];
+          try {
+            const r = await import('./lib/db.js').then(m => m.query(
+              "SELECT value FROM settings WHERE key = 'watchlist'"
+            ));
+            dbPinned = r.rows[0] ? JSON.parse(r.rows[0].value) : [];
+          } catch { /* DB unavailable */ }
+
+          // All pinned = env-var + dashboard-pinned (deduplicated)
+          const allPinned = [...new Set([...pinnedSymbols, ...dbPinned])];
+
           const active = scout
             ? await scout.getActiveWatchlist()
-            : [...pinnedSymbols];
+            : [...allPinned];
 
-          const pinned = active.filter(s => pinnedSymbols.includes(s));
-          const dynamic = active.filter(s => !pinnedSymbols.includes(s));
+          const pinned  = active.filter(s => allPinned.includes(s));
+          const dynamic = active.filter(s => !allPinned.includes(s));
 
           let msg = `📋 <b>Active Watchlist (${active.length} symbols)</b>\n\n`;
           msg += `📌 <b>Pinned (${pinned.length}):</b> ${pinned.join(', ') || '—'}\n`;
@@ -743,6 +755,18 @@ async function main() {
     } else {
       activeSymbols = [...pinnedSymbols];
     }
+
+    // Also include DB-pinned symbols (saved via dashboard) — deduplicated.
+    // These are stored under settings key 'watchlist', separate from the
+    // scout's 'dynamic_watchlist'. Without this, dashboard-pinned symbols
+    // are displayed but never actually scanned for signals.
+    try {
+      const r = await query("SELECT value FROM settings WHERE key = 'watchlist'");
+      const dbPinned = r.rows[0] ? JSON.parse(r.rows[0].value) : [];
+      if (dbPinned.length > 0) {
+        activeSymbols = [...new Set([...activeSymbols, ...dbPinned])];
+      }
+    } catch { /* DB unavailable — continue with existing list */ }
 
     // S4 FIX: Cap watchlist size to maintain scan performance.
     // 50 symbols take ~5-7 seconds to scan. 200+ would block the event loop too long.
