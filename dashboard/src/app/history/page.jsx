@@ -162,11 +162,9 @@ export default function HistoryPage() {
                                             SHORT_ENTRY: { label: 'S ENTRY',  cls: 'badge-red'    },
                                             SHORT_COVER: { label: 'S COVER',  cls: 'badge-blue'   },
                                         };
-                                        const tc = typeConfig[trade.tradeType] ?? { label: trade.side, cls: trade.side === 'BUY' ? 'badge-green' : 'badge-red' };
+                                        const tc = typeConfig[resolveTradeType(trade)] ?? { label: trade.side, cls: trade.side === 'BUY' ? 'badge-green' : 'badge-red' };
                                         return (
-                                            <tr key={i} style={{
-                                                borderLeft: trade.tradeType?.startsWith('SHORT') ? '3px solid rgba(239,68,68,0.4)' : '3px solid rgba(34,197,94,0.4)',
-                                            }}>
+                                            <tr key={i}>
                                                 <td className="whitespace-nowrap">{trade.date}</td>
                                                 <td className="font-medium text-[var(--text-primary)]">{trade.symbol}</td>
                                                 <td><span className={`badge ${tc.cls}`}>{tc.label}</span></td>
