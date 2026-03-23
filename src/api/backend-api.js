@@ -18,6 +18,7 @@ const log = createLogger('backend-api');
  *   GET  /api/holdings                       — broker holdings + positions
  *   GET  /api/live-settings                  — all active Redis param overrides
  *   GET  /api/live-settings/schema           — full schema for all settable params
+ *   POST /api/positions/exit              — manually force-exit a specific open position
  *   POST /api/killswitch                     — engage / reset kill switch
  *   POST /api/settings/mode                  — toggle paper/live mode
  *   POST /api/settings/watchlist             — add/remove watchlist symbols
@@ -395,7 +396,10 @@ export function createApiHandler(deps) {
               : (currentPrice - entryPrice) * ctx.quantity
             : null;
           const unrealisedPnLPct = currentPrice != null
-            ? ((currentPrice - entryPrice) / entryPrice) * 100 : null;
+            ? isShort
+              ? ((entryPrice - currentPrice) / entryPrice) * 100  // short profits when price falls
+              : ((currentPrice - entryPrice) / entryPrice) * 100
+            : null;
           const holdMinutes = (Date.now() - ctx.timestamp) / 60000;
           const stopDistancePct = currentPrice != null && ctx.stopPrice
             ? ((currentPrice - ctx.stopPrice) / currentPrice) * 100 : null;
@@ -440,7 +444,9 @@ export function createApiHandler(deps) {
             currentPrice,
             stopPrice: p.stop_loss ? parseFloat(p.stop_loss) : null,
             stopLoss: p.stop_loss ? parseFloat(p.stop_loss) : null,
-            unrealisedPnL: (currentPrice - entryPrice) * p.quantity,
+            unrealisedPnL: (p.side === 'SELL'
+              ? (entryPrice - currentPrice)
+              : (currentPrice - entryPrice)) * p.quantity,
             product: p.product,
             strategy: p.strategy,
           };
@@ -1009,6 +1015,54 @@ export function createApiHandler(deps) {
     }
   }
 
+  async function handlePositionExit(req, res) {
+    if (!checkAuth(req, res)) return;
+    try {
+      const body = await parseBody(req);
+      const { symbol } = body;
+
+      if (!symbol || typeof symbol !== 'string') {
+        return json(res, { error: 'symbol is required' }, 400);
+      }
+
+      const pos = engine._filledPositions?.get(symbol.toUpperCase());
+      if (!pos) {
+        return json(res, { error: `No open position found for ${symbol}` }, 404);
+      }
+
+      // Get latest price from broker; fall back to entry price
+      let exitPrice = pos.entryPrice;
+      try {
+        if (broker?.getLTP) {
+          const ltp = await broker.getLTP([`NSE:${symbol.toUpperCase()}`]);
+          exitPrice = ltp?.[`NSE:${symbol.toUpperCase()}`]?.last_price || exitPrice;
+        }
+      } catch { /* use entry price as fallback */ }
+
+      const reason = 'MANUAL_EXIT';
+      log.warn({ symbol, exitPrice, operator: 'dashboard' }, '🔴 Manual exit triggered from dashboard');
+
+      const result = await engine.forceExit(symbol.toUpperCase(), exitPrice, reason);
+
+      if (telegram?.enabled) {
+        const pnl = result?.pnl ?? 0;
+        const pnlStr = pnl >= 0 ? `+₹${pnl.toFixed(2)}` : `-₹${Math.abs(pnl).toFixed(2)}`;
+        telegram.sendRaw(
+          `🔴 <b>Manual Exit — ${symbol.toUpperCase()}</b>\n\n` +
+          `📌 Triggered from dashboard\n` +
+          `📤 Exit price: ₹${exitPrice.toFixed(2)}\n` +
+          `💰 P&amp;L: ${pnlStr}\n` +
+          `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+        ).catch(() => {});
+      }
+
+      json(res, { success: result?.success ?? true, symbol, exitPrice, pnl: result?.pnl ?? null });
+    } catch (err) {
+      log.error({ err }, 'Error in POST /api/positions/exit');
+      json(res, { error: err.message }, 500);
+    }
+  }
+
   async function handleKillSwitchGet(req, res) {
     if (!checkAuth(req, res)) return;
     json(res, killSwitch.getStatus());
@@ -1051,6 +1105,7 @@ export function createApiHandler(deps) {
 
       if (req.method === 'POST') {
         switch (url) {
+          case '/api/positions/exit': return handlePositionExit(req, res);
           case '/api/killswitch': return handleKillSwitch(req, res);
           case '/api/settings/mode': return handleSettingsMode(req, res);
           case '/api/settings/watchlist': return handleSettingsWatchlist(req, res);

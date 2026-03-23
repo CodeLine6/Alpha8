@@ -163,6 +163,8 @@ export class SignalConsensus {
       let result;
       try {
         result = strategy.analyze(candles);
+        log.debug({ strategy: strategy.name, signal: result.signal, confidence: result.confidence, reason: result.reason },
+          `[${strategy.name}] → ${result.signal} (${result.confidence}%)`);
       } catch (err) {
         log.error({ strategy: strategy.name, err: err.message },
           'Strategy threw an error — counting as HOLD');
@@ -298,6 +300,19 @@ export class SignalConsensus {
       inOpenWindow,
       strategiesRun: this.strategies.length,
     }, reason);
+
+    // When all strategies vote HOLD, log each strategy's reason so operators
+    // can see exactly why ORB/BAVI/VWAP/Breakout are holding (range-bound,
+    // insufficient volume, no OR candles yet, weak tick imbalance, etc.).
+    if (finalSignal === SIGNAL.HOLD && votes.buy === 0 && votes.sell === 0) {
+      for (const r of results) {
+        log.info(
+          { strategy: r.strategy, signal: r.signal, confidence: r.confidence,
+            meetsFloor: r.meetsFloor, suppressedByTime: r.suppressedByTime },
+          `  ↳ [${r.strategy}] HOLD — ${r.reason}`
+        );
+      }
+    }
 
     // Fix C: isConflicted = any buy AND sell votes (not just equal counts)
     const isConflicted = this._computeConflicted(results);

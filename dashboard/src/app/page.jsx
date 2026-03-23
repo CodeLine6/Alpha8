@@ -319,16 +319,49 @@ function KillSwitchWidget({ data, loading }) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// POSITIONS TABLE
+// POSITIONS TABLE  (with manual exit)
 // ═══════════════════════════════════════════════════════════
 
 function PositionsTable({ data, loading }) {
+    const [confirm, setConfirm] = useState(null);   // { symbol, entryPrice, qty, side }
+    const [exiting, setExiting] = useState(null);   // symbol currently being exited
+    const [exitMsg, setExitMsg] = useState(null);   // { ok, text }
+
+    const handleExitClick = (pos) => {
+        setExitMsg(null);
+        setConfirm({ symbol: pos.symbol, entryPrice: pos.entryPrice, qty: pos.quantity, side: pos.side });
+    };
+
+    const handleExitConfirm = async () => {
+        if (!confirm) return;
+        const sym = confirm.symbol;
+        setExiting(sym);
+        setConfirm(null);
+        try {
+            const apiKey = process.env.NEXT_PUBLIC_API_KEY || '';
+            const res = await fetch(`${API_BASE}/api/positions/exit`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    ...(apiKey ? { 'X-Api-Key': apiKey } : {}),
+                },
+                body: JSON.stringify({ symbol: sym }),
+            });
+            const result = await res.json();
+            if (!res.ok) throw new Error(result.error || 'Exit failed');
+            const pnlSign = (result.pnl ?? 0) >= 0 ? '+' : '';
+            setExitMsg({ ok: true, text: `✅ ${sym} exited @ ₹${result.exitPrice?.toFixed(2)} · P&L ${pnlSign}₹${(result.pnl ?? 0).toFixed(2)}` });
+        } catch (err) {
+            setExitMsg({ ok: false, text: `❌ ${err.message}` });
+        } finally {
+            setExiting(null);
+        }
+    };
+
     if (loading) {
         return (
             <div className="card">
-                <div className="text-xs text-[var(--text-muted)] uppercase tracking-wide mb-3">
-                    Open Positions
-                </div>
+                <div className="text-xs text-[var(--text-muted)] uppercase tracking-wide mb-3">Open Positions</div>
                 {[1, 2, 3].map((i) => <SkeletonRow key={i} />)}
             </div>
         );
@@ -337,60 +370,98 @@ function PositionsTable({ data, loading }) {
     const positions = data?.positions || [];
 
     return (
-        <div className="card overflow-hidden">
-            <div className="flex items-center justify-between mb-3 px-1">
-                <div className="text-xs text-[var(--text-muted)] uppercase tracking-wide">
-                    Open Positions
-                </div>
-                <span className="badge badge-blue">{positions.length} active</span>
-            </div>
-
-            {positions.length === 0 ? (
-                <div className="text-center py-8 text-[var(--text-muted)]">
-                    <p className="text-3xl mb-2">📭</p>
-                    <p className="text-sm">No open positions</p>
-                </div>
-            ) : (
-                <div className="overflow-x-auto">
-                    <table className="data-table">
-                        <thead>
-                            <tr>
-                                <th>Symbol</th>
-                                <th>Side</th>
-                                <th>Qty</th>
-                                <th>Avg Price</th>
-                                <th>Entry Price</th>
-                                <th>Current</th>
-                                <th>P&L</th>
-                                <th>Stop Loss</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {positions.map((pos, i) => {
-                                const unrealized = pos.unrealisedPnL ?? 0;
-                                return (
-                                    <tr key={i}>
-                                        <td className="font-medium text-[var(--text-primary)]">{pos.symbol}</td>
-                                        <td>
-                                            <span className={`badge ${pos.side === 'BUY' ? 'badge-green' : 'badge-red'}`}>
-                                                {pos.side}
-                                            </span>
-                                        </td>
-                                        <td>{pos.quantity}</td>
-                                        <td>{formatINR(pos.avgPrice)}</td>
-                                        <td>{formatINR(pos.entryPrice)}</td>
-                                        <td>{formatINR(pos.currentPrice)}</td>
-                                        <td className={`font-medium ${pnlColor(unrealized)}`}>
-                                            {formatINR(unrealized)}
-                                        </td>
-                                        <td className="text-yellow-400">{pos.stopLoss ? formatINR(pos.stopLoss) : '—'}</td>
-                                    </tr>
-                                );
-                            })}
-                        </tbody>
-                    </table>
+        <>
+            {/* ── Confirmation modal ───────────────────────────── */}
+            {confirm && (
+                <div
+                    onClick={() => setConfirm(null)}
+                    style={{ position: 'fixed', inset: 0, zIndex: 50, background: 'rgba(0,0,0,0.65)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                >
+                    <div className="card" onClick={(e) => e.stopPropagation()}
+                        style={{ width: '22rem', padding: '1.75rem', boxShadow: '0 8px 40px rgba(0,0,0,0.5)' }}>
+                        <div style={{ fontSize: '1.1rem', fontWeight: 700, marginBottom: '0.75rem' }}>🔴 Exit position?</div>
+                        <div style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', marginBottom: '1.25rem', lineHeight: 1.6 }}>
+                            <strong>{confirm.symbol}</strong>&nbsp;
+                            <span className={`badge ${confirm.side === 'BUY' ? 'badge-green' : 'badge-red'}`}>{confirm.side}</span><br />
+                            Qty: {confirm.qty} · Entry: ₹{confirm.entryPrice?.toFixed(2)}<br />
+                            <span style={{ color: 'var(--text-muted)', fontSize: '0.78rem' }}>Will exit at current market price via broker.</span>
+                        </div>
+                        <div style={{ display: 'flex', gap: '0.75rem' }}>
+                            <button id={`exit-confirm-${confirm.symbol}`} className="btn btn-danger" style={{ flex: 1 }} onClick={handleExitConfirm}>Exit Now</button>
+                            <button className="btn btn-secondary" style={{ flex: 1 }} onClick={() => setConfirm(null)}>Cancel</button>
+                        </div>
+                    </div>
                 </div>
             )}
-        </div>
+
+            <div className="card overflow-hidden">
+                <div className="flex items-center justify-between mb-3 px-1">
+                    <div className="text-xs text-[var(--text-muted)] uppercase tracking-wide">Open Positions</div>
+                    <span className="badge badge-blue">{positions.length} active</span>
+                </div>
+
+                {exitMsg && (
+                    <div style={{
+                        margin: '0 0 1rem', padding: '0.6rem 1rem', borderRadius: '0.5rem', fontSize: '0.82rem',
+                        background: exitMsg.ok ? 'rgba(34,197,94,0.1)' : 'rgba(239,68,68,0.1)',
+                        color: exitMsg.ok ? '#4ade80' : '#f87171',
+                        border: `1px solid ${exitMsg.ok ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'}`,
+                    }}>{exitMsg.text}</div>
+                )}
+
+                {positions.length === 0 ? (
+                    <div className="text-center py-8 text-[var(--text-muted)]">
+                        <p className="text-3xl mb-2">📭</p>
+                        <p className="text-sm">No open positions</p>
+                    </div>
+                ) : (
+                    <div className="overflow-x-auto">
+                        <table className="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Symbol</th><th>Side</th><th>Qty</th><th>Avg Price</th>
+                                    <th>Entry Price</th><th>Current</th><th>P&L</th><th>Stop Loss</th><th></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {positions.map((pos, i) => {
+                                    const unrealized = pos.unrealisedPnL ?? 0;
+                                    const isExiting = exiting === pos.symbol;
+                                    return (
+                                        <tr key={i}>
+                                            <td className="font-medium text-[var(--text-primary)]">{pos.symbol}</td>
+                                            <td><span className={`badge ${pos.side === 'BUY' ? 'badge-green' : 'badge-red'}`}>{pos.side}</span></td>
+                                            <td>{pos.quantity}</td>
+                                            <td>{formatINR(pos.avgPrice)}</td>
+                                            <td>{formatINR(pos.entryPrice)}</td>
+                                            <td>{formatINR(pos.currentPrice)}</td>
+                                            <td className={`font-medium ${pnlColor(unrealized)}`}>{formatINR(unrealized)}</td>
+                                            <td className="text-yellow-400">{pos.stopLoss ? formatINR(pos.stopLoss) : '—'}</td>
+                                            <td>
+                                                <button
+                                                    id={`exit-btn-${pos.symbol}`}
+                                                    onClick={() => handleExitClick(pos)}
+                                                    disabled={isExiting}
+                                                    style={{
+                                                        padding: '0.3rem 0.75rem', fontSize: '0.75rem', fontWeight: 600,
+                                                        borderRadius: '0.375rem', border: '1px solid rgba(239,68,68,0.5)',
+                                                        background: isExiting ? 'rgba(239,68,68,0.05)' : 'rgba(239,68,68,0.1)',
+                                                        color: '#f87171', cursor: isExiting ? 'not-allowed' : 'pointer', transition: 'background 0.15s', whiteSpace: 'nowrap',
+                                                    }}
+                                                    onMouseEnter={(e) => { if (!isExiting) e.currentTarget.style.background = 'rgba(239,68,68,0.25)'; }}
+                                                    onMouseLeave={(e) => { if (!isExiting) e.currentTarget.style.background = 'rgba(239,68,68,0.1)'; }}
+                                                >
+                                                    {isExiting ? '⏳ Exiting…' : '🔴 Exit'}
+                                                </button>
+                                            </td>
+                                        </tr>
+                                    );
+                                })}
+                            </tbody>
+                        </table>
+                    </div>
+                )}
+            </div>
+        </>
     );
 }

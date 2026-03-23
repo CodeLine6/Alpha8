@@ -1017,6 +1017,7 @@ export class ExecutionEngine {
               // SHORT profit target: BELOW entry
               profitTargetPrice: order.price * (1 - targetPct / 100),
               profitTargetMode: shortProfitTargetMode,  // Fix Bug 13
+              riskRewardRatio: this._config?.RISK_REWARD_RATIO ?? 2.0,  // FIX: was undefined → 'undefined× R/R' in Telegram
               partialExitEnabled: this._config?.PARTIAL_EXIT_ENABLED ?? true,
               partialExitDone: false,
               partialExitQty: 0,

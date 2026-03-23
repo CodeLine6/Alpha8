@@ -165,6 +165,7 @@ export class PositionManager {
         const levels = computeExitLevels({
             entryPrice: posCtx.entryPrice ?? posCtx.price,
             quantity: posCtx.quantity,
+            direction: posCtx.direction ?? (posCtx.isShort ? 'SELL' : 'BUY'),   // FIX: was missing → defaulted to 'BUY' for all positions, causing inverted stop/target for shorts
             openingStrategy: posCtx.openingStrategy || (posCtx.strategies?.[0] ?? 'UNKNOWN'),
             allStrategies: posCtx.strategies || [],
             regime,
@@ -230,21 +231,32 @@ export class PositionManager {
             posCtx.quantity -= result.qty;
             posCtx.partialExitDone = true;
 
-            // Break-even protection: trail stop can never go below entry after partial exit
-            if (posCtx.trailStopPrice < posCtx.entryPrice) {
+            // Break-even protection: after partial exit, lock trail stop at entry (direction-aware)
+            // LONG:  trail is below price; break-even = trail can never go BELOW entry
+            // SHORT: trail is above price; break-even = trail can never go ABOVE entry
+            const isShortPos = posCtx.isShort ?? posCtx.direction === 'SELL';
+            const trailAtBreakEven = isShortPos
+                ? posCtx.trailStopPrice > posCtx.entryPrice   // SHORT: trail above entry = beyond break-even
+                : posCtx.trailStopPrice < posCtx.entryPrice;  // LONG:  trail below entry = beyond break-even
+            if (trailAtBreakEven) {
                 posCtx.trailStopPrice = posCtx.entryPrice;
-                log.info({ symbol }, 'Trail stop moved to break-even after partial exit');
+                log.info({ symbol, isShort: isShortPos }, 'Trail stop moved to break-even after partial exit');
             }
 
             if (this.engine.telegram?.enabled) {
-                const pnl = (currentPrice - posCtx.entryPrice) * result.qty;
-                const pnlStr = `+₹${pnl.toFixed(2)}`;
+                const grossPnl = isShortPos
+                    ? (posCtx.entryPrice - currentPrice) * result.qty   // SHORT profit: sold high, bought low
+                    : (currentPrice - posCtx.entryPrice) * result.qty;  // LONG profit:  bought low, sold high
+                const pnlStr = grossPnl >= 0 ? `+₹${grossPnl.toFixed(2)}` : `-₹${Math.abs(grossPnl).toFixed(2)}`;
+                const trailLine = trailAtBreakEven
+                    ? `🎯 Trail stop → break-even: ₹${posCtx.entryPrice.toFixed(2)}\n`
+                    : `🎯 Trail stop: ₹${posCtx.trailStopPrice.toFixed(2)}\n`;
                 this.engine.telegram.sendRaw(
                     `📊 <b>Partial Exit — ${symbol}</b>\n\n` +
                     `📌 Sold ${result.qty} shares at ₹${currentPrice.toFixed(2)}\n` +
                     `💰 Locked in: ${pnlStr} (+${result.meta?.gainPct}%)\n` +
                     `📦 Remaining: ${posCtx.quantity} shares still open\n` +
-                    `🎯 Trail stop → break-even: ₹${posCtx.entryPrice.toFixed(2)}\n` +
+                    trailLine +
                     `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
                 ).catch(() => { });
             }
@@ -260,33 +272,46 @@ export class PositionManager {
     async _notifyExit(symbol, posCtx, exitPrice, reason, meta, exitResult) {
         if (!this.engine.telegram?.enabled) return;
 
-        const pnl = exitResult?.pnl ?? (exitPrice - posCtx.entryPrice) * posCtx.quantity;
+        const isShort = posCtx.isShort ?? posCtx.direction === 'SELL';
+        // For LONG:  profit = (exit - entry) × qty
+        // For SHORT: profit = (entry - exit) × qty  ← was using long formula before
+        const grossFallback = isShort
+            ? (posCtx.entryPrice - exitPrice) * posCtx.quantity
+            : (exitPrice - posCtx.entryPrice) * posCtx.quantity;
+        const pnl = exitResult?.pnl ?? grossFallback;
+
+        // pnlPct sign must also match direction
         const pnlPct = posCtx.entryPrice > 0
-            ? ((exitPrice - posCtx.entryPrice) / posCtx.entryPrice * 100).toFixed(2)
+            ? (isShort
+                ? ((posCtx.entryPrice - exitPrice) / posCtx.entryPrice * 100)
+                : ((exitPrice - posCtx.entryPrice) / posCtx.entryPrice * 100)
+              ).toFixed(2)
             : '0.00';
 
         const emoji = pnl >= 0 ? '✅' : '🛑';
-        // P&amp;L correctly escaped for Telegram HTML mode
-        const pnlStr = pnl >= 0
-            ? `+₹${pnl.toFixed(2)} (+${pnlPct}%)`
-            : `-₹${Math.abs(pnl).toFixed(2)} (${pnlPct}%)`;
+        const pnlSign = pnl >= 0 ? '+' : '-';
+        const pnlStr = `${pnlSign}₹${Math.abs(pnl).toFixed(2)} (${pnl >= 0 ? '+' : ''}${pnlPct}%)`;
 
         const reasonDetails = {
             STOP_LOSS: `🛑 Hard stop hit at ₹${meta?.trigger?.toFixed(2)}`,
-            PROFIT_TARGET: `🎯 Target hit (${meta?.mode === 'FIXED_PCT' ? 'fixed %' : `${posCtx.riskRewardRatio}× R/R`})`,
+            PROFIT_TARGET: `🎯 Target hit (${meta?.mode === 'FIXED_PCT' ? 'fixed %' : `${posCtx.riskRewardRatio ?? '?'}× R/R`})`,
             TRAILING_STOP: `📉 Trail stop — high was ₹${meta?.highWaterMark?.toFixed(2)}, locked ${meta?.lockedPnlPct ?? '?'}%`,
             SIGNAL_REVERSAL: `🔄 ${meta?.strategy} fired ${meta?.signal} — reversal detected`,
             TIME_EXIT: `⏰ Max hold time (${meta?.holdMinutes}min) — P&amp;L was ${meta?.pnlPct}%`,
         }[reason] ?? reason;
+
+        const charges = exitResult?.costPaid ?? 0;
+        const netPnl = pnl - charges;
+        const netPnlStr = `${netPnl >= 0 ? '+' : '-'}₹${Math.abs(netPnl).toFixed(2)} (${netPnl >= 0 ? '+' : ''}${posCtx.entryPrice > 0 ? (isShort ? ((posCtx.entryPrice - exitPrice) / posCtx.entryPrice * 100) : ((exitPrice - posCtx.entryPrice) / posCtx.entryPrice * 100)).toFixed(2) : '0.00'}%)`;
 
         await this.engine.telegram.sendRaw(
             `${emoji} <b>Position Exit — ${symbol}</b>\n\n` +
             `${reasonDetails}\n\n` +
             `📥 Entry:  ₹${posCtx.entryPrice.toFixed(2)}\n` +
             `📤 Exit:   ₹${exitPrice.toFixed(2)}\n` +
-            `💰 P&amp;L:   ${pnlStr}\n` +
-            `💰 Net P&amp;L: ${pnlStr}\n` +
-            `💸 Charges:  ₹${(exitResult?.costPaid || 0).toFixed(2)}\n` +
+            `💰 P&amp;L:    ${pnlStr}\n` +
+            `💰 Net P&amp;L: ${netPnlStr}\n` +
+            `💸 Charges:  ₹${charges.toFixed(2)}\n` +
             `📦 Qty:    ${posCtx.quantity}\n` +
             `🏦 Strategy: ${posCtx.openingStrategy || 'unknown'}\n` +
             `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
