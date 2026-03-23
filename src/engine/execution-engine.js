@@ -852,6 +852,8 @@ export class ExecutionEngine {
             const targetPct = this._config?.PROFIT_TARGET_PCT ?? 1.8;
 
           const posCtx = {
+            direction: 'BUY',   // FIX: was missing — API falls back correctly but explicit is safer
+            isShort: false,     // FIX: was missing — computeExitLevels needs this
             strategies,
             // Fix 4: openingStrategy is already the conviction-aware strategy
             // because _lastSignalStrategies was set correctly in processSignal()
@@ -882,14 +884,11 @@ export class ExecutionEngine {
               const rawCandles = this._fetchCandles
                 ? await this._fetchCandles(order.symbol, 20).catch(() => [])
                 : [];
-              // Fix BUG-08: initPosition expects candle objects, not separate arrays
-              const candles = rawCandles.map(c => ({
-                close: c.close,
-                high:  c.high  ?? c.close,
-                low:   c.low   ?? c.close,
-                open:  c.open  ?? c.close,
-              }));
-              await this.positionManager.initPosition(order.symbol, posCtx, candles);
+              // Fix: initPosition expects separate close/high/low arrays, not candle objects
+              const recentCloses = rawCandles.map(c => c.close);
+              const recentHighs  = rawCandles.map(c => c.high  ?? c.close);
+              const recentLows   = rawCandles.map(c => c.low   ?? c.close);
+              await this.positionManager.initPosition(order.symbol, posCtx, recentCloses, recentHighs, recentLows);
             } catch (err) {
               log.warn({ symbol: order.symbol, err: err.message },
                 'initPosition failed — using config-based fallback levels');
@@ -1042,14 +1041,11 @@ export class ExecutionEngine {
                 const rawCandles = this._fetchCandles
                   ? await this._fetchCandles(order.symbol, 20).catch(() => [])
                   : [];
-                // Fix BUG-08: initPosition expects candle objects, not separate arrays
-                const candles = rawCandles.map(c => ({
-                  close: c.close,
-                  high:  c.high  ?? c.close,
-                  low:   c.low   ?? c.close,
-                  open:  c.open  ?? c.close,
-                }));
-                await this.positionManager.initPosition(order.symbol, shortCtx, candles);
+                // Fix: initPosition expects separate close/high/low arrays, not candle objects
+                const recentCloses = rawCandles.map(c => c.close);
+                const recentHighs  = rawCandles.map(c => c.high  ?? c.close);
+                const recentLows   = rawCandles.map(c => c.low   ?? c.close);
+                await this.positionManager.initPosition(order.symbol, shortCtx, recentCloses, recentHighs, recentLows);
               } catch (err) {
                 log.warn({ symbol: order.symbol, err: err.message },
                   'initPosition failed for short — using config-based levels');
