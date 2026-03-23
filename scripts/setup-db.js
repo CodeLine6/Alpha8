@@ -189,6 +189,30 @@ const MIGRATIONS = [
   `ALTER TABLE trades ADD COLUMN IF NOT EXISTS capital_deployed NUMERIC(14,2);`,
   `ALTER TABLE trades ADD COLUMN IF NOT EXISTS trade_roi NUMERIC(8,4);`,
 
+  // Bug #1: open_positions table
+  `CREATE TABLE IF NOT EXISTS open_positions (
+    id               SERIAL PRIMARY KEY,
+    symbol           VARCHAR(20)   NOT NULL UNIQUE,
+    direction        VARCHAR(4)    NOT NULL CHECK (direction IN ('BUY', 'SELL')),
+    is_short         BOOLEAN       NOT NULL DEFAULT false,
+    quantity         INTEGER       NOT NULL,
+    entry_price      NUMERIC(12,2) NOT NULL,
+    stop_price       NUMERIC(12,2),
+    trail_stop_price NUMERIC(12,2),
+    profit_target    NUMERIC(12,2),
+    high_water_mark  NUMERIC(12,2),
+    opening_strategy TEXT,
+    strategies       TEXT[],
+    entry_order_id   VARCHAR(100),
+    paper_mode       BOOLEAN       NOT NULL DEFAULT true,
+    opened_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_open_positions_symbol ON open_positions(symbol);`,
+  `CREATE INDEX IF NOT EXISTS idx_open_positions_opened ON open_positions(opened_at);`,
+
+  // ensure legacy deployments without this table get it created
+  // (already handled by IF NOT EXISTS above)
 ];
 
 // ─── Seed data ──────────────────────────────────────────────────────────────

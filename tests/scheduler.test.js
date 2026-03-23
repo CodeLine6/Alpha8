@@ -57,7 +57,9 @@ function createScheduler(overrides = {}) {
     retryDelayMs: 10,
   });
 
-  // Mock stubs for ORB/BAVI integration deps
+  // Mock engine methods that do heavy DB/Redis lifting (Fix for Bug #7 additions)
+  engine.hydratePositions = jest.fn().mockResolvedValue({ restored: 0, symbols: [] });
+  engine.initialize = jest.fn().mockResolvedValue({ ready: true });
   const baviAdapter   = { setSymbol: jest.fn(), analyze: jest.fn(() => ({ signal: 'HOLD', confidence: 0, reason: 'mock', strategy: 'BAVI', timestamp: new Date().toISOString() })) };
   const rsiStrategy   = { analyze: jest.fn(() => ({ signal: 'HOLD', confidence: 0, reason: 'mock', strategy: 'RSI', timestamp: new Date().toISOString() })) };
   const tickClassifier = { resetAll: jest.fn(), classifyTick: jest.fn() };

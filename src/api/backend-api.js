@@ -432,24 +432,24 @@ export function createApiHandler(deps) {
 
       let positions = [];
       try {
-        const result = await query('SELECT * FROM positions ORDER BY opened_at DESC');
+        const result = await query('SELECT * FROM open_positions ORDER BY opened_at DESC');
         positions = result.rows.map((p) => {
-          const entryPrice = parseFloat(p.avg_price);
-          const currentPrice = parseFloat(p.current_price || p.avg_price);
+          const entryPrice = parseFloat(p.entry_price);
+          const currentPrice = entryPrice;
           return {
             symbol: p.symbol,
-            side: p.side,
+            side: p.direction,
             quantity: p.quantity,
             avgPrice: entryPrice,
             entryPrice,
             currentPrice,
-            stopPrice: p.stop_loss ? parseFloat(p.stop_loss) : null,
-            stopLoss: p.stop_loss ? parseFloat(p.stop_loss) : null,
-            unrealisedPnL: (p.side === 'SELL'
+            stopPrice: p.stop_price ? parseFloat(p.stop_price) : null,
+            stopLoss: p.stop_price ? parseFloat(p.stop_price) : null,
+            unrealisedPnL: (p.direction === 'SELL'
               ? (entryPrice - currentPrice)
               : (currentPrice - entryPrice)) * p.quantity,
-            product: p.product,
-            strategy: p.strategy,
+            product: 'MIS',
+            strategy: p.opening_strategy,
           };
         });
       } catch {
@@ -586,9 +586,13 @@ export function createApiHandler(deps) {
         const pnl = parseFloat(t.pnl) || 0;
         let tradeType;
         if (t.side === 'BUY') {
-          tradeType = hasOpeningStrategies ? 'LONG_ENTRY' : 'SHORT_COVER';
+          if (hasOpeningStrategies) tradeType = 'LONG_ENTRY';
+          else if (Math.abs(pnl) < 0.01) tradeType = 'LONG_ENTRY'; // Legacy fallback
+          else tradeType = 'SHORT_COVER';
         } else {
-          tradeType = hasOpeningStrategies ? 'SHORT_ENTRY' : 'LONG_EXIT';
+          if (hasOpeningStrategies) tradeType = 'SHORT_ENTRY';
+          else if (Math.abs(pnl) < 0.01) tradeType = 'SHORT_ENTRY'; // Legacy fallback
+          else tradeType = 'LONG_EXIT';
         }
         return {
           date:            new Date(t.created_at).toLocaleDateString('en-IN'),

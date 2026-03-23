@@ -612,6 +612,7 @@ export class ExecutionEngine {
         );
 
         this._filledPositions.delete(symbol);
+        await this._clearOpenPosition(symbol);
         this.riskManager.removePosition();
         await this.riskManager.recordTradePnL(pnl, symbol);
 
@@ -853,6 +854,7 @@ export class ExecutionEngine {
             // strategies that opened the short get credited for the outcome.
             this.recordPositionOutcome(order.symbol, pnl, existingPos.strategies).catch(() => {});
             this._filledPositions.delete(order.symbol);
+            this._clearOpenPosition(order.symbol).catch(() => {});
             this.riskManager.removePosition();
 
             // ROI: return deployed capital back to pool on cover
@@ -918,6 +920,7 @@ export class ExecutionEngine {
           };
 
           this._filledPositions.set(order.symbol, posCtx);
+          this._persistOpenPosition(order.symbol, posCtx, order.id).catch(() => {});
 
           if (this.positionManager) {
             try {
@@ -985,6 +988,7 @@ export class ExecutionEngine {
               log.warn({ symbol: order.symbol, err: err.message }, 'Position outcome recording failed')
             );
             this._filledPositions.delete(order.symbol);
+            this._clearOpenPosition(order.symbol).catch(() => {});
             this.riskManager.removePosition();
 
             // ROI: return deployed capital back to the pool (optional — method may not exist)
@@ -1065,6 +1069,7 @@ export class ExecutionEngine {
             };
 
             this._filledPositions.set(order.symbol, shortCtx);
+            this._persistOpenPosition(order.symbol, shortCtx, order.id).catch(() => {});
             this.riskManager.addPosition();
 
             // Fix BUG-19: store openOrderId for short entry
@@ -1376,7 +1381,8 @@ export class ExecutionEngine {
     try {
       // Store opening strategies for both long entries (BUY) and short entries (SELL isShortEntry)
       const isShortEntry = order.isShortEntry ?? false;
-      const openingStrategies = (order.side === 'BUY' || isShortEntry)
+      const isExitOrder = order.isExitOrder ?? false;
+      const openingStrategies = (!isExitOrder && (order.side === 'BUY' || isShortEntry))
         ? JSON.stringify(this._lastSignalStrategies.get(order.symbol) || [])
         : null;
 
@@ -1547,6 +1553,91 @@ VALUES($1, $2, $3, $4, $5, $6, $7, NOW()) RETURNING id`,
       log.info({ symbol, buyStrategies, sellStrategies }, 'Conflict alert sent via Telegram');
     } catch (err) {
       log.warn({ symbol, err: err.message }, 'Conflict alert failed — continuing');
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════
+  // OPEN POSITIONS DB HELPER METHODS
+  // ═══════════════════════════════════════════════════════
+
+  /**
+   * Persist a new open position to DB (called on BUY fill).
+   * This is what allows hydratePositions() to reconstruct state after restart.
+   */
+  async _persistOpenPosition(symbol, posCtx, orderId) {
+    try {
+      await query(
+        `INSERT INTO open_positions 
+           (symbol, direction, is_short, quantity, entry_price, stop_price,
+            trail_stop_price, profit_target, high_water_mark, opening_strategy,
+            strategies, entry_order_id, paper_mode, opened_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW(),NOW())
+         ON CONFLICT (symbol) DO UPDATE SET
+           direction       = EXCLUDED.direction,
+           is_short        = EXCLUDED.is_short,
+           quantity        = EXCLUDED.quantity,
+           entry_price     = EXCLUDED.entry_price,
+           stop_price      = EXCLUDED.stop_price,
+           trail_stop_price= EXCLUDED.trail_stop_price,
+           profit_target   = EXCLUDED.profit_target,
+           high_water_mark = EXCLUDED.high_water_mark,
+           opening_strategy= EXCLUDED.opening_strategy,
+           strategies      = EXCLUDED.strategies,
+           entry_order_id  = EXCLUDED.entry_order_id,
+           updated_at      = NOW()`,
+        [
+          symbol,
+          posCtx.direction ?? 'BUY',
+          posCtx.isShort ?? false,
+          posCtx.quantity,
+          posCtx.entryPrice ?? posCtx.price,
+          posCtx.stopPrice ?? null,
+          posCtx.trailStopPrice ?? null,
+          posCtx.profitTargetPrice ?? null,
+          posCtx.highWaterMark ?? posCtx.entryPrice ?? posCtx.price,
+          posCtx.openingStrategy ?? null,
+          posCtx.strategies ?? [],
+          orderId ?? null,
+          this.paperMode,
+        ]
+      );
+    } catch (err) {
+      log.error({ symbol, err: err.message }, '_persistOpenPosition failed');
+    }
+  }
+
+  /**
+   * Remove position from DB (called on SELL fill / forceExit / square-off).
+   */
+  async _clearOpenPosition(symbol) {
+    try {
+      await query('DELETE FROM open_positions WHERE symbol = $1', [symbol]);
+    } catch (err) {
+      log.error({ symbol, err: err.message }, '_clearOpenPosition failed');
+    }
+  }
+
+  /**
+   * Update stop/trail levels in DB (called by positionManager after trail ratchets).
+   */
+  async _updateOpenPositionLevels(symbol, posCtx) {
+    try {
+      await query(
+        `UPDATE open_positions SET
+           stop_price       = $2,
+           trail_stop_price = $3,
+           high_water_mark  = $4,
+           updated_at       = NOW()
+         WHERE symbol = $1`,
+        [
+          symbol,
+          posCtx.stopPrice ?? null,
+          posCtx.trailStopPrice ?? null,
+          posCtx.highWaterMark ?? null,
+        ]
+      );
+    } catch (err) {
+      log.error({ symbol, err: err.message }, '_updateOpenPositionLevels failed');
     }
   }
 }

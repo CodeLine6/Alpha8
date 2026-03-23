@@ -78,7 +78,18 @@ export class MarketScheduler {
 
     this.getWatchlist        = deps.getWatchlist        || (async () => []);
     this.getNiftyCandles     = deps.getNiftyCandles     || (async () => []);
-    this.getOpenPositions    = deps.getOpenPositions    || (async () => []);
+    this.getOpenPositions = deps.getOpenPositions || (async () => {
+      if (!this.engine?._filledPositions) return [];
+      return [...this.engine._filledPositions.entries()].map(([symbol, ctx]) => ({
+        symbol,
+        tradingsymbol: symbol,
+        quantity:  ctx.quantity,
+        netQuantity: ctx.isShort ? -(ctx.quantity) : ctx.quantity,
+        average_price: ctx.entryPrice ?? ctx.price,
+        product: 'MIS',
+        side: ctx.direction ?? 'BUY',
+      }));
+    });
     this.sendReport          = deps.sendReport          || (async () => { });
     this.healthCheck         = deps.healthCheck         || (async () => ({ broker: true, redis: true, db: true }));
 
@@ -317,6 +328,37 @@ export class MarketScheduler {
       log.info('Rolling tick buffer reset for new session');
     }
     this._scanning = true;
+
+    // FIX BUG #7: Hydrate positions BEFORE starting scanning
+    if (this.engine?.hydratePositions) {
+      const { restored, symbols } = await this.engine.hydratePositions();
+      
+      if (restored > 0) {
+        // Pre-populate _recentlyExited so first scan doesn't try to 
+        // re-enter positions that were just restored
+        // They will be cleared at the TOP of the second scan cycle
+        if (typeof this.engine.clearRecentExits === 'function') {
+          // Don't clear yet — let restored positions be excluded for 1 scan cycle
+          // so position manager can assess them first
+          for (const sym of symbols) {
+            this.engine._recentlyExited?.add(sym);
+          }
+        }
+        
+        log.warn({ restored, symbols },
+          `Market open: hydrated ${restored} position(s) from DB after restart`
+        );
+      }
+    }
+    
+    // FIX BUG #7 (also): Clear any stale _recentlyExited from previous day
+    // Only clear if engine was freshly initialized (not mid-day reconnect)
+    // This is safe because hydratePositions already re-added restored symbols above
+    if (this.engine?.clearRecentExits && 
+        this.engine._filledPositions?.size === 0) {
+      this.engine.clearRecentExits();
+    }
+
     if (this.engine.reconcilePositions) {
       this.engine.reconcilePositions(this.broker).catch(() => { });
     }

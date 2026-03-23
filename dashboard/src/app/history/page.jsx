@@ -7,6 +7,7 @@ import { formatINR, pnlColor, API_BASE } from '@/lib/utils';
 export default function HistoryPage() {
     const [trades, setTrades] = useState([]);
     const [loading, setLoading] = useState(true);
+    const [activeTab, setActiveTab] = useState('ALL');
     const [filters, setFilters] = useState({
         startDate: '',
         endDate: '',
@@ -48,19 +49,17 @@ export default function HistoryPage() {
         URL.revokeObjectURL(url);
     };
 
-    // Resolve trade type — uses API field when available (after bot restart),
-    // falls back to side+pnl heuristic for old rows / pre-restart API.
-    const resolveTradeType = (t) => {
-        if (t.tradeType) return t.tradeType;
-        if (t.side === 'BUY')  return Math.abs(t.pnl) < 0.01 ? 'LONG_ENTRY'  : 'SHORT_COVER';
-        if (t.side === 'SELL') return Math.abs(t.pnl) < 0.01 ? 'SHORT_ENTRY' : 'LONG_EXIT';
-        return null;
-    };
+    // Trade type arrives directly from the backend /api/trades
+    const resolveTradeType = (t) => t.tradeType || null;
 
-    // Client-side filter by tradeType (derived field, not stored in DB)
-    const visibleTrades = filters.tradeType
-        ? trades.filter(t => resolveTradeType(t) === filters.tradeType)
-        : trades;
+    // Client-side filter by tradeType and activeTab
+    const visibleTrades = trades.filter(t => {
+        const type = resolveTradeType(t);
+        if (filters.tradeType && type !== filters.tradeType) return false;
+        if (activeTab === 'LONG' && type !== 'LONG_ENTRY' && type !== 'LONG_EXIT') return false;
+        if (activeTab === 'SHORT' && type !== 'SHORT_ENTRY' && type !== 'SHORT_COVER') return false;
+        return true;
+    });
 
     return (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
@@ -71,6 +70,58 @@ export default function HistoryPage() {
                 </div>
                 <button className="btn btn-primary" onClick={exportCSV} disabled={!trades.length}>
                     📥 Export CSV
+                </button>
+            </div>
+
+            {/* Tabs */}
+            <div style={{ display: 'flex', gap: '2rem', borderBottom: '1px solid var(--border-color)', marginBottom: '1.5rem', padding: '0 0.5rem' }}>
+                <button 
+                    style={{ 
+                        paddingBottom: '0.75rem', 
+                        fontSize: '0.9rem', 
+                        fontWeight: '500', 
+                        borderBottom: `2px solid ${activeTab === 'ALL' ? '#3b82f6' : 'transparent'}`,
+                        color: activeTab === 'ALL' ? '#3b82f6' : 'var(--text-muted)',
+                        cursor: 'pointer',
+                        background: 'transparent',
+                        borderTop: 'none', borderLeft: 'none', borderRight: 'none',
+                        transition: 'all 0.2s'
+                    }}
+                    onClick={() => setActiveTab('ALL')}
+                >
+                    All Orders
+                </button>
+                <button 
+                    style={{ 
+                        paddingBottom: '0.75rem', 
+                        fontSize: '0.9rem', 
+                        fontWeight: '500', 
+                        borderBottom: `2px solid ${activeTab === 'LONG' ? '#3b82f6' : 'transparent'}`,
+                        color: activeTab === 'LONG' ? '#3b82f6' : 'var(--text-muted)',
+                        cursor: 'pointer',
+                        background: 'transparent',
+                        borderTop: 'none', borderLeft: 'none', borderRight: 'none',
+                        transition: 'all 0.2s'
+                    }}
+                    onClick={() => setActiveTab('LONG')}
+                >
+                    Long Orders
+                </button>
+                <button 
+                    style={{ 
+                        paddingBottom: '0.75rem', 
+                        fontSize: '0.9rem', 
+                        fontWeight: '500', 
+                        borderBottom: `2px solid ${activeTab === 'SHORT' ? '#3b82f6' : 'transparent'}`,
+                        color: activeTab === 'SHORT' ? '#3b82f6' : 'var(--text-muted)',
+                        cursor: 'pointer',
+                        background: 'transparent',
+                        borderTop: 'none', borderLeft: 'none', borderRight: 'none',
+                        transition: 'all 0.2s'
+                    }}
+                    onClick={() => setActiveTab('SHORT')}
+                >
+                    Short Orders
                 </button>
             </div>
 
