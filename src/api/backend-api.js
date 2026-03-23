@@ -577,19 +577,34 @@ export function createApiHandler(deps) {
         values
       );
 
-      const trades = result.rows.map((t) => ({
-        date: new Date(t.created_at).toLocaleDateString('en-IN'),
-        symbol: t.symbol,
-        side: t.side,
-        quantity: t.quantity,
-        price: parseFloat(t.price),
-        pnl: parseFloat(t.pnl),
-        strategy: t.strategy,
-        status: t.status,
-        orderId: t.order_id,
-        capitalDeployed: t.capital_deployed ? parseFloat(t.capital_deployed) : null,
-        tradeRoi:        t.trade_roi        ? parseFloat(t.trade_roi)        : null,
-      }));
+      const trades = result.rows.map((t) => {
+        // Derive trade type from available fields (no schema change needed):
+        //   opening_strategies not null  → this row IS an entry (BUY=long entry, SELL=short entry)
+        //   pnl != 0 + side=BUY         → short cover (closing a short)
+        //   pnl != 0 + side=SELL        → long exit
+        const hasOpeningStrategies = !!t.opening_strategies;
+        const pnl = parseFloat(t.pnl) || 0;
+        let tradeType;
+        if (t.side === 'BUY') {
+          tradeType = hasOpeningStrategies ? 'LONG_ENTRY' : 'SHORT_COVER';
+        } else {
+          tradeType = hasOpeningStrategies ? 'SHORT_ENTRY' : 'LONG_EXIT';
+        }
+        return {
+          date:            new Date(t.created_at).toLocaleDateString('en-IN'),
+          symbol:          t.symbol,
+          side:            t.side,
+          tradeType,
+          quantity:        t.quantity,
+          price:           parseFloat(t.price),
+          pnl,
+          strategy:        t.strategy,
+          status:          t.status,
+          orderId:         t.order_id,
+          capitalDeployed: t.capital_deployed ? parseFloat(t.capital_deployed) : null,
+          tradeRoi:        t.trade_roi        ? parseFloat(t.trade_roi)        : null,
+        };
+      });
 
       json(res, { trades });
     } catch (err) {

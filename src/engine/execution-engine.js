@@ -1368,24 +1368,26 @@ export class ExecutionEngine {
    */
   async _persistTrade(order) {
     try {
-      // Get the clean strategy names for this order (if it was a BUY)
-      const openingStrategies = order.side === 'BUY'
+      // Store opening strategies for both long entries (BUY) and short entries (SELL isShortEntry)
+      const isShortEntry = order.isShortEntry ?? false;
+      const openingStrategies = (order.side === 'BUY' || isShortEntry)
         ? JSON.stringify(this._lastSignalStrategies.get(order.symbol) || [])
         : null;
 
       await query(
         `INSERT INTO trades
-  (order_id, symbol, side, quantity, price, pnl, strategy, status, paper_mode, opening_strategies, capital_deployed, created_at)
-VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+  (order_id, symbol, side, quantity, price, pnl, strategy, status, paper_mode, opening_strategies, capital_deployed, trade_roi, created_at)
+VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
          ON CONFLICT(order_id) DO NOTHING`,
         [
           order.id, order.symbol, order.side, order.quantity,
           order.price, order.pnl || 0, order.strategy, order.state,
           this.paperMode, openingStrategies, order.capitalDeployed ?? null,
+          order.tradeRoi ?? null,   // FIX: store ROI directly on exit row
         ]
       ).catch(async (err) => {
-        // opening_strategies or capital_deployed column may not exist yet — retry without them
-        if (err.message?.includes('opening_strategies') || err.message?.includes('capital_deployed') || err.message?.includes('column')) {
+        // opening_strategies, capital_deployed, or trade_roi column may not exist — retry without them
+        if (err.message?.includes('opening_strategies') || err.message?.includes('capital_deployed') || err.message?.includes('trade_roi') || err.message?.includes('column')) {
           return query(
             `INSERT INTO trades
   (order_id, symbol, side, quantity, price, pnl, strategy, status, paper_mode, created_at)

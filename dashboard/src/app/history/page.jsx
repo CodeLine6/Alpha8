@@ -13,6 +13,7 @@ export default function HistoryPage() {
         strategy: '',
         symbol: '',
         side: '',
+        tradeType: '',
     });
 
     const fetchTrades = useCallback(async () => {
@@ -31,9 +32,9 @@ export default function HistoryPage() {
 
     const exportCSV = () => {
         if (!trades.length) return;
-        const headers = ['Date', 'Symbol', 'Side', 'Qty', 'Price', 'P&L', 'Capital Deployed', 'ROI %', 'Strategy', 'Status'];
+        const headers = ['Date', 'Symbol', 'Type', 'Side', 'Qty', 'Price', 'P&L', 'Capital Deployed', 'ROI %', 'Strategy', 'Status'];
         const rows = trades.map((t) => [
-            t.date, t.symbol, t.side, t.quantity, t.price, t.pnl,
+            t.date, t.symbol, t.tradeType ?? '', t.side, t.quantity, t.price, t.pnl,
             t.capitalDeployed ?? '', t.tradeRoi != null ? t.tradeRoi.toFixed(4) : '',
             t.strategy, t.status,
         ]);
@@ -46,6 +47,20 @@ export default function HistoryPage() {
         a.click();
         URL.revokeObjectURL(url);
     };
+
+    // Resolve trade type — uses API field when available (after bot restart),
+    // falls back to side+pnl heuristic for old rows / pre-restart API.
+    const resolveTradeType = (t) => {
+        if (t.tradeType) return t.tradeType;
+        if (t.side === 'BUY')  return Math.abs(t.pnl) < 0.01 ? 'LONG_ENTRY'  : 'SHORT_COVER';
+        if (t.side === 'SELL') return Math.abs(t.pnl) < 0.01 ? 'SHORT_ENTRY' : 'LONG_EXIT';
+        return null;
+    };
+
+    // Client-side filter by tradeType (derived field, not stored in DB)
+    const visibleTrades = filters.tradeType
+        ? trades.filter(t => resolveTradeType(t) === filters.tradeType)
+        : trades;
 
     return (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
@@ -98,6 +113,17 @@ export default function HistoryPage() {
                             <option value="SELL">SELL</option>
                         </select>
                     </div>
+                    <div>
+                        <label className="text-xs text-[var(--text-muted)] mb-1 block">Type</label>
+                        <select className="input" value={filters.tradeType}
+                            onChange={(e) => setFilters({ ...filters, tradeType: e.target.value })}>
+                            <option value="">All</option>
+                            <option value="LONG_ENTRY">Long Entry</option>
+                            <option value="LONG_EXIT">Long Exit</option>
+                            <option value="SHORT_ENTRY">Short Entry</option>
+                            <option value="SHORT_COVER">Short Cover</option>
+                        </select>
+                    </div>
                 </div>
             </div>
 
@@ -118,7 +144,7 @@ export default function HistoryPage() {
                                     <tr>
                                         <th>Date</th>
                                         <th>Symbol</th>
-                                        <th>Side</th>
+                                        <th>Type</th>
                                         <th>Qty</th>
                                         <th>Price</th>
                                         <th>P&L</th>
@@ -129,32 +155,39 @@ export default function HistoryPage() {
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    {trades.map((trade, i) => (
-                                        <tr key={i}>
-                                            <td className="whitespace-nowrap">{trade.date}</td>
-                                            <td className="font-medium text-[var(--text-primary)]">{trade.symbol}</td>
-                                            <td>
-                                                <span className={`badge ${trade.side === 'BUY' ? 'badge-green' : 'badge-red'}`}>
-                                                    {trade.side}
-                                                </span>
-                                            </td>
-                                            <td>{trade.quantity}</td>
-                                            <td>{formatINR(trade.price)}</td>
-                                            <td className={`font-medium ${pnlColor(trade.pnl)}`}>{formatINR(trade.pnl)}</td>
-                                            <td className="text-xs text-[var(--text-muted)]">
-                                                {trade.capitalDeployed != null ? formatINR(trade.capitalDeployed) : '—'}
-                                            </td>
-                                            <td className={`text-xs font-medium ${trade.tradeRoi == null ? '' : trade.tradeRoi >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                                                {trade.tradeRoi != null ? `${trade.tradeRoi >= 0 ? '+' : ''}${trade.tradeRoi.toFixed(2)}%` : '—'}
-                                            </td>
-                                            <td className="text-xs">{trade.strategy}</td>
-                                            <td>
-                                                <span className={`badge ${trade.status === 'FILLED' ? 'badge-green' :
-                                                    trade.status === 'REJECTED' ? 'badge-red' : 'badge-yellow'
-                                                    }`}>{trade.status}</span>
-                                            </td>
-                                        </tr>
-                                    ))}
+                                    {visibleTrades.map((trade, i) => {
+                                        const typeConfig = {
+                                            LONG_ENTRY:  { label: 'L ENTRY',  cls: 'badge-green'  },
+                                            LONG_EXIT:   { label: 'L EXIT',   cls: 'badge-yellow' },
+                                            SHORT_ENTRY: { label: 'S ENTRY',  cls: 'badge-red'    },
+                                            SHORT_COVER: { label: 'S COVER',  cls: 'badge-blue'   },
+                                        };
+                                        const tc = typeConfig[trade.tradeType] ?? { label: trade.side, cls: trade.side === 'BUY' ? 'badge-green' : 'badge-red' };
+                                        return (
+                                            <tr key={i} style={{
+                                                borderLeft: trade.tradeType?.startsWith('SHORT') ? '3px solid rgba(239,68,68,0.4)' : '3px solid rgba(34,197,94,0.4)',
+                                            }}>
+                                                <td className="whitespace-nowrap">{trade.date}</td>
+                                                <td className="font-medium text-[var(--text-primary)]">{trade.symbol}</td>
+                                                <td><span className={`badge ${tc.cls}`}>{tc.label}</span></td>
+                                                <td>{trade.quantity}</td>
+                                                <td>{formatINR(trade.price)}</td>
+                                                <td className={`font-medium ${pnlColor(trade.pnl)}`}>{formatINR(trade.pnl)}</td>
+                                                <td className="text-xs text-[var(--text-muted)]">
+                                                    {trade.capitalDeployed != null ? formatINR(trade.capitalDeployed) : '—'}
+                                                </td>
+                                                <td className={`text-xs font-medium ${trade.tradeRoi == null ? '' : trade.tradeRoi >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                                    {trade.tradeRoi != null ? `${trade.tradeRoi >= 0 ? '+' : ''}${trade.tradeRoi.toFixed(2)}%` : '—'}
+                                                </td>
+                                                <td className="text-xs">{trade.strategy}</td>
+                                                <td>
+                                                    <span className={`badge ${trade.status === 'FILLED' ? 'badge-green' :
+                                                        trade.status === 'REJECTED' ? 'badge-red' : 'badge-yellow'
+                                                        }`}>{trade.status}</span>
+                                                </td>
+                                            </tr>
+                                        );
+                                    })}
                                 </tbody>
                             </table>
                         </div>
