@@ -798,7 +798,7 @@ async function main() {
         if (!currentPrice && broker) {
           try {
             const ltp = await broker.getLTP([`NSE:${symbol}`]);
-            const lastPrice = ltp?.[`NSE:${symbol}`]?.last_price || posCtx.entryPrice;
+            currentPrice = ltp?.[`NSE:${symbol}`]?.last_price ?? 0;
           } catch (ltpErr) {
             log.warn({ symbol, err: ltpErr.message }, 'LTP fetch failed — price unresolvable this cycle');
           }
