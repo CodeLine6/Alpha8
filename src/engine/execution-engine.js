@@ -531,6 +531,12 @@ export class ExecutionEngine {
     const exitQty = qty ?? posCtx.quantity;
     const isFullExit = qty === null || qty === undefined || qty >= posCtx.quantity;
 
+    // Prevent 0 price from corrupting P&L and tripping kill switch
+    if (!exitPrice || exitPrice <= 0) {
+      log.warn({ symbol, entryPrice: posCtx.entryPrice }, 'Exit price is 0 or invalid — falling back to entryPrice to prevent massive fake P&L');
+      exitPrice = posCtx.entryPrice;
+    }
+
     // Fix Bug 7: Determine position direction — needed for order side and P&L sign
     const isShortPos = posCtx.isShort ?? posCtx.direction === 'SELL';
 

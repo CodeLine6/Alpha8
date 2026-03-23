@@ -437,7 +437,7 @@ export class MarketScheduler {
       }
 
       // ── STEP 2: Per-scan reconciliation ───────────────────────────────────
-      if (this.engine._filledPositions?.size > 0 && this.broker) {
+      if (this.broker && typeof this.engine.reconcilePositions === 'function') {
         this.engine.reconcilePositions(this.broker).catch(err =>
           log.warn({ err: err.message }, 'Reconciliation failed')
         );
