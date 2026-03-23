@@ -129,95 +129,131 @@ export class ExecutionEngine {
 
     const isPaperMode = this.paperMode;
 
+    // ── FIX: Fetch ALL today's filled trades (not just the most recent per symbol).
+    // The old DISTINCT ON approach picked the MOST RECENT trade per symbol, which
+    // mis-identified closed longs (latest trade = SELL) as open shorts, and missed
+    // positions that were closed then re-opened.
+    //
+    // Net-quantity approach:
+    //   net = sum(BUY qty) − sum(SELL qty) per symbol
+    //   net > 0 → open long         (restore)
+    //   net < 0 → open short        (restore, abs qty)
+    //   net = 0 → closed position   (skip)
+    //
+    // Works identically in paper and live mode — no broker API required.
     const result = await query(
-      `SELECT symbol, price, quantity, strategy, created_at,
+      `SELECT symbol, side, price, quantity, strategy, created_at,
               opening_strategies
-       FROM (
-         SELECT DISTINCT ON (symbol)
-           symbol, side, price, quantity, strategy, created_at, id,
-           opening_strategies
-         FROM trades
-         WHERE status     = 'FILLED'
-           AND paper_mode = $1
-           AND (created_at AT TIME ZONE 'Asia/Kolkata')::date =
-               (NOW()      AT TIME ZONE 'Asia/Kolkata')::date
-         ORDER BY symbol, created_at DESC, id DESC
-       ) AS latest_trades
-       WHERE side IN ('BUY', 'SELL')`,
+       FROM trades
+       WHERE status     = 'FILLED'
+         AND paper_mode = $1
+         AND (created_at AT TIME ZONE 'Asia/Kolkata')::date =
+             (NOW()      AT TIME ZONE 'Asia/Kolkata')::date
+       ORDER BY created_at ASC, id ASC`,
       [isPaperMode]
     ).catch(async (err) => {
-      // opening_strategies column may not exist on old schema — retry without it
       if (err.message?.includes('opening_strategies')) {
         log.warn('opening_strategies column not found — running without it (run migration)');
         return query(
-          `SELECT symbol, price, quantity, strategy, created_at
-           FROM (
-             SELECT DISTINCT ON (symbol)
-               symbol, side, price, quantity, strategy, created_at, id
-             FROM trades
-             WHERE status     = 'FILLED'
-               AND paper_mode = $1
-               AND (created_at AT TIME ZONE 'Asia/Kolkata')::date =
-                   (NOW()      AT TIME ZONE 'Asia/Kolkata')::date
-             ORDER BY symbol, created_at DESC, id DESC
-           ) AS latest_trades
-           WHERE side IN ('BUY', 'SELL')`,
+          `SELECT symbol, side, price, quantity, strategy, created_at
+           FROM trades
+           WHERE status     = 'FILLED'
+             AND paper_mode = $1
+             AND (created_at AT TIME ZONE 'Asia/Kolkata')::date =
+                 (NOW()      AT TIME ZONE 'Asia/Kolkata')::date
+           ORDER BY created_at ASC, id ASC`,
           [isPaperMode]
         );
       }
       throw err;
     });
 
-    this._filledPositions.clear();
-
-    const stopPct = this._config?.STOP_LOSS_PCT ?? 1.0;
-    const trailPct = this._config?.TRAILING_STOP_PCT ?? 1.5;
-    const targetPct = this._config?.PROFIT_TARGET_PCT ?? 1.8;
-
-    // Valid strategy constants — used to detect clean names vs reason strings
-    const VALID_STRATEGIES = new Set([
-      'EMA_CROSSOVER', 'RSI_MEAN_REVERSION', 'VWAP_MOMENTUM', 'BREAKOUT_VOLUME',
-    ]);
+    // ── Step 1: Compute net position per symbol ─────────────────────────────
+    const netMap = new Map(); // symbol → { netQty, weightedPriceSum, entryTime, opening_strategies, strategy }
 
     for (const row of result.rows) {
-      const entryPrice = parseFloat(row.price);
+      const qty   = parseInt(row.quantity, 10);
+      const price = parseFloat(row.price);
+      const entry = netMap.get(row.symbol) ?? {
+        netQty: 0, weightedPriceSum: 0, entryTime: null,
+        opening_strategies: null, strategy: null,
+      };
 
-      // Recover clean opening strategy name:
-      // 1. Try opening_strategies JSON column (new schema)
-      // 2. Fall back to strategy column if it's a clean constant name
-      // 3. Otherwise UNKNOWN
+      if (row.side === 'BUY') {
+        if (entry.netQty <= 0) {
+          // Covering short or starting fresh long — reset weighted average
+          entry.weightedPriceSum = price * qty;
+        } else {
+          entry.weightedPriceSum += price * qty;
+        }
+        entry.netQty += qty;
+        if (!entry.entryTime) entry.entryTime = row.created_at;
+      } else if (row.side === 'SELL') {
+        if (entry.netQty >= 0) {
+          // Closing long or starting fresh short — reset weighted average
+          entry.weightedPriceSum = price * qty;
+          if (!entry.entryTime || entry.netQty === 0) entry.entryTime = row.created_at;
+        }
+        entry.netQty -= qty;
+      }
+
+      // Keep most recent strategy info (latest entry is most relevant)
+      if (row.opening_strategies) entry.opening_strategies = row.opening_strategies;
+      if (row.strategy)           entry.strategy           = row.strategy;
+
+      netMap.set(row.symbol, entry);
+    }
+
+    // ── Step 2: Restore only truly open (net != 0) positions ───────────────
+    this._filledPositions.clear();
+
+    const stopPct   = this._config?.STOP_LOSS_PCT       ?? 1.0;
+    const trailPct  = this._config?.TRAILING_STOP_PCT   ?? 1.5;
+    const targetPct = this._config?.PROFIT_TARGET_PCT   ?? 1.8;
+
+    const VALID_STRATEGIES = new Set([
+      'EMA_CROSSOVER', 'RSI_MEAN_REVERSION', 'VWAP_MOMENTUM', 'BREAKOUT_VOLUME', 'ORB', 'BAVI',
+    ]);
+
+    let skipped = 0;
+
+    for (const [symbol, data] of netMap) {
+      if (data.netQty === 0) {
+        skipped++;
+        log.debug({ symbol }, 'hydratePositions: skipping closed position (net qty = 0)');
+        continue;
+      }
+
+      const isShort    = data.netQty < 0;
+      const qty        = Math.abs(data.netQty);
+      const entryPrice = data.weightedPriceSum > 0 ? data.weightedPriceSum / qty : 0;
+
       let openingStrategy = 'UNKNOWN';
       let strategies = [];
-
-      if (row.opening_strategies) {
+      if (data.opening_strategies) {
         try {
-          strategies = JSON.parse(row.opening_strategies);
-          if (Array.isArray(strategies) && strategies.length > 0) {
-            openingStrategy = strategies[0];
-          }
-        } catch { /* malformed JSON — leave as UNKNOWN */ }
+          strategies = JSON.parse(data.opening_strategies);
+          if (Array.isArray(strategies) && strategies.length > 0) openingStrategy = strategies[0];
+        } catch { /* malformed JSON */ }
+      }
+      if (openingStrategy === 'UNKNOWN' && data.strategy && VALID_STRATEGIES.has(data.strategy)) {
+        openingStrategy = data.strategy;
+        strategies = [data.strategy];
       }
 
-      if (openingStrategy === 'UNKNOWN' && row.strategy && VALID_STRATEGIES.has(row.strategy)) {
-        openingStrategy = row.strategy;
-        strategies = [row.strategy];
-      }
-
-      const isShort = row.side === 'SELL';
-      this._filledPositions.set(row.symbol, {
+      this._filledPositions.set(symbol, {
         direction: isShort ? 'SELL' : 'BUY',
         isShort,
         strategies,
         openingStrategy,
         entryPrice,
         price: entryPrice,
-        quantity: parseInt(row.quantity, 10),
-        timestamp: new Date(row.created_at).getTime(),
+        quantity: qty,
+        timestamp: new Date(data.entryTime).getTime(),
 
-        // Levels are direction-aware (exit-strategies.js handles both)
         stopPrice: isShort
-          ? entryPrice * (1 + stopPct / 100)    // above entry for shorts
-          : entryPrice * (1 - stopPct / 100),   // below entry for longs
+          ? entryPrice * (1 + stopPct / 100)
+          : entryPrice * (1 - stopPct / 100),
         highWaterMark: entryPrice,
         trailStopPrice: isShort
           ? entryPrice * (1 + trailPct / 100)
@@ -234,18 +270,16 @@ export class ExecutionEngine {
         hydratedFromDB: true,
       });
 
-      // Fix BUG-11: restoreDeployment does NOT add to _totalCashRequired.
-      // openDeployment() would double-count the denominator — cash was already
-      // counted before the restart. This method only restores _currentDeployment.
-      const hydratedTradeSize = entryPrice * parseInt(row.quantity, 10);
-      this.riskManager.restoreDeployment(hydratedTradeSize);
+      // Fix BUG-11: restoreDeployment only restores _currentDeployment, does NOT
+      // touch _totalCashRequired (which would double-count the ROI denominator).
+      this.riskManager.restoreDeployment(entryPrice * qty);
     }
 
-    const count = this._filledPositions.size;
+    const count   = this._filledPositions.size;
     const symbols = Array.from(this._filledPositions.keys());
 
-    log.info({ count, symbols },
-      `✅ Position hydration complete — ${count} open position(s) restored from DB`);
+    log.info({ count, skipped, symbols },
+      `✅ Position hydration complete — ${count} open, ${skipped} closed (skipped)`);
 
     return count;
   }
