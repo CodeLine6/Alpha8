@@ -469,7 +469,7 @@ export class MarketScheduler {
           // the correct tick window for this symbol.
           if (this.baviAdapter) this.baviAdapter.setSymbol(item.symbol);
 
-          const result = this.engine.consensus.evaluate(item.candles);
+          const result = this.engine.consensus.evaluate(item.candles, item.symbol);
           for (const detail of (result.details || [])) {
             if (
               detail.strategy &&

@@ -134,7 +134,7 @@ export class SignalConsensus {
   // evaluate()
   // ─────────────────────────────────────────────────────────────────────────
 
-  evaluate(candles) {
+  evaluate(candles, symbol = 'unknown') {
     if (this.strategies.length === 0) {
       return {
         signal: SIGNAL.HOLD,
@@ -251,7 +251,7 @@ export class SignalConsensus {
     let convictionStrategy = undefined;
 
     if (this.groupedConsensus) {
-      const gr = this._groupedConsensus(results, votes, groupVotes);
+      const gr = this._groupedConsensus(results, votes, groupVotes, symbol);
       finalSignal = gr.signal;
       finalConfidence = gr.confidence;
       reason = gr.reason;
@@ -342,7 +342,7 @@ export class SignalConsensus {
    * SELL (open short): SHORT_INELIGIBLE_STRATEGIES excluded from vote.
    *                    RSI-only SELL → isShortEntry:false (long exit only).
    */
-  _groupedConsensus(results, votes, groupVotes) {
+  _groupedConsensus(results, votes, groupVotes, symbol = 'unknown') {
 
     // ── BUY check (open long) ─────────────────────────────────────────────
     if (groupVotes.reversal.buy >= 1 && groupVotes.momentum.buy >= 1) {
@@ -448,11 +448,13 @@ export class SignalConsensus {
           !SHORT_INELIGIBLE_STRATEGIES.has(best.strategy);
 
         log.info({
+          symbol,                                      // which stock fired Super Conviction
+          signal: best.signal,                         // BUY / SELL
           strategy: best.strategy,
           confidence: best.confidence,
           threshold: this.superConvictionThreshold,
           isShortEntry,
-        }, `⏩ Super Conviction BYPASS: ${best.strategy} (${best.confidence}%)`);
+        }, `⏩ Super Conviction BYPASS: ${best.strategy} (${best.confidence}%) → ${best.signal}`);
 
         return {
           signal: best.signal,

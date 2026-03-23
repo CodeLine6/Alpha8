@@ -265,7 +265,7 @@ export class ExecutionEngine {
       return { action: 'HOLD', order: null, consensus: null };
     }
 
-    const consensusResult = this.consensus.evaluate(candles);
+    const consensusResult = this.consensus.evaluate(candles, symbol);
 
     const consensusSignalId = await this._persistSignals(symbol, consensusResult, currentPrice)
       .catch((err) => {
