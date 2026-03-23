@@ -834,6 +834,7 @@ async function main() {
           avgWin: stats.avgWin,
           avgLoss: stats.avgLoss,
           entryPrice: currentPrice || 100,
+          symbol,
           maxRiskPct: riskManager.perTradeStopLossPct,
           maxPositionPct: riskManager.maxPositionPct,
         });

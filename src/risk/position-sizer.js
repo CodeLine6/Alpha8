@@ -35,13 +35,14 @@ export function calculatePositionSize({
   avgWin,
   avgLoss,
   entryPrice,
+  symbol = null,
   maxRiskPct = RISK_DEFAULTS.PER_TRADE_STOP_LOSS_PCT,
   kellyFraction = 0.5,
   maxPositionPct = RISK_DEFAULTS.MAX_POSITION_VALUE_PCT,
 }) {
   // Validate inputs
   if (!capital || capital <= 0 || !entryPrice || entryPrice <= 0) {
-    log.warn({ capital, entryPrice }, 'Invalid inputs for position sizing');
+    log.warn({ symbol, capital, entryPrice }, 'Invalid inputs for position sizing');
     return {
       quantity: 0,
       riskAmount: 0,
@@ -82,7 +83,7 @@ export function calculatePositionSize({
 
         // Kelly can go negative (meaning don't trade)
         if (kellyPct <= 0) {
-          log.info({ kellyPct, winRate, avgWin, avgLoss }, 'Kelly suggests no trade — negative or zero edge');
+          log.info({ symbol, kellyPct, winRate, avgWin, avgLoss }, 'Kelly suggests no trade — negative or zero edge');
           return {
             quantity: 0,
             riskAmount: 0,
@@ -137,6 +138,7 @@ export function calculatePositionSize({
   const finalPositionValue = quantity * entryPrice;
 
   log.info({
+    symbol,
     quantity,
     riskAmount: +riskAmount.toFixed(2),
     kellyPct: +(kellyPct * 100).toFixed(2),

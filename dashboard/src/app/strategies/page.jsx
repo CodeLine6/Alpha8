@@ -78,7 +78,10 @@ export default function StrategiesPage() {
                                 <tbody>
                                     {signals.map((sig, i) => (
                                         <tr key={i}>
-                                            <td className="whitespace-nowrap text-xs">{sig.timestamp}</td>
+                                            <td className="whitespace-nowrap text-xs">
+                                                <div>{sig.date ?? sig.timestamp}</div>
+                                                <div className="text-[var(--text-muted)]">{sig.time}</div>
+                                            </td>
                                             <td className="text-xs">{sig.strategy}</td>
                                             <td className="font-medium text-[var(--text-primary)]">{sig.symbol}</td>
                                             <td>

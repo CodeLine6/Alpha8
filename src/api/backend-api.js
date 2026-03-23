@@ -636,16 +636,22 @@ export function createApiHandler(deps) {
         [limit]
       );
 
-      const signals = result.rows.map((s) => ({
-        timestamp: new Date(s.created_at).toLocaleTimeString('en-IN', {
-          hour: '2-digit', minute: '2-digit', hour12: false,
-        }),
-        strategy: s.strategy,
-        symbol: s.symbol,
-        signal: s.signal,
-        confidence: s.confidence,
-        actedOn: s.acted_on,
-      }));
+      const signals = result.rows.map((s) => {
+        const dt = new Date(s.created_at);
+        return {
+          date: dt.toLocaleDateString('en-IN', {
+            day: '2-digit', month: 'short', timeZone: 'Asia/Kolkata',
+          }),
+          time: dt.toLocaleTimeString('en-IN', {
+            hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Kolkata',
+          }),
+          strategy: s.strategy,
+          symbol: s.symbol,
+          signal: s.signal,
+          confidence: s.confidence,
+          actedOn: s.acted_on,
+        };
+      });
 
       json(res, { signals });
     } catch (err) {
