@@ -186,7 +186,9 @@ function DailyRoiCard({ data, loading }) {
     if (loading) return <SkeletonCard />;
     const roi = data?.dailyRoi ?? 0;
     const deployed = data?.totalCashRequired ?? 0;
-    const current = data?.currentDeployment ?? 0;
+    // walletDeployed = fresh wallet cash still locked in open positions (always ≤ capital)
+    // currentDeployment can exceed capital via recycled profits — not shown directly
+    const walletDeployed = data?.walletDeployed ?? data?.currentDeployment ?? 0;
     return (
         <div className={`card ${roi >= 0 ? 'pulse-green' : 'pulse-red'}`}>
             <div className="text-xs text-[var(--text-muted)] uppercase tracking-wider mb-2">
@@ -196,11 +198,11 @@ function DailyRoiCard({ data, loading }) {
                 {roi >= 0 ? '+' : ''}{roi.toFixed(2)}%
             </div>
             <div className="text-xs text-[var(--text-muted)] mt-2">
-                on {formatINR(deployed)} fresh capital used {/* Fix BUG-22: was 'cash used'; totalCashRequired = fresh wallet draws, the ROI denominator */}
+                on {formatINR(deployed)} fresh capital used
             </div>
-            {current > 0 && (
+            {walletDeployed > 0 && (
                 <div className="text-xs mt-1 text-yellow-400">
-                    {formatINR(current)} currently deployed
+                    {formatINR(walletDeployed)} wallet currently deployed
                 </div>
             )}
         </div>

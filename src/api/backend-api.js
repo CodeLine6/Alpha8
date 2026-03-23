@@ -358,6 +358,7 @@ export function createApiHandler(deps) {
         dailyRoi:          roiData.dailyRoi,
         totalCashRequired: roiData.totalCashRequired,
         currentDeployment: roiData.currentDeployment,
+        walletDeployed:    roiData.walletDeployed,   // net fresh wallet cash still locked in positions (≤ capital)
         peakDeployment:    roiData.peakDeployment,
       });
     } catch (err) {

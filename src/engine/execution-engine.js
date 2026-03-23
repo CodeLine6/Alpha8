@@ -727,6 +727,7 @@ export class ExecutionEngine {
       quantity: params.quantity,
       price: params.price,
       strategy: params.strategy,
+      isShortEntry: params.isShortEntry ?? false,  // FIX: short entries also count as new positions
     }, totalExposure);
 
     if (!riskDecision.allowed) {

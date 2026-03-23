@@ -400,8 +400,11 @@ export class RiskManager {
       return { allowed: false, reason, context };
     }
 
-    // ─── Check 3: Max Open Positions (only for BUY) ──────
-    if (order.side === 'BUY' && this._openPositionCount >= this.maxPositionCount) {
+    // ─── Check 3: Max Open Positions (BUY or new SHORT entry) ────
+    // A SELL that opens a short IS a new position — it must respect the limit.
+    // A SELL that closes an existing long is NOT a new position — skip the check.
+    const isNewPosition = order.side === 'BUY' || order.isShortEntry === true;
+    if (isNewPosition && this._openPositionCount >= this.maxPositionCount) {
       const reason =
         `Max open positions reached: ${this._openPositionCount}/${this.maxPositionCount}`;
       log.warn({ ...context }, `ORDER REJECTED — ${reason}`);
@@ -418,15 +421,16 @@ export class RiskManager {
       return { allowed: false, reason, context };
     }
 
-    // ─── Check 5: Square-Off Time Guard ──────────────────
-    if (order.side === 'BUY' && isSquareOffTime()) {
-      const reason = `New BUY orders blocked after ${SQUARE_OFF_TIME} IST (square-off-window)`;
+    // ─── Check 5: Square-Off Time Guard ───────────────────
+    // Block both new longs (BUY) and new shorts (isShortEntry SELL) near close
+    if (isNewPosition && isSquareOffTime()) {
+      const reason = `New position orders blocked after ${SQUARE_OFF_TIME} IST (square-off-window)`;
       log.warn({ ...context }, `ORDER REJECTED — ${reason}`);
       return { allowed: false, reason, context };
     }
 
-    // ─── Check 6: Total Capital Exposure (only for BUY) ──
-    if (order.side === 'BUY') {
+    // ─── Check 6: Total Capital Exposure (BUY or new SHORT entry) ──
+    if (isNewPosition) {
       const newTradeValue = order.quantity * order.price;
       const totalAfterTrade = totalExposureValue + this._pendingExposureValue + newTradeValue;
 
@@ -616,11 +620,17 @@ export class RiskManager {
    * @returns {{ dailyRoi, totalCashRequired, currentDeployment, peakDeployment, totalPnl }}
    */
   getDailyRoi() {
+    // walletDeployed = fresh cash drawn from wallet that is still locked in open positions.
+    // Unlike _currentDeployment (which can exceed capital via recycled profits),
+    // this value is always ≤ TRADING_CAPITAL.
+    const walletDeployed = Math.max(0, this._totalCashRequired - this._availablePool);
+
     if (this._totalCashRequired <= 0) {
       return {
         dailyRoi:          0,
         totalCashRequired: 0,
         currentDeployment: this._currentDeployment,
+        walletDeployed,
         peakDeployment:    this._peakDeployment,
         totalPnl:          this._dailyPnL,
       };
@@ -629,6 +639,7 @@ export class RiskManager {
       dailyRoi:          +((this._dailyPnL / this._totalCashRequired) * 100).toFixed(2),
       totalCashRequired: this._totalCashRequired,
       currentDeployment: this._currentDeployment,
+      walletDeployed,
       peakDeployment:    this._peakDeployment,
       totalPnl:          this._dailyPnL,
     };
