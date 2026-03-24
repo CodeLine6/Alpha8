@@ -1073,10 +1073,16 @@ async function main() {
         const rStatus = riskManager.getStatus();
         const eStatus = engine.getStatus();
 
+        let liveCap = config.TRADING_CAPITAL;
+        if (redisHealthy && typeof getLiveSetting === 'function') {
+          try { liveCap = await getLiveSetting('TRADING_CAPITAL', config.TRADING_CAPITAL); } catch { /* */ }
+        }
+
         const msg =
           `🖥️ <b>System Status</b>\n` +
           `━━━━━━━━━━━━━━━━━━━━\n` +
           `🛰️ <b>Scanning:</b> ${sStatus.scanning ? '🟢 ACTIVE' : '⚪ INACTIVE'}\n` +
+          `💰 <b>Capital:</b> ₹${Number(liveCap).toLocaleString('en-IN')}\n` +
           `📊 <b>PnL:</b> ₹${rStatus.dailyPnL.toLocaleString('en-IN')}\n` +
           `📉 <b>Drawdown:</b> ${rStatus.drawdownPct.toFixed(2)}%\n` +
           `📦 <b>Positions:</b> ${eStatus.openPositions}\n` +
@@ -1268,6 +1274,11 @@ async function main() {
       try { activeWatchlist = await scout.getActiveWatchlist(); } catch { /* */ }
     }
 
+    let liveCapital = config.TRADING_CAPITAL;
+    if (redisHealthy && typeof getLiveSetting === 'function') {
+      try { liveCapital = await getLiveSetting('TRADING_CAPITAL', config.TRADING_CAPITAL); } catch { /* */ }
+    }
+
     telegram.sendRaw(
       `🚀 <b>Alpha8 Started</b>\n` +
       `📊 Mode: ${config.LIVE_TRADING ? '🔴 LIVE' : '🟢 PAPER'}\n` +
@@ -1277,7 +1288,7 @@ async function main() {
       `🔍 Scout: ${scout ? '✅ Active (nightly @ 8 PM)' : '❌ Disabled'}\n` +
       `📌 Pinned: ${pinnedSymbols.join(', ')}\n` +
       `📋 Active watchlist (${activeWatchlist.length}): ${activeWatchlist.join(', ')}\n` +
-      `💰 Capital: ₹${config.TRADING_CAPITAL.toLocaleString('en-IN')}\n` +
+      `💰 Capital: ₹${Number(liveCapital).toLocaleString('en-IN')}\n` +
       `🔬 Shadow: ${shadowRecorder ? '✅ Active' : '❌ Disabled'}\n` +
       `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
     ).catch(err => log.error({ err: err.message }, 'Failed to send Telegram startup message'));
