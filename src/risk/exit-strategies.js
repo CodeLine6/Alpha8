@@ -1,46 +1,37 @@
 /**
- * @fileoverview Exit Strategy Logic for Alpha8 Position Manager
+ * @fileoverview Exit Strategy Logic for Alpha8 — PnL-Aware Trailing Stop
  *
- * Supports both LONG and SHORT positions with full symmetry.
+ * KEY CHANGE: Trailing stop is now calculated on PEAK UNREALIZED PnL (₹)
+ * rather than peak price percentage. This correctly accounts for position
+ * quantity — a 500-share position profits/loses 5x more per rupee move
+ * than a 100-share position at the same price, and the trail must reflect that.
  *
- * SHORT POSITION MATH (inverted from long):
- *   - Stop loss    : price ABOVE entry  (entry × (1 + stop%))
- *   - Profit target: price BELOW entry  (entry × (1 - target%))
- *   - Trail stop   : low-water mark — moves DOWN as price falls, never back up
- *   - Break-even   : trail can never go ABOVE entry once profitable
- *   - Signal reversal: opening strategy fires BUY (not SELL)
+ * TRAIL MODES:
+ *   PNL_TRAIL (new default):
+ *     - Tracks peak unrealized PnL in ₹
+ *     - Trail = retain at least (100 - trailPct)% of peak PnL
+ *     - Example: peak ₹10,000, trail 25% → exit if PnL drops below ₹7,500
+ *     - Quantity-aware by nature (PnL = price_diff × qty)
  *
- * EXIT PRIORITY ORDER (same for long and short):
- *   1. STOP_LOSS
- *   2. PROFIT_TARGET (full exit)
- *   3. PARTIAL_EXIT
- *   4. TRAILING_STOP
- *   5. SIGNAL_REVERSAL
- *   6. TIME_EXIT
+ *   PRICE_TRAIL (legacy, kept for backward compat):
+ *     - Original behavior: trail % below high water mark price
+ *     - Used only when PNL_TRAIL cannot be computed
  *
- * STRATEGY SHORT ELIGIBILITY:
- *   EMA_CROSSOVER     ✅ — bearish crossover is a textbook short
- *   VWAP_MOMENTUM     ✅ — break below VWAP with volume
- *   BREAKOUT_VOLUME   ✅ — breakdown below support with volume
- *   RSI_MEAN_REVERSION ❌ — overbought shorts have poor R/R; stays as exit signal only
+ * HYBRID PROTECTION (always active):
+ *   Both price floor AND PnL floor are computed.
+ *   Exit triggers when EITHER is breached.
+ *   This prevents a thinly-priced high-qty stock from ignoring price completely.
  */
 
-// ── Strategy classification ────────────────────────────────────────────────
+// ── Trail mode constants ───────────────────────────────────────────────────
 
-/** Strategies that use mean-reversion fixed % targets (longs only) */
-const MEAN_REVERSION_STRATEGIES = new Set(['RSI_MEAN_REVERSION']);
+export const TRAIL_MODE = Object.freeze({
+    PNL_TRAIL: 'PNL_TRAIL',   // protect ₹ profits (quantity-aware) — DEFAULT
+    PRICE_TRAIL: 'PRICE_TRAIL', // protect price % (legacy)
+    HYBRID: 'HYBRID',      // both must hold (most conservative)
+});
 
-/** Strategies allowed to open short positions.
- * ORB and BAVI replace EMA_CROSSOVER (v1.1). RSI is now a long-exit helper only.
- */
-export const SHORT_ELIGIBLE_STRATEGIES = new Set([
-    'ORB',
-    'BAVI',
-    'VWAP_MOMENTUM',
-    'BREAKOUT_VOLUME',
-]);
-
-// ── Regime multipliers for ATR-based trail ────────────────────────────────
+// ── Regime multipliers (unchanged) ────────────────────────────────────────
 
 const REGIME_TRAIL_MULTIPLIER = {
     TRENDING: 1.0,
@@ -49,27 +40,10 @@ const REGIME_TRAIL_MULTIPLIER = {
     UNKNOWN: 1.2,
 };
 
-// ═══════════════════════════════════════════════════════
-// PUBLIC: Position initialisation
-// ═══════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
+// computeExitLevels — add PnL trail fields
+// ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Compute all exit levels for a new position at entry time.
- * Works for both LONG ('BUY') and SHORT ('SELL') positions.
- *
- * @param {Object} params
- * @param {number}   params.entryPrice
- * @param {number}   params.quantity
- * @param {'BUY'|'SELL'} params.direction      - 'BUY' for long, 'SELL' for short
- * @param {string}   params.openingStrategy
- * @param {string[]} params.allStrategies
- * @param {string}   params.regime
- * @param {number[]} [params.recentCloses]
- * @param {number[]} [params.recentHighs]
- * @param {number[]} [params.recentLows]
- * @param {Object}   params.config
- * @returns {Object} exitLevels to merge into posCtx
- */
 export function computeExitLevels({
     entryPrice,
     quantity,
@@ -84,127 +58,251 @@ export function computeExitLevels({
 }) {
     const isShort = direction === 'SELL';
 
-    const stopLossPct         = config.stopLossPct         ?? config.STOP_LOSS_PCT         ?? 1.0;
-    const trailingStopPct     = config.trailingStopPct     ?? config.TRAILING_STOP_PCT     ?? 1.5;
-    const profitTargetPct     = config.profitTargetPct     ?? config.PROFIT_TARGET_PCT     ?? 1.8;
-    // Fix BUG-09: riskRewardRatio may be stored under different key names; default to 2.0
-    const riskRewardRatio     = config.riskRewardRatio
-      ?? config.RISK_REWARD_RATIO
-      ?? config.riskReward
-      ?? 2.0;
-    const partialExitEnabled  = config.partialExitEnabled  ?? config.PARTIAL_EXIT_ENABLED  ?? true;
-    const partialExitPct      = config.partialExitPct      ?? config.PARTIAL_EXIT_PCT      ?? 50;
-    // Fix BUG-10: signalReversalEnabled must default to true; undefined would disable reversal exits
-    const signalReversalEnabled = config.signalReversalEnabled
-      ?? config.SIGNAL_REVERSAL_ENABLED
-      ?? true;   // core feature — default ON
+    const stopLossPct = config.stopLossPct ?? config.STOP_LOSS_PCT ?? 1.0;
+    const trailingStopPct = config.trailingStopPct ?? config.TRAILING_STOP_PCT ?? 1.5;
+    const profitTargetPct = config.profitTargetPct ?? config.PROFIT_TARGET_PCT ?? 1.8;
+    const riskRewardRatio = config.riskRewardRatio ?? config.RISK_REWARD_RATIO ?? 2.0;
+    const partialExitEnabled = config.partialExitEnabled ?? config.PARTIAL_EXIT_ENABLED ?? true;
+    const partialExitPct = config.partialExitPct ?? config.PARTIAL_EXIT_PCT ?? 50;
+    const signalReversalEnabled = config.signalReversalEnabled ?? config.SIGNAL_REVERSAL_ENABLED ?? true;
 
-    // ── Stop loss ──────────────────────────────────────────────────────────
-    // LONG:  stop below entry  (entry × (1 - stop%))
-    // SHORT: stop above entry  (entry × (1 + stop%))
+    // ── NEW: PnL trail configuration ──────────────────────────────────────────
+    // pnlTrailPct: what % of peak PnL to give back before exiting
+    //   e.g. 25 means "exit if PnL drops 25% from its peak"
+    //   Higher = more room to breathe, captures bigger moves
+    //   Lower  = locks in more profit, exits earlier on pullbacks
+    const pnlTrailPct = config.pnlTrailPct ?? config.PNL_TRAIL_PCT ?? 25;
+
+    // pnlTrailFloor: minimum ₹ PnL that must be protected before trail activates
+    //   Trail only kicks in once we're profitable beyond this floor
+    //   Prevents trail from triggering on noise before any real profit exists
+    //   Default: protect at least 0.5% of position value
+    const pnlTrailFloor = config.pnlTrailFloor
+        ?? config.PNL_TRAIL_FLOOR
+        ?? entryPrice * quantity * 0.005; // 0.5% of position value
+
+    // Trail mode: PNL_TRAIL | PRICE_TRAIL | HYBRID
+    const trailMode = config.trailMode ?? config.TRAIL_MODE ?? TRAIL_MODE.PNL_TRAIL;
+
+    // ── Hard stop loss ────────────────────────────────────────────────────────
     const stopPrice = isShort
         ? entryPrice * (1 + stopLossPct / 100)
         : entryPrice * (1 - stopLossPct / 100);
 
-    // ── Profit target ──────────────────────────────────────────────────────
-    // RSI uses fixed % (mean reversion snaps back to a level)
-    // All other strategies use risk/reward multiplier
-    // SHORT: target is BELOW entry for both modes
-    const targetMode = MEAN_REVERSION_STRATEGIES.has(openingStrategy)
-        ? 'FIXED_PCT'
-        : 'RISK_REWARD';
+    // ── Profit target ─────────────────────────────────────────────────────────
+    const MEAN_REVERSION = new Set(['RSI_MEAN_REVERSION']);
+    const targetMode = MEAN_REVERSION.has(openingStrategy) ? 'FIXED_PCT' : 'RISK_REWARD';
 
     let profitTargetPrice;
     if (isShort) {
         profitTargetPrice = targetMode === 'FIXED_PCT'
             ? entryPrice * (1 - profitTargetPct / 100)
             : entryPrice - (stopPrice - entryPrice) * riskRewardRatio;
-        // stopPrice > entryPrice for shorts, so (stopPrice - entry) = risk distance
     } else {
         profitTargetPrice = targetMode === 'FIXED_PCT'
             ? entryPrice * (1 + profitTargetPct / 100)
             : entryPrice + (entryPrice - stopPrice) * riskRewardRatio;
     }
 
-    // ── Partial exit quantity ──────────────────────────────────────────────
+    // ── Partial exit ──────────────────────────────────────────────────────────
     const partialQty = partialExitEnabled
         ? Math.max(1, Math.floor(quantity * (partialExitPct / 100)))
         : 0;
 
-    // ── Initial trail stop ─────────────────────────────────────────────────
-    // LONG:  trail starts below entry, moves UP
-    // SHORT: trail starts above entry, moves DOWN
+    // ── ATR for price-trail component ─────────────────────────────────────────
     const atrPct = recentCloses.length >= 14
         ? computeAtrPct(recentHighs, recentLows, recentCloses)
         : null;
-
     const trailMultiplier = REGIME_TRAIL_MULTIPLIER[regime] ?? REGIME_TRAIL_MULTIPLIER.UNKNOWN;
     const effectiveTrailPct = (atrPct != null ? atrPct : trailingStopPct) * trailMultiplier;
 
-    const initialTrailStop = isShort
-        ? entryPrice * (1 + effectiveTrailPct / 100)   // above entry for shorts
-        : entryPrice * (1 - effectiveTrailPct / 100);  // below entry for longs
+    // ── Initial price-trail stop (legacy component, still computed) ───────────
+    const initialPriceTrailStop = isShort
+        ? entryPrice * (1 + effectiveTrailPct / 100)
+        : entryPrice * (1 - effectiveTrailPct / 100);
 
-    // ── Low-water mark (short equivalent of high-water mark) ──────────────
-    // LONG:  highWaterMark — the best (highest) price seen since entry
-    // SHORT: lowWaterMark  — the best (lowest)  price seen since entry
-    // We store it as 'highWaterMark' for compatibility; for shorts it holds
-    // the low-water value.
-    const waterMark = entryPrice;
+    // ── PnL trail initial values ───────────────────────────────────────────────
+    // peakUnrealizedPnl: best unrealized PnL seen so far (₹)
+    //   Starts at 0 (no profit at entry)
+    // pnlTrailStop: minimum PnL we'll accept before exiting
+    //   Starts at -Infinity (trail hasn't activated yet)
+    const peakUnrealizedPnl = 0;
+    const pnlTrailStop = -Infinity; // activates once pnlTrailFloor is breached
 
     return {
         direction,
         isShort,
 
-        // Stop loss
+        // ── Hard stop ──────────────────────────────────────────────────────────
         stopPrice,
 
-        // Trailing stop (moves in favorable direction, never reverses)
-        trailStopPrice: initialTrailStop,
+        // ── Price trail (legacy, still computed for HYBRID mode) ───────────────
+        trailStopPrice: initialPriceTrailStop,
         trailPct: effectiveTrailPct,
-        highWaterMark: waterMark,   // for longs: highest price; for shorts: lowest price
+        highWaterMark: entryPrice,  // price high/low watermark
 
-        // Profit target
+        // ── PnL trail (new — primary trail mechanism) ──────────────────────────
+        trailMode,
+        pnlTrailPct,
+        pnlTrailFloor,                // minimum profit (₹) before trail activates
+        peakUnrealizedPnl,            // peak profit seen so far (₹)
+        pnlTrailStop,                 // current trail floor in ₹ (-Infinity = inactive)
+        pnlTrailActivated: false,     // has trail floor been crossed yet?
+
+        // ── Profit target ──────────────────────────────────────────────────────
         profitTargetPrice,
         profitTargetMode: targetMode,
 
-        // Partial exit
+        // ── Partial exit ───────────────────────────────────────────────────────
         partialExitEnabled,
         partialExitQty: partialQty,
         partialExitDone: false,
 
-        // Signal reversal
+        // ── Signal reversal ────────────────────────────────────────────────────
         signalReversalEnabled,
         openingStrategy,
 
-        // Metadata
+        // ── Metadata ───────────────────────────────────────────────────────────
         entryAtrPct: atrPct,
         entryRegime: regime,
         entryTrailPct: effectiveTrailPct,
         trailMultiplier,
+
+        // ── PnL trail metadata for dashboard ──────────────────────────────────
+        peakPnlAt: null,  // timestamp when peak was hit
+        pnlTrailHistory: [],    // [{pnl, price, ts}] for debugging
     };
 }
 
-// ═══════════════════════════════════════════════════════
-// PUBLIC: Exit decision
-// ═══════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
+// updateTrailStop — PnL-aware ratchet
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Determine if and how a position should exit.
- * Handles both LONG and SHORT positions transparently.
+ * Recompute and ratchet trail stops given current price.
  *
- * @param {Object} params
- * @param {string}   params.symbol
- * @param {Object}   params.posCtx
- * @param {number}   params.currentPrice
- * @param {number[]} [params.recentCloses]
- * @param {number[]} [params.recentHighs]
- * @param {number[]} [params.recentLows]
- * @param {string}   [params.regime]
- * @param {Object}   [params.latestSignals]
- * @param {Object}   params.config
- * @returns {{ exit: boolean, partial: boolean, reason: string|null, qty: number }}
+ * PRIMARY: PnL trail — tracks peak ₹ profit, exits if it drops by pnlTrailPct%
+ * SECONDARY: Price trail — legacy behavior, used in HYBRID mode
+ *
+ * @param {Object}   posCtx
+ * @param {number}   currentPrice
+ * @param {number[]} recentCloses
+ * @param {number[]} recentHighs
+ * @param {number[]} recentLows
+ * @param {string}   regime
+ * @param {Object}   config
+ * @returns {Partial<Object>} fields to merge back into posCtx
  */
+export function updateTrailStop(
+    posCtx, currentPrice,
+    recentCloses, recentHighs, recentLows,
+    regime, config,
+) {
+    const updates = {};
+    const isShort = posCtx.isShort ?? posCtx.direction === 'SELL';
+    const qty = posCtx.quantity;
+    const entry = posCtx.entryPrice ?? posCtx.price;
+
+    // ── Compute current unrealized PnL in ₹ ─────────────────────────────────
+    const unrealizedPnl = isShort
+        ? (entry - currentPrice) * qty   // short: profit when price falls
+        : (currentPrice - entry) * qty;  // long:  profit when price rises
+
+    const trailMode = posCtx.trailMode ?? TRAIL_MODE.PNL_TRAIL;
+    const pnlTrailPct = posCtx.pnlTrailPct ?? 25;
+    const pnlFloor = posCtx.pnlTrailFloor ?? (entry * qty * 0.005);
+
+    // ── PnL Trail Update ─────────────────────────────────────────────────────
+
+    if (trailMode === TRAIL_MODE.PNL_TRAIL || trailMode === TRAIL_MODE.HYBRID) {
+        const currentPeak = posCtx.peakUnrealizedPnl ?? 0;
+
+        // Update peak PnL if current is higher
+        if (unrealizedPnl > currentPeak) {
+            updates.peakUnrealizedPnl = unrealizedPnl;
+            updates.peakPnlAt = Date.now();
+
+            // Activate trail once profit crosses the floor threshold
+            if (unrealizedPnl >= pnlFloor) {
+                // PnL trail stop: retain (100 - pnlTrailPct)% of peak
+                // Example: peak ₹10,000, trail 25% → floor = ₹7,500
+                const newPnlTrailStop = unrealizedPnl * (1 - pnlTrailPct / 100);
+
+                // Trail only ratchets UP (protects more profit as peak grows)
+                // Never moves DOWN even if we recompute a lower value
+                const currentPnlTrailStop = posCtx.pnlTrailStop ?? -Infinity;
+
+                if (newPnlTrailStop > currentPnlTrailStop) {
+                    updates.pnlTrailStop = newPnlTrailStop;
+                    updates.pnlTrailActivated = true;
+
+                    // Diagnostics for dashboard/Telegram
+                    updates.pnlTrailHistory = [
+                        ...(posCtx.pnlTrailHistory ?? []).slice(-9), // keep last 10
+                        {
+                            pnl: +unrealizedPnl.toFixed(2),
+                            floor: +newPnlTrailStop.toFixed(2),
+                            price: currentPrice,
+                            pct: pnlTrailPct,
+                            ts: Date.now(),
+                        },
+                    ];
+                }
+            }
+        }
+    }
+
+    // ── Price Trail Update (legacy, for HYBRID mode) ─────────────────────────
+
+    if (trailMode === TRAIL_MODE.PRICE_TRAIL || trailMode === TRAIL_MODE.HYBRID) {
+        const newWatermark = isShort
+            ? currentPrice < posCtx.highWaterMark   // new low for shorts
+            : currentPrice > posCtx.highWaterMark;  // new high for longs
+
+        if (newWatermark) {
+            updates.highWaterMark = currentPrice;
+            updates.currentRegime = regime;
+
+            const atrPct = recentCloses.length >= 14
+                ? computeAtrPct(recentHighs, recentLows, recentCloses)
+                : null;
+            const multiplier = REGIME_TRAIL_MULTIPLIER[regime] ?? REGIME_TRAIL_MULTIPLIER.UNKNOWN;
+            const trailPct = (atrPct != null ? atrPct : posCtx.trailPct) * multiplier;
+
+            let newPriceTrail = isShort
+                ? currentPrice * (1 + trailPct / 100)
+                : currentPrice * (1 - trailPct / 100);
+
+            // Break-even protection
+            const profitable = isShort
+                ? currentPrice <= entry * 0.995
+                : currentPrice >= entry * 1.005;
+
+            if (profitable) {
+                if (isShort && newPriceTrail > entry) newPriceTrail = entry;
+                if (!isShort && newPriceTrail < entry) newPriceTrail = entry;
+            }
+
+            const trailImproved = isShort
+                ? newPriceTrail < posCtx.trailStopPrice
+                : newPriceTrail > posCtx.trailStopPrice;
+
+            if (trailImproved) {
+                updates.trailStopPrice = newPriceTrail;
+                updates.trailPct = trailPct;
+                updates.trailMultiplier = multiplier;
+                updates.currentAtrPct = atrPct;
+            }
+        }
+    }
+
+    return updates;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// evaluateExits — PnL trail check added
+// ─────────────────────────────────────────────────────────────────────────────
+
 export function evaluateExits({
     symbol,
     posCtx,
@@ -218,8 +316,10 @@ export function evaluateExits({
 }) {
     const noExit = { exit: false, partial: false, reason: null, qty: posCtx.quantity };
     const isShort = posCtx.isShort ?? posCtx.direction === 'SELL';
+    const qty = posCtx.quantity;
+    const entry = posCtx.entryPrice ?? posCtx.price;
 
-    // ── Update trail stop before checking ─────────────────────────────────
+    // ── Update trail before checking ──────────────────────────────────────────
     const updatedLevels = updateTrailStop(
         posCtx, currentPrice,
         recentCloses, recentHighs, recentLows,
@@ -227,9 +327,12 @@ export function evaluateExits({
     );
     Object.assign(posCtx, updatedLevels);
 
-    // ── 1. STOP_LOSS ───────────────────────────────────────────────────────
-    // LONG:  stop fires when price drops BELOW stopPrice
-    // SHORT: stop fires when price rises ABOVE stopPrice
+    // ── Current unrealized PnL ────────────────────────────────────────────────
+    const unrealizedPnl = isShort
+        ? (entry - currentPrice) * qty
+        : (currentPrice - entry) * qty;
+
+    // ── 1. STOP_LOSS (price-based hard floor — unchanged) ─────────────────────
     const stopHit = isShort
         ? currentPrice >= posCtx.stopPrice
         : currentPrice <= posCtx.stopPrice;
@@ -238,19 +341,18 @@ export function evaluateExits({
         return {
             exit: true, partial: false,
             reason: 'STOP_LOSS',
-            qty: posCtx.quantity,
+            qty,
             meta: {
                 trigger: posCtx.stopPrice,
                 current: currentPrice,
-                dropPct: pct(posCtx.entryPrice, currentPrice),
+                lossRupees: +Math.abs(unrealizedPnl).toFixed(2),
+                lossPct: +pct(entry, currentPrice, isShort).toFixed(2),
                 isShort,
             },
         };
     }
 
-    // ── 2. PROFIT_TARGET (full exit) ──────────────────────────────────────
-    // LONG:  target fires when price rises ABOVE targetPrice
-    // SHORT: target fires when price falls BELOW targetPrice
+    // ── 2. PROFIT_TARGET / PARTIAL_EXIT (unchanged) ───────────────────────────
     const targetHit = isShort
         ? currentPrice <= posCtx.profitTargetPrice
         : currentPrice >= posCtx.profitTargetPrice;
@@ -259,25 +361,21 @@ export function evaluateExits({
         return {
             exit: true, partial: false,
             reason: 'PROFIT_TARGET',
-            qty: posCtx.quantity,
+            qty,
             meta: {
                 target: posCtx.profitTargetPrice,
                 current: currentPrice,
-                gainPct: pct(posCtx.entryPrice, currentPrice),
+                gainRupees: +unrealizedPnl.toFixed(2),
+                gainPct: +pct(entry, currentPrice, isShort).toFixed(2),
                 mode: posCtx.profitTargetMode,
                 isShort,
             },
         };
     }
 
-    // ── 3. PARTIAL_EXIT ───────────────────────────────────────────────────
-    if (
-        posCtx.partialExitEnabled &&
-        !posCtx.partialExitDone &&
-        targetHit &&
-        posCtx.partialExitQty > 0 &&
-        posCtx.partialExitQty < posCtx.quantity
-    ) {
+    if (posCtx.partialExitEnabled && !posCtx.partialExitDone &&
+        targetHit && posCtx.partialExitQty > 0 &&
+        posCtx.partialExitQty < posCtx.quantity) {
         return {
             exit: false, partial: true,
             reason: 'PARTIAL_EXIT',
@@ -287,42 +385,91 @@ export function evaluateExits({
                 current: currentPrice,
                 partialQty: posCtx.partialExitQty,
                 remainingQty: posCtx.quantity - posCtx.partialExitQty,
-                gainPct: pct(posCtx.entryPrice, currentPrice),
+                gainPct: +pct(entry, currentPrice, isShort).toFixed(2),
                 isShort,
             },
         };
     }
 
-    // ── 4. TRAILING_STOP ──────────────────────────────────────────────────
-    // LONG:  trail fires when price drops BELOW trailStopPrice AND was profitable
-    //        (highWaterMark > entryPrice)
-    // SHORT: trail fires when price rises ABOVE trailStopPrice AND was profitable
-    //        (lowWaterMark < entryPrice — stored in highWaterMark for shorts)
-    const trailHit = isShort
-        ? currentPrice >= posCtx.trailStopPrice &&
-        posCtx.highWaterMark < posCtx.entryPrice
-        : currentPrice <= posCtx.trailStopPrice &&
-        posCtx.highWaterMark > posCtx.entryPrice;
+    // ── 3. PNL TRAILING STOP (NEW — primary trail check) ─────────────────────
+    //
+    // Fires when ALL of these are true:
+    //   a) Trail has been activated (peak profit crossed pnlTrailFloor)
+    //   b) Current PnL has dropped below the trail floor
+    //   c) We were profitable (peak > 0) — prevents firing on initial loss
+    //
+    const trailMode = posCtx.trailMode ?? TRAIL_MODE.PNL_TRAIL;
+    const isPnlTrail = trailMode === TRAIL_MODE.PNL_TRAIL || trailMode === TRAIL_MODE.HYBRID;
 
-    if (trailHit) {
-        return {
-            exit: true, partial: false,
-            reason: 'TRAILING_STOP',
-            qty: posCtx.quantity,
-            meta: {
-                trailStop: posCtx.trailStopPrice,
-                highWaterMark: posCtx.highWaterMark,
-                current: currentPrice,
-                lockedPnlPct: pct(posCtx.entryPrice, posCtx.trailStopPrice),
-                regime: posCtx.currentRegime || posCtx.entryRegime,
-                isShort,
-            },
-        };
+    if (isPnlTrail && posCtx.pnlTrailActivated) {
+        const pnlDroppedThroughFloor = unrealizedPnl < posCtx.pnlTrailStop;
+        const wasEverProfitable = (posCtx.peakUnrealizedPnl ?? 0) > 0;
+
+        if (pnlDroppedThroughFloor && wasEverProfitable) {
+            const retainedPct = posCtx.peakUnrealizedPnl > 0
+                ? (posCtx.pnlTrailStop / posCtx.peakUnrealizedPnl * 100).toFixed(1)
+                : 0;
+
+            return {
+                exit: true, partial: false,
+                reason: 'TRAILING_STOP',  // keeps same reason string for compatibility
+                qty,
+                meta: {
+                    trailType: 'PNL_TRAIL',
+                    currentPnl: +unrealizedPnl.toFixed(2),
+                    peakPnl: +posCtx.peakUnrealizedPnl.toFixed(2),
+                    pnlFloor: +posCtx.pnlTrailStop.toFixed(2),
+                    pnlGivenBack: +(posCtx.peakUnrealizedPnl - unrealizedPnl).toFixed(2),
+                    pnlGivenBackPct: +(100 - parseFloat(retainedPct)).toFixed(1),
+                    retainedPct: +retainedPct,
+                    currentPrice,
+                    entryPrice: entry,
+                    quantity: qty,
+                    regime: posCtx.currentRegime ?? posCtx.entryRegime,
+                    isShort,
+                },
+            };
+        }
     }
 
-    // ── 5. SIGNAL_REVERSAL ────────────────────────────────────────────────
-    // LONG:  opening strategy fires SELL → exit
-    // SHORT: opening strategy fires BUY  → cover
+    // ── 4. PRICE TRAILING STOP (legacy, or HYBRID second check) ──────────────
+    //
+    // In PNL_TRAIL mode:  only fires if position never became profitable
+    //                     (PnL trail never activated) — acts as a backstop
+    // In PRICE_TRAIL mode: fires as before
+    // In HYBRID mode:      fires if EITHER PnL OR price trail is breached
+    //
+    const isPriceTrail = trailMode === TRAIL_MODE.PRICE_TRAIL || trailMode === TRAIL_MODE.HYBRID;
+    const pnlTrailNeverActivated = !posCtx.pnlTrailActivated;
+
+    const shouldCheckPriceTrail = isPriceTrail ||
+        (trailMode === TRAIL_MODE.PNL_TRAIL && pnlTrailNeverActivated);
+
+    if (shouldCheckPriceTrail) {
+        const priceTrailHit = isShort
+            ? currentPrice >= posCtx.trailStopPrice && posCtx.highWaterMark < entry
+            : currentPrice <= posCtx.trailStopPrice && posCtx.highWaterMark > entry;
+
+        if (priceTrailHit) {
+            return {
+                exit: true, partial: false,
+                reason: 'TRAILING_STOP',
+                qty,
+                meta: {
+                    trailType: 'PRICE_TRAIL',
+                    trailStop: posCtx.trailStopPrice,
+                    highWaterMark: posCtx.highWaterMark,
+                    currentPrice,
+                    currentPnl: +unrealizedPnl.toFixed(2),
+                    lockedPnlPct: +pct(entry, posCtx.trailStopPrice, isShort).toFixed(2),
+                    regime: posCtx.currentRegime ?? posCtx.entryRegime,
+                    isShort,
+                },
+            };
+        }
+    }
+
+    // ── 5–6. Signal reversal + Time exit (unchanged) ─────────────────────────
     if (posCtx.signalReversalEnabled && posCtx.openingStrategy) {
         const reversalSignal = latestSignals[posCtx.openingStrategy];
         const reversalHit = isShort
@@ -333,186 +480,96 @@ export function evaluateExits({
             return {
                 exit: true, partial: false,
                 reason: 'SIGNAL_REVERSAL',
-                qty: posCtx.quantity,
+                qty,
                 meta: {
                     strategy: posCtx.openingStrategy,
                     signal: reversalSignal,
-                    pnlPct: pct(posCtx.entryPrice, currentPrice),
+                    currentPnl: +unrealizedPnl.toFixed(2),
                     isShort,
                 },
             };
         }
     }
 
-    // ── 5b. RSI EXIT HELPER (longs only) ────────────────────────────────────
-    // RSI overbought (SELL signal) exits long positions even if the opening
-    // strategy has not reversed. RSI is not in consensus - it cannot open
-    // new shorts; it only closes existing long positions.
-    // Only fires on CONFIDENT RSI signals (>= 65) to avoid false triggers.
     if (!isShort && latestSignals?.RSI_MEAN_REVERSION === 'SELL') {
         const rsiConfidence = latestSignals?._RSI_CONFIDENCE ?? 0;
         if (rsiConfidence >= 65) {
             return {
                 exit: true, partial: false,
                 reason: 'RSI_OVERBOUGHT_EXIT',
-                qty:    posCtx.quantity,
-                meta: {
-                    rsiSignal:     'SELL',
-                    rsiConfidence,
-                    pnlPct:        pct(posCtx.entryPrice, currentPrice),
-                },
+                qty,
+                meta: { rsiConfidence, currentPnl: +unrealizedPnl.toFixed(2) },
             };
         }
     }
 
-    // -- 6. TIME_EXIT --------------------------------------------------------
     const holdMinutes = (Date.now() - posCtx.timestamp) / 60000;
-    const pnlPct = isShort
-        ? pct(currentPrice, posCtx.entryPrice)   // profit when price falls
-        : pct(posCtx.entryPrice, currentPrice);
+    const pnlPct = +pct(entry, currentPrice, isShort).toFixed(2);
     const maxHold = config.maxHoldMinutes ?? 90;
 
-    // Tier 1 (soft): flat or losing past max hold → exit
     if (holdMinutes >= maxHold && pnlPct < 0.3) {
         return {
             exit: true, partial: false,
             reason: 'TIME_EXIT',
-            qty: posCtx.quantity,
-            meta: { holdMinutes: +holdMinutes.toFixed(1), maxHold, pnlPct, tier: 'soft', isShort },
+            qty,
+            meta: {
+                holdMinutes: +holdMinutes.toFixed(1),
+                maxHold,
+                pnlPct,
+                currentPnl: +unrealizedPnl.toFixed(2),
+                tier: 'soft',
+                isShort,
+            },
         };
     }
 
-    // Tier 2 (hard): any position held > 2× maxHold (unless trail is in profit zone)
     const trailInProfitZone = isShort
-        ? posCtx.trailStopPrice <= posCtx.entryPrice
-        : posCtx.trailStopPrice >= posCtx.entryPrice;
+        ? posCtx.trailStopPrice <= entry
+        : posCtx.trailStopPrice >= entry;
 
     if (holdMinutes >= maxHold * 2 && !trailInProfitZone) {
         return {
             exit: true, partial: false,
             reason: 'TIME_EXIT',
-            qty: posCtx.quantity,
-            meta: { holdMinutes: +holdMinutes.toFixed(1), maxHold, pnlPct, tier: 'hard', isShort },
+            qty,
+            meta: {
+                holdMinutes: +holdMinutes.toFixed(1),
+                maxHold,
+                pnlPct,
+                currentPnl: +unrealizedPnl.toFixed(2),
+                tier: 'hard',
+                isShort,
+            },
         };
     }
 
     return noExit;
 }
 
-// ═══════════════════════════════════════════════════════
-// PUBLIC: Trail stop updater
-// ═══════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Recompute and ratchet trail stop given current price.
- * For LONG:  trail ratchets UP   — only moves when price makes new highs.
- * For SHORT: trail ratchets DOWN — only moves when price makes new lows.
- *
- * @param {Object}   posCtx
- * @param {number}   currentPrice
- * @param {number[]} recentCloses
- * @param {number[]} recentHighs
- * @param {number[]} recentLows
- * @param {string}   regime
- * @param {Object}   config
- * @returns {Partial<Object>}
- */
-export function updateTrailStop(
-    posCtx, currentPrice,
-    recentCloses, recentHighs, recentLows,
-    regime, config,
-) {
-    const updates = {};
-    const isShort = posCtx.isShort ?? posCtx.direction === 'SELL';
-
-    // For longs, new high = new watermark.
-    // For shorts, new low = new watermark (stored in same highWaterMark field).
-    const newWatermark = isShort
-        ? currentPrice < posCtx.highWaterMark  // new low for shorts
-        : currentPrice > posCtx.highWaterMark; // new high for longs
-
-    if (!newWatermark) return updates;
-
-    updates.highWaterMark = currentPrice;
-    updates.currentRegime = regime;
-
-    // Recompute trail width
-    const atrPct = recentCloses.length >= 14
-        ? computeAtrPct(recentHighs, recentLows, recentCloses)
-        : null;
-    const multiplier = REGIME_TRAIL_MULTIPLIER[regime] ?? REGIME_TRAIL_MULTIPLIER.UNKNOWN;
-    const trailPct = atrPct != null
-        ? atrPct * multiplier
-        : (posCtx.trailPct ?? config.trailingStopPct);
-
-    let newTrailStop = isShort
-        ? currentPrice * (1 + trailPct / 100)   // trail above current price for shorts
-        : currentPrice * (1 - trailPct / 100);  // trail below current price for longs
-
-    // Break-even protection — trail locked at entry once sufficiently profitable
-    const significantlyProfitable = isShort
-        ? currentPrice <= posCtx.entryPrice * 0.995   // 0.5% below entry for shorts
-        : currentPrice >= posCtx.entryPrice * 1.005;  // 0.5% above entry for longs
-
-    if (significantlyProfitable) {
-        if (isShort && newTrailStop > posCtx.entryPrice) {
-            newTrailStop = posCtx.entryPrice;
-        } else if (!isShort && newTrailStop < posCtx.entryPrice) {
-            newTrailStop = posCtx.entryPrice;
-        }
-    }
-
-    // Trail only ratchets in the favorable direction — never reverses
-    const trailImproved = isShort
-        ? newTrailStop < posCtx.trailStopPrice   // lower trail stop = more profit locked for short
-        : newTrailStop > posCtx.trailStopPrice;  // higher trail stop = more profit locked for long
-
-    if (trailImproved) {
-        updates.trailStopPrice = newTrailStop;
-        updates.trailPct = trailPct;
-        updates.trailMultiplier = multiplier;
-        updates.currentAtrPct = atrPct;
-    }
-
-    return updates;
+function pct(entry, current, isShort = false) {
+    if (entry <= 0) return 0;
+    return isShort
+        ? ((entry - current) / entry) * 100
+        : ((current - entry) / entry) * 100;
 }
 
-// ═══════════════════════════════════════════════════════
-// PUBLIC: ATR calculation
-// ═══════════════════════════════════════════════════════
-
-/**
- * Compute ATR as a percentage of current price.
- */
 export function computeAtrPct(highs, lows, closes, period = 14) {
-    if (
-        !highs?.length || !lows?.length || !closes?.length ||
-        highs.length < period + 1 ||
-        lows.length < period + 1 ||
-        closes.length < period + 1
-    ) return null;
+    if (!highs?.length || !lows?.length || !closes?.length ||
+        highs.length < period + 1 || closes.length < period + 1) return null;
 
-    const trueRanges = [];
+    const trs = [];
     for (let i = 1; i < closes.length; i++) {
         const hl = highs[i] - lows[i];
         const hpc = Math.abs(highs[i] - closes[i - 1]);
         const lpc = Math.abs(lows[i] - closes[i - 1]);
-        trueRanges.push(Math.max(hl, hpc, lpc));
+        trs.push(Math.max(hl, hpc, lpc));
     }
-
-    const recent = trueRanges.slice(-period);
+    const recent = trs.slice(-period);
     const atr = recent.reduce((a, b) => a + b, 0) / recent.length;
     const last = closes[closes.length - 1];
-
-    if (last <= 0) return null;
-    return (atr / last) * 100;
-}
-
-// ═══════════════════════════════════════════════════════
-// HELPERS
-// ═══════════════════════════════════════════════════════
-
-/** % change from a to b, rounded to 2dp */
-function pct(from, to) {
-    return from > 0 ? +((to - from) / from * 100).toFixed(2) : 0;
+    return last <= 0 ? null : (atr / last) * 100;
 }

@@ -355,11 +355,11 @@ export function createApiHandler(deps) {
         killSwitchReason: ksStatus.reason,
         bestTrade: null,
         worstTrade: null,
-        dailyRoi:          roiData.dailyRoi,
+        dailyRoi: roiData.dailyRoi,
         totalCashRequired: roiData.totalCashRequired,
         currentDeployment: roiData.currentDeployment,
-        walletDeployed:    roiData.walletDeployed,   // net fresh wallet cash still locked in positions (≤ capital)
-        peakDeployment:    roiData.peakDeployment,
+        walletDeployed: roiData.walletDeployed,   // net fresh wallet cash still locked in positions (≤ capital)
+        peakDeployment: roiData.peakDeployment,
       });
     } catch (err) {
       log.error({ err }, 'Error in /api/summary');
@@ -595,18 +595,18 @@ export function createApiHandler(deps) {
           else tradeType = 'LONG_EXIT';
         }
         return {
-          date:            new Date(t.created_at).toLocaleDateString('en-IN'),
-          symbol:          t.symbol,
-          side:            t.side,
+          date: new Date(t.created_at).toLocaleDateString('en-IN'),
+          symbol: t.symbol,
+          side: t.side,
           tradeType,
-          quantity:        t.quantity,
-          price:           parseFloat(t.price),
+          quantity: t.quantity,
+          price: parseFloat(t.price),
           pnl,
-          strategy:        t.strategy,
-          status:          t.status,
-          orderId:         t.order_id,
+          strategy: t.strategy,
+          status: t.status,
+          orderId: t.order_id,
           capitalDeployed: t.capital_deployed ? parseFloat(t.capital_deployed) : null,
-          tradeRoi:        t.trade_roi        ? parseFloat(t.trade_roi)        : null,
+          tradeRoi: t.trade_roi ? parseFloat(t.trade_roi) : null,
         };
       });
 
@@ -1073,7 +1073,7 @@ export function createApiHandler(deps) {
           `📤 Exit price: ₹${exitPrice.toFixed(2)}\n` +
           `💰 P&amp;L: ${pnlStr}\n` +
           `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
-        ).catch(() => {});
+        ).catch(() => { });
       }
 
       json(res, { success: result?.success ?? true, symbol, exitPrice, pnl: result?.pnl ?? null });
