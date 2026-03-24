@@ -146,6 +146,27 @@ export function createApiHandler(deps) {
       default: config.PARTIAL_EXIT_PCT ?? 50,
       category: 'exits',
     },
+    PNL_TRAIL_PCT: {
+      label: 'PnL Trail Fallback %',
+      description: 'How much of peak profit (%) to give back before exiting',
+      type: 'number', min: 10, max: 50, step: 1,
+      default: config.PNL_TRAIL_PCT ?? 25,
+      category: 'exits',
+    },
+    PNL_TRAIL_FLOOR: {
+      label: 'PnL Trail Floor (₹)',
+      description: 'Minimum ₹ profit before trail activates (0 = auto 0.5% value)',
+      type: 'number', min: 0, max: 10000, step: 50,
+      default: config.PNL_TRAIL_FLOOR ?? 0,
+      category: 'exits',
+    },
+    TRAIL_MODE: {
+      label: 'Trail Logic Mode',
+      description: 'Which trailing stop logic to use',
+      type: 'select', options: ['PNL_TRAIL', 'PRICE_TRAIL', 'HYBRID'],
+      default: config.TRAIL_MODE ?? 'PNL_TRAIL',
+      category: 'exits',
+    },
     SIGNAL_REVERSAL_ENABLED: {
       label: 'Signal Reversal Exit',
       description: 'Exit when the strategy that opened the position fires the opposite signal',
@@ -338,17 +359,17 @@ export function createApiHandler(deps) {
         };
       } catch { /* OK — no trades yet */ }
 
-      const roiData = riskManager.getDailyRoi();
+      const liveCapital = getLiveSetting ? await getLiveSetting('TRADING_CAPITAL', config.TRADING_CAPITAL) : config.TRADING_CAPITAL;
       json(res, {
         pnl: tradeStats.totalPnl || 0,
-        pnlPct: (tradeStats.totalPnl / config.TRADING_CAPITAL * 100) || 0,
+        pnlPct: (tradeStats.totalPnl / liveCapital * 100) || 0,
         tradeCount: tradeStats.count,
         winCount: tradeStats.wins,
         lossCount: tradeStats.losses,
         filled: tradeStats.filled,
         rejected: tradeStats.rejected,
         drawdownPct: riskStatus.drawdownPct || 0,
-        capital: config.TRADING_CAPITAL,
+        capital: liveCapital,
         capitalDeployed: riskStatus.dailyPnl ? Math.abs(riskStatus.dailyPnl) : 0,
         paperMode: !config.LIVE_TRADING,
         killSwitchEngaged: ksStatus.engaged,
@@ -414,6 +435,7 @@ export function createApiHandler(deps) {
             avgPrice: entryPrice,
             entryPrice,
             currentPrice,
+            targetPrice: ctx.profitTargetPrice ?? null,
             stopPrice: ctx.stopPrice ?? null,
             stopLoss: ctx.stopPrice ?? null,
             trailStopPrice: ctx.trailStopPrice ?? null,
@@ -443,6 +465,7 @@ export function createApiHandler(deps) {
             avgPrice: entryPrice,
             entryPrice,
             currentPrice,
+            targetPrice: p.profit_target ? parseFloat(p.profit_target) : null,
             stopPrice: p.stop_price ? parseFloat(p.stop_price) : null,
             stopLoss: p.stop_price ? parseFloat(p.stop_price) : null,
             unrealisedPnL: (p.direction === 'SELL'
@@ -461,6 +484,7 @@ export function createApiHandler(deps) {
           avgPrice: o.price,
           entryPrice: o.price,
           currentPrice: o.filledPrice || o.price,
+          targetPrice: o.profitTargetPrice ?? null,
           stopPrice: null,
           stopLoss: null,
           unrealisedPnL: ((o.filledPrice || o.price) - o.price) * o.quantity,
@@ -582,16 +606,29 @@ export function createApiHandler(deps) {
         //   opening_strategies not null  → this row IS an entry (BUY=long entry, SELL=short entry)
         //   pnl != 0 + side=BUY         → short cover (closing a short)
         //   pnl != 0 + side=SELL        → long exit
-        const hasOpeningStrategies = !!t.opening_strategies;
+
+        let hasOpeningStrategies = t.opening_strategies && t.opening_strategies !== '[]' && t.opening_strategies !== 'null';
+
         const pnl = parseFloat(t.pnl) || 0;
+
+        // Fix for past trades affected by the execution engine race condition:
+        // Exits should never pretend to be entries.
+        const exitStrategies = new Set([
+          'MANUAL_EXIT', 'PARTIAL_EXIT', 'STOP_LOSS', 'TRAILING_STOP',
+          'PROFIT_TARGET', 'END_OF_DAY', 'MAX_HOLD_TIME', 'SIGNAL_REVERSAL', 'KILL_SWITCH'
+        ]);
+        if (exitStrategies.has(t.strategy)) {
+          hasOpeningStrategies = false;
+        }
+
         let tradeType;
         if (t.side === 'BUY') {
           if (hasOpeningStrategies) tradeType = 'LONG_ENTRY';
-          else if (Math.abs(pnl) < 0.01) tradeType = 'LONG_ENTRY'; // Legacy fallback
+          else if (Math.abs(pnl) < 0.01 && !exitStrategies.has(t.strategy)) tradeType = 'LONG_ENTRY'; // Legacy fallback
           else tradeType = 'SHORT_COVER';
         } else {
           if (hasOpeningStrategies) tradeType = 'SHORT_ENTRY';
-          else if (Math.abs(pnl) < 0.01) tradeType = 'SHORT_ENTRY'; // Legacy fallback
+          else if (Math.abs(pnl) < 0.01 && !exitStrategies.has(t.strategy)) tradeType = 'SHORT_ENTRY'; // Legacy fallback
           else tradeType = 'LONG_EXIT';
         }
         return {
@@ -881,6 +918,16 @@ export function createApiHandler(deps) {
         return;
       }
 
+      // Handle select type params (TRAIL_MODE)
+      if (schema.type === 'select') {
+        if (!schema.options.includes(value)) {
+          return json(res, { error: `Invalid option '${value}' for ${key}. Allowed: ${schema.options.join(', ')}` }, 400);
+        }
+        await setLiveSetting(key, value);
+        log.info({ key, value }, '⚙️  Live select setting updated');
+        json(res, { success: true, action: 'set', key, value, label: schema.label });
+        return;
+      }
 
       const numValue = Number(value);
 

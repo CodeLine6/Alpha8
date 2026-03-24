@@ -422,7 +422,7 @@ function PositionsTable({ data, loading }) {
                             <thead>
                                 <tr>
                                     <th>Symbol</th><th>Side</th><th>Qty</th><th>Avg Price</th>
-                                    <th>Entry Price</th><th>Current</th><th>P&L</th><th>Stop Loss</th><th></th>
+                                    <th>Entry Price</th><th>Current</th><th>P&L</th><th>Target</th><th>Stop Loss</th><th></th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -438,6 +438,7 @@ function PositionsTable({ data, loading }) {
                                             <td>{formatINR(pos.entryPrice)}</td>
                                             <td>{formatINR(pos.currentPrice)}</td>
                                             <td className={`font-medium ${pnlColor(unrealized)}`}>{formatINR(unrealized)}</td>
+                                            <td className="text-blue-400">{pos.targetPrice ? formatINR(pos.targetPrice) : '—'}</td>
                                             <td className="text-yellow-400">{pos.stopLoss ? formatINR(pos.stopLoss) : '—'}</td>
                                             <td>
                                                 <button

@@ -43,6 +43,10 @@ export class PositionManager {
             partialExitPct: config.PARTIAL_EXIT_PCT ?? 50,
             signalReversalEnabled: config.SIGNAL_REVERSAL_ENABLED ?? true,
             maxHoldMinutes: config.MAX_HOLD_MINUTES ?? 90,
+            // PnL-aware trailing stop params
+            pnlTrailPct: config.PNL_TRAIL_PCT ?? 25,
+            pnlTrailFloor: config.PNL_TRAIL_FLOOR ?? 0,
+            trailMode: config.TRAIL_MODE ?? 'PNL_TRAIL',
         };
 
         this._active = { ...this._base };
@@ -69,6 +73,10 @@ export class PositionManager {
                 partialExitPct: await this._getLiveSetting('PARTIAL_EXIT_PCT', this._base.partialExitPct),
                 signalReversalEnabled: await this._getLiveSetting('SIGNAL_REVERSAL_ENABLED', this._base.signalReversalEnabled),
                 maxHoldMinutes: await this._getLiveSetting('MAX_HOLD_MINUTES', this._base.maxHoldMinutes),
+                // PnL-aware trailing stop params wired to live settings
+                pnlTrailPct: Number(await this._getLiveSetting('PNL_TRAIL_PCT', this._base.pnlTrailPct)),
+                pnlTrailFloor: Number(await this._getLiveSetting('PNL_TRAIL_FLOOR', this._base.pnlTrailFloor)),
+                trailMode: await this._getLiveSetting('TRAIL_MODE', this._base.trailMode),
             };
         } catch (err) {
             log.warn({ err: err.message }, '_refreshParams failed — keeping current values');
@@ -273,12 +281,14 @@ export class PositionManager {
         if (!this.engine.telegram?.enabled) return;
 
         const isShort = posCtx.isShort ?? posCtx.direction === 'SELL';
-        // For LONG:  profit = (exit - entry) × qty
-        // For SHORT: profit = (entry - exit) × qty  ← was using long formula before
+        
         const grossFallback = isShort
             ? (posCtx.entryPrice - exitPrice) * posCtx.quantity
             : (exitPrice - posCtx.entryPrice) * posCtx.quantity;
-        const pnl = exitResult?.pnl ?? grossFallback;
+            
+        const grossPnl = exitResult?.order?.grossPnl ?? grossFallback;
+        const charges = exitResult?.order?.costPaid ?? 0;
+        const netPnl = exitResult?.order?.pnl ?? (grossPnl - charges);
 
         // pnlPct sign must also match direction
         const pnlPct = posCtx.entryPrice > 0
@@ -288,21 +298,21 @@ export class PositionManager {
               ).toFixed(2)
             : '0.00';
 
-        const emoji = pnl >= 0 ? '✅' : '🛑';
-        const pnlSign = pnl >= 0 ? '+' : '-';
-        const pnlStr = `${pnlSign}₹${Math.abs(pnl).toFixed(2)} (${pnl >= 0 ? '+' : ''}${pnlPct}%)`;
+        const emoji = netPnl >= 0 ? '✅' : '🛑';
+        const pnlSign = grossPnl >= 0 ? '+' : '-';
+        const pnlStr = `${pnlSign}₹${Math.abs(grossPnl).toFixed(2)} (${grossPnl >= 0 ? '+' : ''}${pnlPct}%)`;
 
         const reasonDetails = {
             STOP_LOSS: `🛑 Hard stop hit at ₹${meta?.trigger?.toFixed(2)}`,
             PROFIT_TARGET: `🎯 Target hit (${meta?.mode === 'FIXED_PCT' ? 'fixed %' : `${posCtx.riskRewardRatio ?? '?'}× R/R`})`,
-            TRAILING_STOP: `📉 Trail stop — high was ₹${meta?.highWaterMark?.toFixed(2)}, locked ${meta?.lockedPnlPct ?? '?'}%`,
+            TRAILING_STOP: meta?.trailType === 'PNL_TRAIL'
+                ? `📉 Trail stop (PnL) — peak was ₹${meta?.peakPnl?.toFixed(2) ?? '?'}, retained ${meta?.retainedPct ?? '?'}%`
+                : `📉 Trail stop (Price) — high was ₹${meta?.highWaterMark?.toFixed(2)}, locked ${meta?.lockedPnlPct ?? '?'}%`,
             SIGNAL_REVERSAL: `🔄 ${meta?.strategy} fired ${meta?.signal} — reversal detected`,
             TIME_EXIT: `⏰ Max hold time (${meta?.holdMinutes}min) — P&amp;L was ${meta?.pnlPct}%`,
         }[reason] ?? reason;
 
-        const charges = exitResult?.costPaid ?? 0;
-        const netPnl = pnl - charges;
-        const netPnlStr = `${netPnl >= 0 ? '+' : '-'}₹${Math.abs(netPnl).toFixed(2)} (${netPnl >= 0 ? '+' : ''}${posCtx.entryPrice > 0 ? (isShort ? ((posCtx.entryPrice - exitPrice) / posCtx.entryPrice * 100) : ((exitPrice - posCtx.entryPrice) / posCtx.entryPrice * 100)).toFixed(2) : '0.00'}%)`;
+        const netPnlStr = `${netPnl >= 0 ? '+' : '-'}₹${Math.abs(netPnl).toFixed(2)} (${netPnl >= 0 ? '+' : ''}${pnlPct}%)`;
 
         await this.engine.telegram.sendRaw(
             `${emoji} <b>Position Exit — ${symbol}</b>\n\n` +

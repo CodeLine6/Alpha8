@@ -81,6 +81,10 @@ export default function LiveParamsPage() {
         const value = inputs[key];
         if (value === '' || value === null || value === undefined) return;
 
+        let payloadValue = value;
+        if (schema?.[key]?.type === 'number') payloadValue = Number(value);
+        else if (schema?.[key]?.type === 'boolean') payloadValue = value === 'true';
+
         setSaving(prev => ({ ...prev, [key]: true }));
         setErrors(prev => ({ ...prev, [key]: null }));
         setSuccess(prev => ({ ...prev, [key]: false }));
@@ -89,7 +93,7 @@ export default function LiveParamsPage() {
             const res = await fetch(`${API_BASE}/api/live-settings`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ key, value: Number(value) }),
+                body: JSON.stringify({ key, value: payloadValue }),
             });
             const json = await res.json();
 
@@ -107,8 +111,8 @@ export default function LiveParamsPage() {
                 ...prev,
                 [key]: {
                     ...prev[key],
-                    currentValue: Number(value),
-                    overrideValue: Number(value),
+                    currentValue: payloadValue,
+                    overrideValue: payloadValue,
                     isOverridden: true,
                 },
             }));
@@ -374,7 +378,10 @@ function ParamRow({
     const isOverridden = setting?.isOverridden ?? false;
     const currentValue = setting?.currentValue ?? schema.default;
     const defaultValue = schema.default;
-    const isDirty = Number(inputValue) !== currentValue;
+    
+    let isDirty = inputValue !== currentValue;
+    if (schema.type === 'number') isDirty = Number(inputValue) !== currentValue;
+    if (schema.type === 'boolean') isDirty = (inputValue === 'true') !== currentValue;
 
     // Format value for display — capital gets INR formatting
     function fmtValue(val) {
@@ -428,6 +435,18 @@ function ParamRow({
                         >
                             <option value="true">Enabled</option>
                             <option value="false">Disabled</option>
+                        </select>
+                    ) : schema.type === 'select' ? (
+                        <select
+                            className="input"
+                            value={String(inputValue)}
+                            disabled={isSaving}
+                            onChange={e => onInputChange(e.target.value)}
+                            style={{ width: 110 }}
+                        >
+                            {schema.options?.map(opt => (
+                                <option key={opt} value={opt}>{opt}</option>
+                            ))}
                         </select>
                     ) : (
                         <input

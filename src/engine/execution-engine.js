@@ -565,6 +565,7 @@ export class ExecutionEngine {
       price: exitPrice,
       strategy: reason,
     });
+    order.isExitOrder = true;
 
     this._orders.set(order.id, order);
 
@@ -710,6 +711,7 @@ export class ExecutionEngine {
         return order;
       }
       // existing.isShort === true — fall through to place BUY-to-cover
+      order.isExitOrder = true;
       log.info({ symbol: params.symbol }, `Covering SHORT position for ${params.symbol}`);
     }
 
@@ -971,6 +973,7 @@ export class ExecutionEngine {
           if (existingPos && !existingPos.isShort) {
             // ── Closing an existing LONG position ───────────────────────────
             const posCtx = existingPos;
+            order.isExitOrder = true;
             const { netPnl, grossPnl, totalCost } = calcNetPnl({
               entryPrice: posCtx.price,
               exitPrice: order.price,
