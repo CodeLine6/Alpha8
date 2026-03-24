@@ -328,6 +328,7 @@ export function createApiHandler(deps) {
     try {
       const riskStatus = riskManager.getStatus();
       const ksStatus = killSwitch.getStatus();
+      const roiData = riskManager.getDailyRoi();
 
       // Fix Bug 1: Removed dead first try/catch that assigned to undeclared `dbSummary`
       // (would throw ReferenceError in strict-mode ESM on every call).
