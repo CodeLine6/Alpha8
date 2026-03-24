@@ -32,8 +32,8 @@ const log = createLogger('adaptive-weights');
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const ALL_STRATEGIES = [
-    'EMA_CROSSOVER',
-    'RSI_MEAN_REVERSION',
+    'ORB',
+    'BAVI',
     'VWAP_MOMENTUM',
     'BREAKOUT_VOLUME',
 ];

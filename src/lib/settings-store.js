@@ -61,7 +61,19 @@ const DEFAULTS = {
     BREAKOUT_BB_PERIOD: null,
     BREAKOUT_BB_STDDEV: null,
 
+    // ── ORB Strategy ─────────────────────────────────────────────────────────────
+    ORB_MIN_RANGE_PCT: null,
+    ORB_MAX_RANGE_PCT: null,
+    ORB_VOLUME_MULTIPLIER: null,
+
+    // ── BAVI Strategy ────────────────────────────────────────────────────────────
+    BAVI_IMBALANCE_THRESHOLD: null,
+    BAVI_STRONG_IMBALANCE: null,
+    BAVI_MIN_TICK_COUNT: null,
+
     // ── Signal Consensus ────────────────────────────────────────────────────────
+    MIN_CONFIDENCE: null,
+    MIN_AGREEMENT: null,
     SUPER_CONVICTION_THRESHOLD: null,
 };
 

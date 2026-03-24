@@ -1,4 +1,4 @@
-import { BollingerBands } from 'technicalindicators';
+import { BollingerBands, EMA } from 'technicalindicators';
 import { SIGNAL, STRATEGY } from '../config/constants.js';
 import { BaseStrategy } from './base-strategy.js';
 import { createLogger } from '../lib/logger.js';
@@ -95,6 +95,14 @@ export class BreakoutVolumeStrategy extends BaseStrategy {
       bbUpper = bbValues[bbValues.length - 1].upper;
       bbLower = bbValues[bbValues.length - 1].lower;
     }
+    
+    // EMA50 Trend Filter
+    let ema50 = null;
+    if (closes.length >= 50) {
+      const emaValues = EMA.calculate({ period: 50, values: closes });
+      if (emaValues.length > 0) ema50 = emaValues[emaValues.length - 1];
+    }
+    const isBroadTrendUp = ema50 ? currentPrice > ema50 : false;
 
     const breakAboveResistance = currentPrice > resistanceLevel;
     const breakAboveBB = bbUpper && currentPrice > bbUpper;
@@ -120,21 +128,27 @@ export class BreakoutVolumeStrategy extends BaseStrategy {
     }
 
     if (breakBelowSupport || breakBelowBB) {
-      let confidence = 40;
-      const breakdownPct = ((supportLevel - currentPrice) / supportLevel) * 100;
-      confidence += Math.min(breakdownPct * 10, 20);
-      if (hasVolumeConfirmation) { confidence += 25; } else { confidence -= 10; }
-      if (breakBelowBB) confidence += 10;
-      confidence += Math.min(volumeRatio * 3, 10);
+      // Counter-trend block logic: do not short a breakdown if the 50EMA indicates a broad uptrend
+      if (isBroadTrendUp) {
+        log.debug({ currentPrice, ema50, supportLevel }, 'Blocked bearish breakdown sell signal due to broad EMA50 uptrend.');
+        // Fall back to HOLD
+      } else {
+        let confidence = 40;
+        const breakdownPct = ((supportLevel - currentPrice) / supportLevel) * 100;
+        confidence += Math.min(breakdownPct * 10, 20);
+        if (hasVolumeConfirmation) { confidence += 25; } else { confidence -= 10; }
+        if (breakBelowBB) confidence += 10;
+        confidence += Math.min(volumeRatio * 3, 10);
 
-      const reason =
-        `Bearish breakdown below ${this.lookbackPeriod}-period support ` +
-        `(${supportLevel.toFixed(2)}). Price: ${currentPrice.toFixed(2)} (-${breakdownPct.toFixed(2)}%). ` +
-        `Volume: ${volumeRatio.toFixed(1)}x avg${hasVolumeConfirmation ? ' ✓' : ' ✗ (unconfirmed)'}` +
-        (breakBelowBB ? `. Below Bollinger lower (${bbLower.toFixed(2)})` : '');
+        const reason =
+          `Bearish breakdown below ${this.lookbackPeriod}-period support ` +
+          `(${supportLevel.toFixed(2)}). Price: ${currentPrice.toFixed(2)} (-${breakdownPct.toFixed(2)}%). ` +
+          `Volume: ${volumeRatio.toFixed(1)}x avg${hasVolumeConfirmation ? ' ✓' : ' ✗ (unconfirmed)'}` +
+          (breakBelowBB ? `. Below Bollinger lower (${bbLower.toFixed(2)})` : '');
 
-      log.info({ signal: SIGNAL.SELL, confidence, breakdownPct, volumeRatio }, reason);
-      return this.buildSignal(SIGNAL.SELL, confidence, reason);
+        log.info({ signal: SIGNAL.SELL, confidence, breakdownPct, volumeRatio }, reason);
+        return this.buildSignal(SIGNAL.SELL, confidence, reason);
+      }
     }
 
     const range = resistanceLevel - supportLevel;

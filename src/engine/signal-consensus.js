@@ -162,7 +162,7 @@ export class SignalConsensus {
     for (const strategy of this.strategies) {
       let result;
       try {
-        result = strategy.analyze(candles);
+        result = strategy.analyze(candles, symbol);
         log.debug({ strategy: strategy.name, signal: result.signal, confidence: result.confidence, reason: result.reason },
           `[${strategy.name}] → ${result.signal} (${result.confidence}%)`);
       } catch (err) {

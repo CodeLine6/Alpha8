@@ -332,7 +332,7 @@ async function main() {
       this._symbol    = null;
     }
     setSymbol(symbol) { this._symbol = symbol; return this; }
-    analyze(candles)  { return this._strategy.analyze(candles, this._tickBuf, this._symbol); }
+    analyze(candles, symbol = null)  { return this._strategy.analyze(candles, this._tickBuf, symbol || this._symbol); }
     async refreshParams() { return this._strategy.refreshParams(); }
   }
   const baviAdapter = new BAVIAdapter(baviStrategy, rollingTickBuf);

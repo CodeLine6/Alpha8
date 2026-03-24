@@ -270,11 +270,61 @@ export function createApiHandler(deps) {
       default: 2, category: 'breakout',
     },
     // ── Signal Consensus ─────────────────────────────────────────────────────
+    MIN_CONFIDENCE: {
+      label: 'Minimum Confidence %',
+      description: 'Minimum confidence score required for a signal to vote',
+      type: 'number', min: 20, max: 90, step: 1,
+      default: 40, category: 'consensus',
+    },
+    MIN_AGREEMENT: {
+      label: 'Minimum Agreement count',
+      description: 'Minimum number of strategies that must agree for a valid consensus',
+      type: 'number', min: 1, max: 5, step: 1,
+      default: 2, category: 'consensus',
+    },
     SUPER_CONVICTION_THRESHOLD: {
       label: 'Super Conviction Threshold',
       description: 'Confidence % required for a single strategy to bypass cross-group consensus',
       type: 'number', min: 60, max: 95, step: 1,
       default: 80, category: 'consensus',
+    },
+    // ── ORB Strategy ─────────────────────────────────────────────────────────
+    ORB_MIN_RANGE_PCT: {
+      label: 'ORB Min Range %',
+      description: 'Minimum percentage width of the opening range',
+      type: 'number', min: 0.1, max: 2, step: 0.1,
+      default: 0.3, category: 'orb',
+    },
+    ORB_MAX_RANGE_PCT: {
+      label: 'ORB Max Range %',
+      description: 'Maximum percentage width of the opening range (prevents huge whipsaws)',
+      type: 'number', min: 1, max: 5, step: 0.1,
+      default: 3.0, category: 'orb',
+    },
+    ORB_VOLUME_MULTIPLIER: {
+      label: 'ORB Volume Multiplier',
+      description: 'Volume must be this × average to confirm ORB breakout',
+      type: 'number', min: 0.5, max: 5, step: 0.1,
+      default: 1.5, category: 'orb',
+    },
+    // ── BAVI Strategy ────────────────────────────────────────────────────────
+    BAVI_IMBALANCE_THRESHOLD: {
+      label: 'BAVI Imbalance Minimum',
+      description: 'Minimum bid-ask volume imbalance percentage to trigger',
+      type: 'number', min: 0.1, max: 0.9, step: 0.05,
+      default: 0.35, category: 'bavi',
+    },
+    BAVI_STRONG_IMBALANCE: {
+      label: 'BAVI Strong Imbalance',
+      description: 'Threshold defining a massive, high-confidence imbalance',
+      type: 'number', min: 0.4, max: 0.9, step: 0.05,
+      default: 0.50, category: 'bavi',
+    },
+    BAVI_MIN_TICK_COUNT: {
+      label: 'BAVI Min Tick Count',
+      description: 'Minimum ticks required in the buffer to allow a valid calculation',
+      type: 'number', min: 10, max: 500, step: 10,
+      default: 50, category: 'bavi',
     },
   };
 

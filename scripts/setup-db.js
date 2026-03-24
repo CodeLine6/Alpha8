@@ -211,6 +211,10 @@ const MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS idx_open_positions_symbol ON open_positions(symbol);`,
   `CREATE INDEX IF NOT EXISTS idx_open_positions_opened ON open_positions(opened_at);`,
 
+  // Persistent PnL Trailing columns
+  `ALTER TABLE open_positions ADD COLUMN IF NOT EXISTS peak_unrealized_pnl NUMERIC(12,2);`,
+  `ALTER TABLE open_positions ADD COLUMN IF NOT EXISTS pnl_trail_stop NUMERIC(12,2);`,
+
   // ensure legacy deployments without this table get it created
   // (already handled by IF NOT EXISTS above)
 ];

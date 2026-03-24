@@ -20,6 +20,7 @@
  */
 
 import { createLogger } from '../lib/logger.js';
+import { getRedis } from '../lib/redis.js';
 import {
     computeExitLevels,
     evaluateExits,
@@ -147,6 +148,16 @@ export class PositionManager {
                         const exitResult = await this.engine.forceExit(symbol, data.price, result.reason);
                         exits.push({ symbol, reason: result.reason, meta: result.meta, ...exitResult });
                         await this._notifyExit(symbol, posCtx, data.price, result.reason, result.meta, exitResult);
+                    }
+
+                    // Redis Trail Persistence Hook — execute synchronously so memory matches Redis
+                    if (!result.exit || result.partial) {
+                        if (posCtx.peakUnrealizedPnl !== undefined && posCtx.pnlTrailStop !== undefined) {
+                            getRedis().hset(`trail:${symbol}`, 
+                                'peakUnrealizedPnl', String(posCtx.peakUnrealizedPnl),
+                                'pnlTrailStop', String(posCtx.pnlTrailStop)
+                            ).catch(e => log.debug({ err: e.message }, 'Failed to save trail to Redis'));
+                        }
                     }
                 } catch (err) {
                     log.error({ symbol, err: err.message }, 'Position check failed — skipping');

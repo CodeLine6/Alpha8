@@ -1,6 +1,7 @@
 import { SIGNAL, STRATEGY } from '../config/constants.js';
 import { BaseStrategy } from './base-strategy.js';
 import { createLogger } from '../lib/logger.js';
+import { EMA } from 'technicalindicators';
 
 const log = createLogger('strategy:vwap-momentum');
 
@@ -191,10 +192,21 @@ export class VWAPMomentumStrategy extends BaseStrategy {
       const deviation = ((currentPrice - currentVWAP) / currentVWAP) * 100;
       const absDeviation = Math.abs(deviation);
       const bandThreshold = this.priceBandPct;
+      
+      // Calculate EMA50 for broad trend filtering
+      let ema50 = null;
+      if (closes.length >= 50) {
+        const emaValues = EMA.calculate({ period: 50, values: closes });
+        if (emaValues.length > 0) ema50 = emaValues[emaValues.length - 1];
+      }
+      const isBroadTrendUp = ema50 ? currentPrice > ema50 : false;
 
       // Volume confirmation
       const volumeRatio = avgVolume > 0 ? currentVolume / avgVolume : 0;
       const hasVolumeConfirmation = volumeRatio >= this.volumeMultiplier;
+      // Asymmetric volume requirement: if counter-trend shorting, require 1.5x more volume
+      const counterTrendShortVolumeReq = this.volumeMultiplier * 1.5;
+      const hasCounterTrendVolume = volumeRatio >= counterTrendShortVolumeReq;
 
       // Detect VWAP crossover
 
@@ -220,18 +232,26 @@ export class VWAPMomentumStrategy extends BaseStrategy {
 
       // ─── Bearish: Price crosses below VWAP ───────────────
       if (bearishCross && absDeviation > bandThreshold) {
-        let confidence = 45;
-        confidence += Math.min(absDeviation * 10, 25);
-        if (hasVolumeConfirmation) confidence += 20;
-        confidence += Math.min(volumeRatio * 5, 10);
+        // If the broad trend is up, we must have extreme volume to justify shorting
+        if (isBroadTrendUp && !hasCounterTrendVolume) {
+          log.debug({ currentPrice, ema50, volumeRatio }, 'Blocked VWAP short crossover due to broad uptrend EMA50 filter.');
+        } else {
+          let confidence = 45;
+          confidence += Math.min(absDeviation * 10, 25);
+          if (hasVolumeConfirmation) confidence += 20;
+          confidence += Math.min(volumeRatio * 5, 10);
+          
+          if (isBroadTrendUp) confidence -= 15; // penalize counter-trend trades
 
-        const reason =
-          `Price crossed below VWAP. ` +
-          `Price: ${currentPrice.toFixed(2)}, VWAP: ${currentVWAP.toFixed(2)} (${deviation.toFixed(2)}%). ` +
-          `Volume: ${volumeRatio.toFixed(1)}x avg${hasVolumeConfirmation ? ' ✓' : ''}`;
+          const reason =
+            `Price crossed below VWAP. ` +
+            `Price: ${currentPrice.toFixed(2)}, VWAP: ${currentVWAP.toFixed(2)} (${deviation.toFixed(2)}%). ` +
+            `Volume: ${volumeRatio.toFixed(1)}x avg${hasVolumeConfirmation ? ' ✓' : ''}` +
+            (isBroadTrendUp ? ` (Counter-Trend)` : '');
 
-        log.info({ signal: SIGNAL.SELL, confidence, deviation, volumeRatio }, reason);
-        return this.buildSignal(SIGNAL.SELL, confidence, reason);
+          log.info({ signal: SIGNAL.SELL, confidence, deviation, volumeRatio }, reason);
+          return this.buildSignal(SIGNAL.SELL, confidence, reason);
+        }
       }
 
       // ─── Momentum continuation (no crossover but trending) ──
@@ -242,9 +262,14 @@ export class VWAPMomentumStrategy extends BaseStrategy {
             `Momentum continuation above VWAP (+${deviation.toFixed(2)}%). Volume confirmed.`);
         }
         if (deviation < 0 && currentPrice < previousPrice) {
-          const confidence = 40 + Math.min(absDeviation * 10, 20);
-          return this.buildSignal(SIGNAL.SELL, confidence,
-            `Momentum continuation below VWAP (${deviation.toFixed(2)}%). Volume confirmed.`);
+          if (isBroadTrendUp) {
+            log.debug('Blocked VWAP momentum continuation short due to broad uptrend EMA50.');
+            // fall through to neutral
+          } else {
+            const confidence = 40 + Math.min(absDeviation * 10, 20);
+            return this.buildSignal(SIGNAL.SELL, confidence,
+              `Momentum continuation below VWAP (${deviation.toFixed(2)}%). Volume confirmed.`);
+          }
         }
       }
 

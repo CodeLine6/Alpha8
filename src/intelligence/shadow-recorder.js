@@ -42,8 +42,8 @@ const MIN_SAMPLE_SIZE = 10;
 
 // Strategy names must match exactly what strategies emit in their signal.strategy field
 const VALID_STRATEGIES = new Set([
-    'EMA_CROSSOVER',
-    'RSI_MEAN_REVERSION',
+    'ORB',
+    'BAVI',
     'VWAP_MOMENTUM',
     'BREAKOUT_VOLUME',
 ]);

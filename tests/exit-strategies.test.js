@@ -326,6 +326,7 @@ describe('updateTrailStop', () => {
             highWaterMark: 1010,
             trailStopPrice: 994,
             trailPct: 1.5,
+            trailMode: 'PRICE_TRAIL',
         };
         const updates = updateTrailStop(
             posCtx, 1020, [], [], [], 'TRENDING', BASE_CONFIG
@@ -340,6 +341,7 @@ describe('updateTrailStop', () => {
             highWaterMark: 1020,
             trailStopPrice: 1004,
             trailPct: 1.5,
+            trailMode: 'PRICE_TRAIL',
         };
         const updates = updateTrailStop(
             posCtx, 1015, [], [], [], 'TRENDING', BASE_CONFIG
@@ -353,6 +355,7 @@ describe('updateTrailStop', () => {
             highWaterMark: 1000,
             trailStopPrice: 985,
             trailPct: 1.5,
+            trailMode: 'PRICE_TRAIL',
         };
         const updates = updateTrailStop(
             posCtx, 1006, [], [], [], 'TRENDING', BASE_CONFIG

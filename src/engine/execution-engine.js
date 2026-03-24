@@ -41,6 +41,7 @@ import { createLogger } from '../lib/logger.js';
 import { ORDER_STATE, MAX_ORDER_RETRIES, RETRY_DELAY_MS } from '../config/constants.js';
 import { createOrder, transitionOrder, isTerminal } from './order-state-machine.js';
 import { query, getPool } from '../lib/db.js';
+import { getRedis } from '../lib/redis.js';
 import { calcNetPnl, calcTradeCost } from '../lib/brokerage.js';
 
 const log = createLogger('execution-engine');
@@ -273,6 +274,25 @@ export class ExecutionEngine {
       // Fix BUG-11: restoreDeployment only restores _currentDeployment, does NOT
       // touch _totalCashRequired (which would double-count the ROI denominator).
       this.riskManager.restoreDeployment(entryPrice * qty);
+    }
+
+    // ── Step 3: Hydrate Peak PnL Trail State from Redis ────────────────────
+    try {
+      const redis = getRedis();
+      for (const [symbol, posCtx] of this._filledPositions.entries()) {
+        const trailData = await redis.hgetall(`trail:${symbol}`);
+        if (trailData && Object.keys(trailData).length > 0) {
+          if (trailData.peakUnrealizedPnl !== undefined) {
+             posCtx.peakUnrealizedPnl = parseFloat(trailData.peakUnrealizedPnl);
+          }
+          if (trailData.pnlTrailStop !== undefined) {
+             posCtx.pnlTrailStop = parseFloat(trailData.pnlTrailStop);
+          }
+          log.info({ symbol, peakUnrealizedPnl: posCtx.peakUnrealizedPnl }, 'Recovered PnL trailing state from Redis');
+        }
+      }
+    } catch (err) {
+      log.warn({ err: err.message }, 'Failed to hydrate trailing state from Redis');
     }
 
     const count   = this._filledPositions.size;
@@ -1615,6 +1635,7 @@ VALUES($1, $2, $3, $4, $5, $6, $7, NOW()) RETURNING id`,
   async _clearOpenPosition(symbol) {
     try {
       await query('DELETE FROM open_positions WHERE symbol = $1', [symbol]);
+      await getRedis().del(`trail:${symbol}`).catch(() => {});
     } catch (err) {
       log.error({ symbol, err: err.message }, '_clearOpenPosition failed');
     }
