@@ -249,24 +249,22 @@ async function main() {
 
   // Wire tick classification into the tick feed (if available)
   if (tickFeed) {
-    tickFeed.on('ticks', (ticks) => {
-      for (const tick of ticks) {
+    tickFeed.on('tick', (tick) => {
         // Reverse-lookup tradingsymbol from instrument_token via tickFeed.symbolMap
         // symbolMap is { tradingsymbol: instrument_token_string }
         const token = tick.instrument_token?.toString() ?? tick.symbol;
         const symbol = tickFeed.symbolMap
           ? Object.keys(tickFeed.symbolMap).find(s => tickFeed.symbolMap[s] === token)
           : token;
-        if (!symbol) continue;
+        if (!symbol) return;
 
-        // NEW: Let the position manager evaluate this tick instantly for exact-moment trailing stops
+        // Let the position manager evaluate this tick instantly for exact-moment trailing stops
         if (engine && engine.positionManager) {
             engine.positionManager.evaluateTick(symbol, tick);
         }
 
         const classified = tickClassifier.classify(symbol, tick);
         rollingTickBuf.push(symbol, classified);
-      }
     });
     log.info('✅ Tick classifier + rolling buffer wired into tick feed');
   }

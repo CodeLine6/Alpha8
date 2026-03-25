@@ -90,7 +90,7 @@ export class ORBStrategy {
         }
 
         const latest = candles[candles.length - 1];
-        const timeIST = this._toIST(latest.date);
+        const timeIST = this._toIST(latest.timestamp || latest.date);
 
         // ── Check if we're past the signal cutoff time ──────────────────────
         if (this._isPastCutoff(timeIST)) {
@@ -101,7 +101,7 @@ export class ORBStrategy {
         // OR = first N 5-min candles of the session (9:15, 9:20, ..., 9:40)
         // We identify these by time (09:15–09:44 IST)
         const orCandles = candles.filter(c => {
-            const t = this._toIST(c.date);
+            const t = this._toIST(c.timestamp || c.date);
             return t >= '09:15' && t <= '09:44';
         });
 
@@ -135,7 +135,7 @@ export class ORBStrategy {
 
         // ── Only look at candles AFTER the OR period ─────────────────────────
         const postORCandles = candles.filter(c => {
-            const t = this._toIST(c.date);
+            const t = this._toIST(c.timestamp || c.date);
             return t >= '09:45';
         });
 

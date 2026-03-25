@@ -254,7 +254,8 @@ export class BAVIStrategy {
         }).split(',')[0].trim();
 
         return candles.filter(c => {
-            const d = c.date instanceof Date ? c.date : new Date(c.date);
+            const dateVal = c.timestamp || c.date;
+            const d = dateVal instanceof Date ? dateVal : new Date(dateVal);
             const ist = d.toLocaleString('en-CA', { timeZone: 'Asia/Kolkata' })
                 .split(',')[0].trim();
             return ist === today;
