@@ -41,7 +41,7 @@ const log = createLogger('backend-api');
  */
 export function createApiHandler(deps) {
   const {
-    killSwitch, riskManager, engine, config, broker, telegram, holdingsManager,
+    killSwitch, riskManager, engine, config, broker, telegram, holdingsManager, tickFeed,
     getLiveSetting, setLiveSetting, getAllLiveSettings, resetLiveSetting,
   } = deps;
 
@@ -447,11 +447,26 @@ export function createApiHandler(deps) {
         const symbols = Array.from(enginePositions.keys());
         let priceMap = {};
 
-        if (broker) {
-          try {
-            const keys = symbols.map(s => `NSE:${s}`);
-            const ltp = await broker.getLTP(keys);
+        // FAST PATH: Read instantaneous prices directly from WebSocket tick buffer
+        if (tickFeed && tickFeed.latestTicks && tickFeed.symbolMap) {
             for (const sym of symbols) {
+              const tokenStr = tickFeed.symbolMap[sym];
+              if (tokenStr) {
+                  const tick = tickFeed.latestTicks.get(Number(tokenStr)) || tickFeed.latestTicks.get(tokenStr);
+                  if (tick && tick.lastPrice > 0) {
+                      priceMap[sym] = tick.lastPrice;
+                  }
+              }
+            }
+        }
+
+        // SLOW PATH: Fallback to broker API ONLY for symbols missing from the fast tick buffer
+        const missingSymbols = symbols.filter(sym => !priceMap[sym]);
+        if (broker && missingSymbols.length > 0) {
+          try {
+            const keys = missingSymbols.map(s => `NSE:${s}`);
+            const ltp = await broker.getLTP(keys);
+            for (const sym of missingSymbols) {
               const price = ltp?.[`NSE:${sym}`]?.last_price;
               if (price && price > 0) priceMap[sym] = price;
             }

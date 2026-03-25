@@ -1183,17 +1183,9 @@ async function main() {
   try {
     const { default: cron } = await import('node-cron');
 
-    // ─── Keep-Awake Cron (Every 10 mins) ───────────────────
-    cron.schedule('*/5 * * * *', async () => {
-      const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${config.PORT}`;
-      const pingUrl = url.endsWith('/') ? `${url}health` : `${url}/health`;
-      log.info(`🔌 Pinging service to keep awake: ${pingUrl}`);
-      try {
-        await axios.get(pingUrl);
-      } catch (err) {
-        log.warn({ err: err.message }, '⚠️  Keep-awake ping failed');
-      }
-    });
+    // ─── Render Keep-Awake ─────────────────────────────────────
+    // Note: Render ignores internal self-pings. Use an external service
+    // like UptimeRobot or cron-job.org pointing to /health instead.
 
     cron.schedule('0 8 * * 1-5', async () => {
       log.info('🔐 Running scheduled auto-login...');
@@ -1245,7 +1237,7 @@ async function main() {
   // ─── Start REST API Server ─────────────────────────────
   const { createServer } = await import('node:http');
   const apiHandler = createApiHandler({
-    killSwitch, riskManager, engine, config, broker, telegram, scout, holdingsManager,
+    killSwitch, riskManager, engine, config, broker, telegram, scout, holdingsManager, tickFeed,
     getLiveSetting: redisHealthy ? getLiveSetting : null,
     setLiveSetting: redisHealthy ? setLiveSetting : null,
     getAllLiveSettings: redisHealthy ? getAllLiveSettings : null,
