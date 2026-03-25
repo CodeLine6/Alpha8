@@ -147,6 +147,8 @@ export default function HistoryPage() {
                             <option value="RSI_MEAN_REVERSION">RSI Reversion</option>
                             <option value="VWAP_MOMENTUM">VWAP Momentum</option>
                             <option value="BREAKOUT_VOLUME">Breakout Volume</option>
+                            <option value="ORB">ORB Breakout</option>
+                            <option value="BAVI">BAVI Order Flow</option>
                         </select>
                     </div>
                     <div>

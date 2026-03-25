@@ -77,9 +77,10 @@ export function computeExitLevels({
     //   Trail only kicks in once we're profitable beyond this floor
     //   Prevents trail from triggering on noise before any real profit exists
     //   Default: protect at least 0.5% of position value
-    const pnlTrailFloor = config.pnlTrailFloor
-        ?? config.PNL_TRAIL_FLOOR
-        ?? entryPrice * quantity * 0.005; // 0.5% of position value
+    const providedFloor = config.pnlTrailFloor ?? config.PNL_TRAIL_FLOOR;
+    const pnlTrailFloor = (typeof providedFloor === 'number' && providedFloor > 0)
+        ? providedFloor
+        : (entryPrice * quantity * 0.005); // 0.5% of position value
 
     // Trail mode: PNL_TRAIL | PRICE_TRAIL | HYBRID
     const trailMode = config.trailMode ?? config.TRAIL_MODE ?? TRAIL_MODE.PNL_TRAIL;
@@ -407,7 +408,7 @@ export function evaluateExits({
 
         if (pnlDroppedThroughFloor && wasEverProfitable) {
             const retainedPct = posCtx.peakUnrealizedPnl > 0
-                ? (posCtx.pnlTrailStop / posCtx.peakUnrealizedPnl * 100).toFixed(1)
+                ? (unrealizedPnl / posCtx.peakUnrealizedPnl * 100).toFixed(1)
                 : 0;
 
             return {

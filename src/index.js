@@ -258,6 +258,12 @@ async function main() {
           ? Object.keys(tickFeed.symbolMap).find(s => tickFeed.symbolMap[s] === token)
           : token;
         if (!symbol) continue;
+
+        // NEW: Let the position manager evaluate this tick instantly for exact-moment trailing stops
+        if (engine && engine.positionManager) {
+            engine.positionManager.evaluateTick(symbol, tick);
+        }
+
         const classified = tickClassifier.classify(symbol, tick);
         rollingTickBuf.push(symbol, classified);
       }

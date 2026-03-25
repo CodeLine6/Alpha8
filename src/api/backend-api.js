@@ -634,8 +634,9 @@ export function createApiHandler(deps) {
         values.push(params.endDate);
       }
       if (params.strategy) {
-        conditions.push(`strategy = $${paramIdx++}`);
-        values.push(params.strategy);
+        conditions.push(`(strategy = $${paramIdx} OR opening_strategies LIKE $${paramIdx + 1})`);
+        values.push(params.strategy, `%"${params.strategy}"%`);
+        paramIdx += 2;
       }
       if (params.symbol) {
         conditions.push(`symbol ILIKE $${paramIdx++}`);
@@ -682,6 +683,15 @@ export function createApiHandler(deps) {
           else if (Math.abs(pnl) < 0.01 && !exitStrategies.has(t.strategy)) tradeType = 'SHORT_ENTRY'; // Legacy fallback
           else tradeType = 'LONG_EXIT';
         }
+
+        let displayStrategy = t.strategy;
+        if (hasOpeningStrategies) {
+          try {
+            const parsed = JSON.parse(t.opening_strategies);
+            if (parsed.length > 0) displayStrategy = parsed[0];
+          } catch (e) {}
+        }
+
         return {
           date: new Date(t.created_at).toLocaleDateString('en-IN'),
           symbol: t.symbol,
@@ -690,7 +700,7 @@ export function createApiHandler(deps) {
           quantity: t.quantity,
           price: parseFloat(t.price),
           pnl,
-          strategy: t.strategy,
+          strategy: displayStrategy,
           status: t.status,
           orderId: t.order_id,
           capitalDeployed: t.capital_deployed ? parseFloat(t.capital_deployed) : null,
@@ -709,7 +719,11 @@ export function createApiHandler(deps) {
     try {
       const result = await query(`
         SELECT
-          strategy,
+          CASE 
+            WHEN opening_strategies IS NOT NULL AND opening_strategies NOT IN ('null', '[]')
+            THEN (opening_strategies::json->>0)
+            ELSE strategy
+          END as clean_strategy,
           COUNT(*) as trade_count,
           COUNT(*) FILTER (WHERE pnl > 0)  as wins,
           COUNT(*) FILTER (WHERE pnl <= 0) as losses,
@@ -718,12 +732,13 @@ export function createApiHandler(deps) {
           ROUND((COUNT(*) FILTER (WHERE pnl > 0)::numeric / NULLIF(COUNT(*)::numeric, 0) * 100), 1) as win_rate
         FROM trades
         WHERE strategy IS NOT NULL
-        GROUP BY strategy
+          AND strategy NOT IN ('MANUAL_EXIT', 'PARTIAL_EXIT', 'STOP_LOSS', 'TRAILING_STOP', 'PROFIT_TARGET', 'END_OF_DAY', 'MAX_HOLD_TIME', 'SIGNAL_REVERSAL', 'KILL_SWITCH')
+        GROUP BY clean_strategy
         ORDER BY total_pnl DESC
       `);
 
       const strategies = result.rows.map((r) => ({
-        name: r.strategy.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()),
+        name: r.clean_strategy.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()),
         winRate: parseFloat(r.win_rate) || 0,
         avgReturn: parseFloat(r.avg_return) || 0,
         totalPnl: parseFloat(r.total_pnl) || 0,

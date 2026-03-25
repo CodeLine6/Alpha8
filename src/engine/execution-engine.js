@@ -286,7 +286,11 @@ export class ExecutionEngine {
              posCtx.peakUnrealizedPnl = parseFloat(trailData.peakUnrealizedPnl);
           }
           if (trailData.pnlTrailStop !== undefined) {
-             posCtx.pnlTrailStop = parseFloat(trailData.pnlTrailStop);
+             const stopVal = parseFloat(trailData.pnlTrailStop);
+             posCtx.pnlTrailStop = stopVal;
+             if (!isNaN(stopVal) && stopVal !== -Infinity) {
+                 posCtx.pnlTrailActivated = true;
+             }
           }
           log.info({ symbol, peakUnrealizedPnl: posCtx.peakUnrealizedPnl }, 'Recovered PnL trailing state from Redis');
         }

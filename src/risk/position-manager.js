@@ -177,6 +177,61 @@ export class PositionManager {
         }
     }
 
+    /**
+     * Instantly evaluate trailing stops, hard stops, and profit targets on every incoming tick.
+     * Bypasses the 5-minute schedule to prevent catastrophic slippage.
+     */
+    evaluateTick(symbol, tick) {
+        if (!this.enabled || this.engine._filledPositions.size === 0) return;
+
+        const posCtx = this.engine._filledPositions.get(symbol);
+        if (!posCtx) return;
+
+        const currentPrice = tick.lastPrice || tick.close || 0;
+        if (currentPrice <= 0) return;
+
+        // Concurrency guard to prevent tick avalanches while an API exit is mid-flight
+        if (posCtx.isExiting) return;
+
+        try {
+            const result = evaluateExits({
+                symbol,
+                posCtx,
+                currentPrice,
+                recentCloses: [],
+                recentHighs: [],
+                recentLows: [],
+                regime: null, 
+                latestSignals: {}, // Ignore reversal signals here (they wait for candle close)
+                config: this._active,
+            });
+
+            if (result.partial) {
+                posCtx.isExiting = true;
+                this._executePartialExit(symbol, posCtx, currentPrice, result)
+                    .finally(() => { posCtx.isExiting = false; });
+            } else if (result.exit) {
+                posCtx.isExiting = true;
+                log.info({ symbol, currentPrice }, '🚨 Real-time TICK breached trailing/stop-loss floor! Force exiting immediately!');
+                this.engine.forceExit(symbol, currentPrice, result.reason)
+                    .then(exitResult => this._notifyExit(symbol, posCtx, currentPrice, result.reason, result.meta, exitResult))
+                    .catch(err => log.error({ symbol, err: err.message }, 'Real-time tick exit failed'))
+                    .finally(() => { posCtx.isExiting = false; });
+            } else {
+                // Sync to Redis only when the peak advances to prevent spamming I/O on every tick
+                if (posCtx.peakUnrealizedPnl !== undefined && posCtx.peakUnrealizedPnl !== posCtx._lastSavedPeak) {
+                    posCtx._lastSavedPeak = posCtx.peakUnrealizedPnl;
+                    getRedis().hset(`trail:${symbol}`, 
+                        'peakUnrealizedPnl', String(posCtx.peakUnrealizedPnl),
+                        'pnlTrailStop', String(posCtx.pnlTrailStop)
+                    ).catch(() => {});
+                }
+            }
+        } catch (err) {
+            log.error({ symbol, err: err.message }, 'Tick evaluation failed');
+        }
+    }
+
     async initPosition(symbol, posCtx, recentCloses = [], recentHighs = [], recentLows = []) {
         await this._refreshParams();
         const regime = await this._getCurrentRegime();
