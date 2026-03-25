@@ -401,8 +401,12 @@ export function evaluateExits({
     //
     const trailMode = posCtx.trailMode ?? TRAIL_MODE.PNL_TRAIL;
     const isPnlTrail = trailMode === TRAIL_MODE.PNL_TRAIL || trailMode === TRAIL_MODE.HYBRID;
+    
+    // Reboot-Proof Fix: Dynamically infer activation state. If trailing stop floor exists and
+    // is above -Infinity, the trail is guaranteed to be active. Memory flags wipe on restart!
+    const isActuallyActivated = posCtx.pnlTrailActivated || (posCtx.pnlTrailStop > -Infinity);
 
-    if (isPnlTrail && posCtx.pnlTrailActivated) {
+    if (isPnlTrail && isActuallyActivated) {
         const pnlDroppedThroughFloor = unrealizedPnl < posCtx.pnlTrailStop;
         const wasEverProfitable = (posCtx.peakUnrealizedPnl ?? 0) > 0;
 
@@ -441,7 +445,7 @@ export function evaluateExits({
     // In HYBRID mode:      fires if EITHER PnL OR price trail is breached
     //
     const isPriceTrail = trailMode === TRAIL_MODE.PRICE_TRAIL || trailMode === TRAIL_MODE.HYBRID;
-    const pnlTrailNeverActivated = !posCtx.pnlTrailActivated;
+    const pnlTrailNeverActivated = !isActuallyActivated;
 
     const shouldCheckPriceTrail = isPriceTrail ||
         (trailMode === TRAIL_MODE.PNL_TRAIL && pnlTrailNeverActivated);

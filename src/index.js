@@ -252,7 +252,7 @@ async function main() {
     tickFeed.on('tick', (tick) => {
         // Reverse-lookup tradingsymbol from instrument_token via tickFeed.symbolMap
         // symbolMap is { tradingsymbol: instrument_token_string }
-        const token = tick.instrument_token?.toString() ?? tick.symbol;
+        const token = tick.instrumentToken?.toString();
         const symbol = tickFeed.symbolMap
           ? Object.keys(tickFeed.symbolMap).find(s => tickFeed.symbolMap[s] === token)
           : token;

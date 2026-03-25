@@ -231,7 +231,7 @@ export class PositionManager {
         const posCtx = this.engine._filledPositions.get(symbol);
         if (!posCtx) return;
 
-        const currentPrice = tick.lastPrice || tick.close || 0;
+        const currentPrice = tick.ltp || tick.lastPrice || tick.close || 0;
         if (currentPrice <= 0) return;
 
         // Concurrency guard to prevent tick avalanches while an API exit is mid-flight
@@ -294,6 +294,18 @@ export class PositionManager {
         });
 
         Object.assign(posCtx, levels);
+
+        // Explicitly create the initial trail data in Redis instantly, removing the
+        // dependency on the lazy check in evaluateTick() or the 5-minute cron.
+        try {
+            await getRedis().hset(`trail:${symbol}`, 
+                'peakUnrealizedPnl', String(levels.peakUnrealizedPnl),
+                'pnlTrailStop', String(levels.pnlTrailStop)
+            );
+            posCtx._lastSavedPeak = levels.peakUnrealizedPnl;
+        } catch (err) {
+            log.debug({ err: err.message }, 'Failed to set initial trail in Redis');
+        }
 
         log.info({
             symbol,
