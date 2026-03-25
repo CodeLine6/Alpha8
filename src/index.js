@@ -1180,9 +1180,18 @@ async function main() {
   try {
     const { default: cron } = await import('node-cron');
 
-    // ─── Render Keep-Awake ─────────────────────────────────────
-    // Note: Render ignores internal self-pings. Use an external service
-    // like UptimeRobot or cron-job.org pointing to /health instead.
+    // ─── Render Keep-Awake (Self-Ping) ─────────────────────────
+    // Actively pings the server's own health endpoint every 4 minutes
+    // to prevent free-tier cloud instances (like Render) from sleeping.
+    const PING_URL = process.env.RENDER_EXTERNAL_URL || process.env.APP_URL || 'https://alpha8-1.onrender.com/health';
+    setInterval(async () => {
+      try {
+        const res = await fetch(PING_URL);
+        log.debug(`Self-ping keep-awake: ${res.status}`);
+      } catch (err) {
+        log.debug({ err: err.message }, 'Self-ping failed (expected if running locally offline)');
+      }
+    }, 4 * 60 * 1000); // 4 minutes
 
     cron.schedule('0 8 * * 1-5', async () => {
       log.info('🔐 Running scheduled auto-login...');
