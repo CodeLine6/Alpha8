@@ -313,10 +313,18 @@ export class MarketScheduler {
         log.warn({ err: err.message }, 'Intraday decay reset failed')
       );
     }
-    if (this.dataFeed?.connect) {
-      await this.dataFeed.connect().catch(err =>
-        log.error({ err: err.message }, 'Data feed connect failed')
-      );
+    if (this.dataFeed) {
+      if (this.dataFeed.connect) {
+        await this.dataFeed.connect().catch(err =>
+          log.error({ err: err.message }, 'Data feed connect failed')
+        );
+      } else if (this.dataFeed.start) {
+        try {
+          await this.dataFeed.start();
+        } catch (err) {
+          log.error({ err: err.message }, 'Data feed start failed');
+        }
+      }
     }
     // Reset tick classification state for new trading session
     if (this.tickClassifier) {
@@ -627,8 +635,14 @@ export class MarketScheduler {
 
   async _postMarket() {
     log.info('═══ POST-MARKET ═══');
-    if (this.dataFeed?.disconnect) {
-      await this.dataFeed.disconnect().catch(() => { });
+    if (this.dataFeed) {
+      if (this.dataFeed.disconnect) {
+        await this.dataFeed.disconnect().catch(() => { });
+      } else if (this.dataFeed.stop) {
+        try {
+          await this.dataFeed.stop();
+        } catch (err) { }
+      }
     }
 
     const riskStatus = this.riskManager.getStatus();

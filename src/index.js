@@ -668,9 +668,13 @@ async function main() {
           // All pinned = env-var + dashboard-pinned (deduplicated)
           const allPinned = [...new Set([...pinnedSymbols, ...dbPinned])];
 
-          const active = scout
+          let active = scout
             ? await scout.getActiveWatchlist()
             : [...allPinned];
+
+          // FIX: explicitly append DB-pinned symbols to the active list
+          // (This matches the behavior of getWatchlist() used for trading)
+          active = [...new Set([...active, ...dbPinned])];
 
           const pinned  = active.filter(s => allPinned.includes(s));
           const dynamic = active.filter(s => !allPinned.includes(s));
@@ -776,6 +780,19 @@ async function main() {
       log.warn({ count: activeSymbols.length, cap: MAX_WATCHLIST_SIZE },
         'Watchlist size exceeds limit — capping to mantain scan performance');
       activeSymbols = activeSymbols.slice(0, MAX_WATCHLIST_SIZE);
+    }
+
+    // Dynamic TickFeed Subscription Sync
+    // Ensure that any new dynamic symbols not yet in the tick feed are subscribed.
+    if (tickFeed && instrumentManager) {
+      const resolved = instrumentManager.resolveSymbols(activeSymbols);
+      const currentSubscribed = new Set(tickFeed.subscribedTokens || []);
+      const newTokens = resolved.tokens.filter(t => !currentSubscribed.has(t));
+      if (newTokens.length > 0) {
+        tickFeed.symbolMap = { ...(tickFeed.symbolMap || {}), ...resolved.symbolMap };
+        tickFeed.subscribe(newTokens, 'full');
+        log.info({ count: newTokens.length }, 'Dynamically subscribed new watchlist symbols to tick feed');
+      }
     }
 
     const items = [];
