@@ -84,6 +84,49 @@ export class PositionManager {
         }
     }
 
+    /**
+     * Dynamically synchronizes global live risk parameters with all active open positions.
+     * Overwrites the entry-time stop-loss and profit-target prices so that changing a 
+     * setting mid-trade instantly scales the risk management levels for all active positions.
+     */
+    _syncActivePositionsToLiveParams() {
+        const stopPct = this._active.stopLossPct ?? this._active.STOP_LOSS_PCT ?? 1.0;
+        const targetPct = this._active.profitTargetPct ?? this._active.PROFIT_TARGET_PCT ?? 1.8;
+        const rrRatio = this._active.riskRewardRatio ?? this._active.RISK_REWARD_RATIO ?? 2.0;
+
+        for (const [symbol, posCtx] of this.engine._filledPositions.entries()) {
+            const entry = posCtx.entryPrice ?? posCtx.price;
+            const isShort = posCtx.isShort ?? posCtx.direction === 'SELL';
+
+            const newStop = isShort 
+                ? entry * (1 + stopPct / 100) 
+                : entry * (1 - stopPct / 100);
+
+            const MEAN_REVERSION = new Set(['RSI_MEAN_REVERSION']);
+            const targetMode = MEAN_REVERSION.has(posCtx.openingStrategy) ? 'FIXED_PCT' : 'RISK_REWARD';
+
+            let newTarget;
+            if (isShort) {
+                newTarget = targetMode === 'FIXED_PCT'
+                    ? entry * (1 - targetPct / 100)
+                    : entry - (newStop - entry) * rrRatio;
+            } else {
+                newTarget = targetMode === 'FIXED_PCT'
+                    ? entry * (1 + targetPct / 100)
+                    : entry + (entry - newStop) * rrRatio;
+            }
+
+            // Static bounds sync natively on global change
+            posCtx.stopPrice = newStop;
+            posCtx.profitTargetPrice = newTarget;
+            posCtx.profitTargetMode = targetMode;
+            
+            if (posCtx.hydratedFromDB) {
+                posCtx.hydratedFromDB = false; // Synced!
+            }
+        }
+    }
+
     // ═══════════════════════════════════════════════════════
     // PUBLIC
     // ═══════════════════════════════════════════════════════
@@ -111,6 +154,7 @@ export class PositionManager {
 
         try {
             await this._refreshParams();
+            this._syncActivePositionsToLiveParams(); // Fix: sync global live params to open positions
 
             const positions = this.engine._filledPositions;
             if (positions.size === 0) return { checked: 0, exits: [], partials: [] };
