@@ -449,12 +449,18 @@ export function createApiHandler(deps) {
 
         // FAST PATH: Read instantaneous prices directly from WebSocket tick buffer
         if (tickFeed && tickFeed.latestTicks && tickFeed.symbolMap) {
+            // symbolMap is { token: symbol }. Invert it once for fast lookups
+            const invertedMap = {};
+            for (const [tok, s] of Object.entries(tickFeed.symbolMap)) {
+                invertedMap[s] = tok;
+            }
+
             for (const sym of symbols) {
-              const tokenStr = tickFeed.symbolMap[sym];
+              const tokenStr = invertedMap[sym];
               if (tokenStr) {
                   const tick = tickFeed.latestTicks.get(Number(tokenStr)) || tickFeed.latestTicks.get(tokenStr);
-                  if (tick && tick.lastPrice > 0) {
-                      priceMap[sym] = tick.lastPrice;
+                  if (tick && tick.ltp > 0) {
+                      priceMap[sym] = tick.ltp;
                   }
               }
             }

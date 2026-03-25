@@ -250,13 +250,10 @@ async function main() {
   // Wire tick classification into the tick feed (if available)
   if (tickFeed) {
     tickFeed.on('tick', (tick) => {
-        // Reverse-lookup tradingsymbol from instrument_token via tickFeed.symbolMap
-        // symbolMap is { tradingsymbol: instrument_token_string }
+        // The symbolMap natively maps { token_string: tradingsymbol }
         const token = tick.instrumentToken?.toString();
-        const symbol = tickFeed.symbolMap
-          ? Object.keys(tickFeed.symbolMap).find(s => tickFeed.symbolMap[s] === token)
-          : token;
-        if (!symbol) return;
+        const symbol = tickFeed.symbolMap ? tickFeed.symbolMap[token] : token;
+        if (!symbol || symbol.startsWith('TOKEN:')) return;
 
         // Let the position manager evaluate this tick instantly for exact-moment trailing stops
         if (engine && engine.positionManager) {
