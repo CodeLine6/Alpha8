@@ -1,168 +1,382 @@
 'use client';
 
-import React, { useEffect, useRef, useState } from 'react';
-import { createChart } from 'lightweight-charts';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { createChart, LineStyle } from 'lightweight-charts';
 import { API_BASE } from '@/lib/utils';
 
-export default function TradingChart({ symbol, trades = [], interval = '5minute', days = 5 }) {
-  const chartContainerRef = useRef();
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
+// ── helpers ────────────────────────────────────────────────────────────────────
+function fmtVol(v) {
+  if (!v && v !== 0) return '—';
+  if (v >= 1e7) return (v / 1e7).toFixed(2) + ' Cr';
+  if (v >= 1e5) return (v / 1e5).toFixed(2) + ' L';
+  if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K';
+  return v.toString();
+}
 
+const TYPE_CFG = {
+  LONG_ENTRY:  { text: 'L.Entry', color: '#10b981', position: 'belowBar' },
+  LONG_EXIT:   { text: 'L.Exit',  color: '#eab308', position: 'aboveBar' },
+  SHORT_ENTRY: { text: 'S.Entry', color: '#ef4444', position: 'aboveBar' },
+  SHORT_COVER: { text: 'S.Cover', color: '#3b82f6', position: 'belowBar' },
+};
+
+function parseTradeTime(t) {
+  if (t.timestamp) {
+    return typeof t.timestamp === 'string'
+      ? Math.floor(new Date(t.timestamp).getTime() / 1000)
+      : Math.floor(t.timestamp / 1000);
+  }
+  if (t.time && t.date) {
+    try { const d = new Date(`${t.date} ${t.time}`); if (!isNaN(d)) return Math.floor(d.getTime() / 1000); } catch { /**/ }
+  }
+  return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * @param {object} props
+ * @param {string}  props.symbol
+ * @param {Array}   props.trades      — trade/position objects to plot as markers
+ * @param {string}  [props.interval]
+ * @param {number}  [props.days]
+ * @param {string}  [props.endDate]
+ * @param {boolean} [props.isLive]    — enables real-time tick polling & price lines
+ * @param {object}  [props.liveData]  — { currentPrice, entryPrice, stopLoss, targetPrice, trailingStop }
+ */
+export default function TradingChart({
+  symbol,
+  trades = [],
+  interval = '5minute',
+  days = 2,
+  endDate,
+  isLive = false,
+  liveData = {},
+}) {
+  const containerRef = useRef();
+  const chartRef     = useRef();
+  const candleRef    = useRef();
+  const volRef       = useRef();
+  const priceLinesRef = useRef({});    // keyed by label
+  const lastCandleRef = useRef(null);  // last full candle for live update
+
+  const [loading, setLoading]  = useState(true);
+  const [error, setError]      = useState(null);
+  const [legend, setLegend]    = useState(null);
+  const [tooltip, setTooltip]  = useState(null);
+  const [livePrice, setLivePrice] = useState(liveData.currentPrice ?? null);
+
+  // ── 1. Build / refresh price level lines ─────────────────────────────────
+  const refreshPriceLines = useCallback((data) => {
+    const series = candleRef.current;
+    if (!series) return;
+
+    const lines = {
+      entry:         { price: data.entryPrice,    color: '#e2e8f0', title: '  Entry',         lineStyle: LineStyle.Solid,   lineWidth: 1 },
+      stopLoss:      { price: data.stopLoss,       color: '#ef4444', title: '  Stop Loss',     lineStyle: LineStyle.Dashed,  lineWidth: 1 },
+      trailingStop:  { price: data.trailingStop,   color: '#f97316', title: '  Trail Stop',    lineStyle: LineStyle.Dotted,  lineWidth: 1 },
+      target:        { price: data.targetPrice,    color: '#10b981', title: '  Target',         lineStyle: LineStyle.Dashed,  lineWidth: 1 },
+    };
+
+    for (const [key, cfg] of Object.entries(lines)) {
+      if (!cfg.price) { 
+        // Remove old line if price disappeared
+        if (priceLinesRef.current[key]) {
+          try { series.removePriceLine(priceLinesRef.current[key]); } catch { /**/ }
+          delete priceLinesRef.current[key];
+        }
+        continue;
+      }
+      if (priceLinesRef.current[key]) {
+        // Update existing — lightweight-charts doesn't support in-place update, remove + recreate
+        try { series.removePriceLine(priceLinesRef.current[key]); } catch { /**/ }
+      }
+      priceLinesRef.current[key] = series.createPriceLine({
+        price: cfg.price,
+        color: cfg.color,
+        lineWidth: cfg.lineWidth,
+        lineStyle: cfg.lineStyle,
+        axisLabelVisible: true,
+        title: cfg.title,
+      });
+    }
+  }, []);
+
+  // ── 2. Main chart init (runs once on mount / when symbol/interval changes) ──
   useEffect(() => {
-    if (!symbol || !chartContainerRef.current) return;
+    if (!symbol || !containerRef.current) return;
 
-    let chart;
-    let candlestickSeries;
+    let destroyed = false;
+    priceLinesRef.current = {};
+    lastCandleRef.current = null;
 
-    async function fetchData() {
+    async function init() {
       try {
         setLoading(true);
         setError(null);
 
-        const res = await fetch(`${API_BASE}/api/candles?symbol=${symbol}&interval=${interval}&days=${days}`);
+        const url = `${API_BASE}/api/candles?symbol=${symbol}&interval=${interval}&days=${days}${endDate ? `&endDate=${endDate}` : ''}`;
+        const res  = await fetch(url);
         if (!res.ok) throw new Error('Failed to fetch chart data');
         const data = await res.json();
-        
         if (data.error) throw new Error(data.error);
-        if (!data.candles || data.candles.length === 0) {
-          throw new Error('No candle data available for ' + symbol);
-        }
+        if (!data.candles?.length) throw new Error('No candle data for ' + symbol);
 
-        chart = createChart(chartContainerRef.current, {
-          layout: {
-            background: { color: 'transparent' },
-            textColor: '#9ca3af',
-          },
-          grid: {
-            vertLines: { color: 'rgba(31, 41, 55, 0.5)' },
-            horzLines: { color: 'rgba(31, 41, 55, 0.5)' },
-          },
+        if (destroyed) return;
+
+        const chart = createChart(containerRef.current, {
+          layout:    { background: { color: 'transparent' }, textColor: '#9ca3af' },
+          grid:      { vertLines: { color: 'rgba(31,41,55,0.45)' }, horzLines: { color: 'rgba(31,41,55,0.45)' } },
           crosshair: {
             mode: 1,
-            vertLine: {
-                color: '#6b7280',
-                width: 1,
-                style: 1,
-                labelBackgroundColor: '#374151',
-            },
-            horzLine: {
-                color: '#6b7280',
-                width: 1,
-                style: 1,
-                labelBackgroundColor: '#374151',
-            },
+            vertLine: { color: '#6b7280', width: 1, style: 1, labelBackgroundColor: '#374151' },
+            horzLine: { color: '#6b7280', width: 1, style: 1, labelBackgroundColor: '#374151' },
           },
-          timeScale: {
-            timeVisible: true,
-            secondsVisible: false,
-            borderColor: 'rgba(31, 41, 55, 0.5)',
-          },
-          rightPriceScale: {
-            borderColor: 'rgba(31, 41, 55, 0.5)',
-          },
+          timeScale:       { timeVisible: true, secondsVisible: false, borderColor: 'rgba(55,65,81,0.6)' },
+          rightPriceScale: { borderColor: 'rgba(55,65,81,0.6)' },
         });
+        chartRef.current  = chart;
 
-        candlestickSeries = chart.addCandlestickSeries({
-          upColor: '#10b981',
-          downColor: '#ef4444',
+        // Candlestick series
+        const candleSeries = chart.addCandlestickSeries({
+          upColor: '#10b981', downColor: '#ef4444',
           borderVisible: false,
-          wickUpColor: '#10b981',
-          wickDownColor: '#ef4444',
+          wickUpColor: '#10b981', wickDownColor: '#ef4444',
         });
+        candleRef.current = candleSeries;
+        candleSeries.setData(data.candles);
+        lastCandleRef.current = data.candles[data.candles.length - 1];
 
-        candlestickSeries.setData(data.candles);
+        // Volume histogram
+        const volSeries = chart.addHistogramSeries({ priceFormat: { type: 'volume' }, priceScaleId: 'vol' });
+        volRef.current  = volSeries;
+        volSeries.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 }, drawTicks: false, borderVisible: false });
+        volSeries.setData(data.candles.map(c => ({
+          time: c.time, value: c.volume || 0,
+          color: c.close >= c.open ? 'rgba(16,185,129,0.35)' : 'rgba(239,68,68,0.35)',
+        })));
 
-        if (trades && trades.length > 0) {
-            const markers = [];
-            for (const t of trades) {
-                let tradeTime;
-                
-                // Parse timestamp correctly depending on if it's from history page or active position
-                if (t.timestamp) {
-                    tradeTime = typeof t.timestamp === 'string' ? Math.floor(new Date(t.timestamp).getTime() / 1000) : Math.floor(t.timestamp / 1000);
-                } else if (t.time && t.date) {
-                    try {
-                         const d = new Date(`${t.date} ${t.time}`);
-                         if (!isNaN(d)) tradeTime = Math.floor(d.getTime() / 1000);
-                    } catch {}
-                }
-                
-                if (!tradeTime) {
-                    tradeTime = data.candles[data.candles.length - 1].time; 
-                } 
+        // Markers
+        const markerMeta = [];
+        if (trades.length > 0) {
+          const rawM = [];
+          for (const t of trades) {
+            let time = parseTradeTime(t);
+            if (!time) time = data.candles[data.candles.length - 1].time;
 
-                const isBuy = t.side === 'BUY';
-                
-                if (tradeTime > 0) {
-                    markers.push({
-                        time: tradeTime,
-                        position: isBuy ? 'belowBar' : 'aboveBar',
-                        color: isBuy ? '#10b981' : '#ef4444',
-                        shape: isBuy ? 'arrowUp' : 'arrowDown',
-                        text: isBuy ? 'BUY' : 'SELL',
-                        size: 2,
-                    });
-                }
-            }
+            const cfg = TYPE_CFG[t.tradeType] ?? {
+              text: t.side === 'BUY' ? 'Buy' : 'Sell',
+              color: t.side === 'BUY' ? '#10b981' : '#ef4444',
+              position: t.side === 'BUY' ? 'belowBar' : 'aboveBar',
+            };
 
-            markers.sort((a,b) => a.time - b.time);
+            const lbl = t.strategy === 'PARTIAL_EXIT' ? 'P.' + cfg.text.split('.')[1] : cfg.text;
+            if (time > 0) rawM.push({ time, trade: t, ...cfg, text: lbl, shape: 'circle' });
+          }
 
-            // Deduplicate exact timestamps
-            const deduped = [];
-            let lastT = 0;
-            for (const m of markers) {
-                if (m.time === lastT) m.time += 1;
-                deduped.push(m);
-                lastT = m.time;
-            }
-
-            if (deduped.length > 0) {
-                candlestickSeries.setMarkers(deduped);
-            }
+          rawM.sort((a, b) => a.time - b.time);
+          let lastT = 0;
+          for (const m of rawM) {
+            if (m.time <= lastT) m.time = lastT + 1;
+            markerMeta.push({ time: m.time, trade: m.trade, color: m.color });
+            lastT = m.time;
+          }
+          candleSeries.setMarkers(rawM.map(({ trade: _t, ...rest }) => rest));
         }
+
+        // If live, draw price lines now
+        if (isLive) refreshPriceLines(liveData);
+
+        // Crosshair subscription
+        chart.subscribeCrosshairMove(param => {
+          if (!param.point || !param.time || param.point.x < 0 || param.point.y < 0) {
+            setLegend(null); setTooltip(null); return;
+          }
+          const candle = param.seriesData.get(candleSeries);
+          const vol    = param.seriesData.get(volSeries);
+          if (candle) setLegend({ ...candle, volume: vol?.value });
+
+          const hit = markerMeta.find(m => Math.abs(m.time - param.time) < 3 * 5 * 60);
+          setTooltip(hit ? { trade: hit.trade, color: hit.color, x: param.point.x, y: param.point.y } : null);
+        });
 
         chart.timeScale().fitContent();
         setLoading(false);
       } catch (err) {
-        setError(err.message);
-        setLoading(false);
+        if (!destroyed) { setError(err.message); setLoading(false); }
       }
     }
 
-    fetchData();
+    init();
 
-    const handleResize = () => {
-      if (chart && chartContainerRef.current) {
-        chart.applyOptions({ width: chartContainerRef.current.clientWidth });
-      }
-    };
-
-    window.addEventListener('resize', handleResize);
-
+    const onResize = () => { if (chartRef.current && containerRef.current) chartRef.current.applyOptions({ width: containerRef.current.clientWidth }); };
+    window.addEventListener('resize', onResize);
     return () => {
-      window.removeEventListener('resize', handleResize);
-      if (chart) chart.remove();
+      destroyed = true;
+      window.removeEventListener('resize', onResize);
+      chartRef.current?.remove();
+      chartRef.current = null;
+      candleRef.current = null;
+      volRef.current = null;
     };
-  }, [symbol, interval, days, trades]);
+  }, [symbol, interval, days, endDate]); // eslint-disable-line
+
+  // ── 3. Update price lines when liveData prop changes (from parent polling) ──
+  useEffect(() => {
+    if (isLive && candleRef.current) refreshPriceLines(liveData);
+  }, [isLive, liveData, refreshPriceLines]);
+
+  // ── 4. Real-time last-candle update via /api/live-price polling ────────────
+  useEffect(() => {
+    if (!isLive || !symbol) return;
+
+    const poll = async () => {
+      try {
+        const r = await fetch(`${API_BASE}/api/live-price?symbol=${symbol}`);
+        if (!r.ok) return;
+        const d = await r.json();
+        if (!d.ltp) return;
+
+        setLivePrice(d.ltp);
+
+        // Update the last candle's close / high / low in the chart
+        if (candleRef.current && lastCandleRef.current) {
+          const now  = Math.floor(Date.now() / 1000);
+          const last = lastCandleRef.current;
+
+          // Snap to 5-minute candle bucket
+          const bucketSize = interval === '5minute' ? 300 : interval === '1minute' ? 60 : interval === '15minute' ? 900 : 300;
+          const bucket = Math.floor(now / bucketSize) * bucketSize;
+
+          if (bucket > last.time) {
+            // New candle started
+            const newCandle = { time: bucket, open: d.ltp, high: d.ltp, low: d.ltp, close: d.ltp };
+            candleRef.current.update(newCandle);
+            volRef.current?.update({ time: bucket, value: 0, color: 'rgba(107,114,128,0.3)' });
+            lastCandleRef.current = newCandle;
+          } else {
+            // Same candle — update its close / high / low
+            const updated = {
+              time:  last.time,
+              open:  last.open,
+              high:  Math.max(last.high, d.ltp),
+              low:   Math.min(last.low,  d.ltp),
+              close: d.ltp,
+            };
+            candleRef.current.update(updated);
+            lastCandleRef.current = updated;
+          }
+        }
+      } catch { /**/ }
+    };
+
+    // Poll every 2 seconds when chart is live
+    poll();
+    const id = setInterval(poll, 2000);
+    return () => clearInterval(id);
+  }, [isLive, symbol, interval]);
+
+  // ── Render ─────────────────────────────────────────────────────────────────
+  const isUp = legend && legend.close >= legend.open;
+  const clr   = isUp ? 'text-green-400' : 'text-red-400';
 
   return (
-    <div className="w-full relative bg-[#1e222d] rounded-lg overflow-hidden border border-gray-800" style={{ height: '400px' }}>
-      {loading && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/50 z-10 backdrop-blur-sm">
-          <div className="flex bg-gray-900 border border-gray-700 rounded-full px-4 py-2 text-sm text-gray-300">
-             <span className="animate-spin mr-2">⏳</span> Loading chart...
+    <div style={{ height: 520 }} className="w-full relative bg-[#161b27] rounded-lg overflow-hidden border border-gray-800/70 flex flex-col">
+
+      {/* Top OHLCV bar */}
+      <div className="flex-none px-3 py-1.5 flex items-center gap-3 border-b border-gray-800/60 bg-[#161b27] text-xs text-gray-400 z-10">
+        <span className="font-bold text-white mr-1">{symbol}</span>
+
+        {/* Live badge + price */}
+        {isLive && (
+          <span className="flex items-center gap-1.5 bg-green-900/30 text-green-400 border border-green-500/30 px-2 py-0.5 rounded-full text-[10px] font-semibold">
+            <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
+            LIVE {livePrice ? `₹${livePrice.toFixed(2)}` : ''}
+          </span>
+        )}
+
+        {legend ? (
+          <>
+            <span>O:<span className={`${clr} ml-1`}>{legend.open.toFixed(2)}</span></span>
+            <span>H:<span className={`${clr} ml-1`}>{legend.high.toFixed(2)}</span></span>
+            <span>L:<span className={`${clr} ml-1`}>{legend.low.toFixed(2)}</span></span>
+            <span>C:<span className={`${clr} ml-1`}>{legend.close.toFixed(2)}</span></span>
+            <span className="text-gray-500">Vol:<span className="text-gray-300 ml-1">{fmtVol(legend.volume)}</span></span>
+            <span className={`ml-auto font-medium ${clr}`}>
+              {isUp ? '▲' : '▼'} {Math.abs(legend.close - legend.open).toFixed(2)}
+              {' '}({Math.abs(((legend.close - legend.open) / legend.open) * 100).toFixed(2)}%)
+            </span>
+          </>
+        ) : (
+          <span className="text-gray-600 italic ml-2">Hover over a candle for OHLCV</span>
+        )}
+      </div>
+
+      {/* Chart pane */}
+      <div className="flex-1 relative">
+        {loading && (
+          <div className="absolute inset-0 flex items-center justify-center bg-black/60 z-20 backdrop-blur-sm">
+            <div className="flex bg-gray-900 border border-gray-700 rounded-full px-4 py-2 text-sm text-gray-300">
+              <span className="animate-spin mr-2">⏳</span> Loading chart...
+            </div>
           </div>
-        </div>
-      )}
-      {error && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/50 z-10 backdrop-blur-sm">
-          <div className="text-red-400 bg-red-900/20 px-4 py-3 rounded border border-red-500/30">
-            {error}
+        )}
+        {error && (
+          <div className="absolute inset-0 flex items-center justify-center bg-black/60 z-20 backdrop-blur-sm">
+            <div className="text-red-400 bg-red-900/20 px-4 py-3 rounded border border-red-500/30 text-sm max-w-sm text-center">{error}</div>
           </div>
-        </div>
-      )}
-      <div ref={chartContainerRef} className="w-full h-full" />
+        )}
+
+        <div ref={containerRef} className="absolute inset-0" />
+
+        {/* Marker hover tooltip */}
+        {tooltip && (() => {
+          const t = tooltip.trade;
+          const pnl = t.pnl ?? null;
+          const pnlColor = pnl == null ? 'text-gray-400' : pnl >= 0 ? 'text-green-400' : 'text-red-400';
+          const flipX = tooltip.x > 520;
+
+          return (
+            <div className="pointer-events-none absolute z-30" style={{ left: flipX ? tooltip.x - 224 : tooltip.x + 18, top: Math.max(10, tooltip.y - 30), minWidth: 208 }}>
+              <div className="rounded-lg text-xs shadow-xl" style={{ background: 'rgba(15,20,30,0.97)', border: `1px solid ${tooltip.color}44`, borderLeft: `3px solid ${tooltip.color}`, padding: '10px 14px' }}>
+                <div className="flex items-center gap-2 mb-2.5">
+                  <span className="w-2 h-2 rounded-full flex-none" style={{ background: tooltip.color }} />
+                  <span className="font-bold text-white text-sm">{t.symbol}</span>
+                  <span className="ml-auto font-semibold text-[11px]" style={{ color: tooltip.color }}>{t.tradeType?.replace('_', ' ') ?? t.side}</span>
+                </div>
+                <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-gray-400">
+                  <span>Price</span>
+                  <span className="text-white font-medium text-right">₹{(t.price ?? t.entryPrice ?? 0).toFixed ? (t.price ?? t.entryPrice ?? 0).toFixed(2) : '—'}</span>
+                  <span>Qty</span>
+                  <span className="text-white font-medium text-right">{t.quantity ?? '—'}</span>
+                  {pnl != null && <><span>P&amp;L</span><span className={`font-medium text-right ${pnlColor}`}>{pnl >= 0 ? '+' : ''}₹{pnl.toFixed(2)}</span></>}
+                  {t.peakPnl != null && <><span>Peak P&amp;L</span><span className="font-medium text-right text-emerald-400">+₹{Math.abs(t.peakPnl).toFixed(2)}</span></>}
+                  {t.capitalDeployed != null && <><span>Deployed</span><span className="text-gray-300 text-right">₹{Math.round(t.capitalDeployed).toLocaleString('en-IN')}</span></>}
+                  {t.strategy && <><span>Strategy</span><span className="text-gray-300 text-right truncate max-w-[100px]" title={t.strategy}>{t.strategy.replace(/_/g, ' ')}</span></>}
+                  <span>Date</span>
+                  <span className="text-gray-300 text-right">{t.date ?? '—'}</span>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+      </div>
+
+      {/* Bottom legend bar */}
+      <div className="flex-none px-3 py-1.5 flex items-center gap-4 border-t border-gray-800/60 bg-[#161b27] text-xs z-10">
+        <span style={{ color: '#10b981' }} className="font-medium">● L.Entry</span>
+        <span style={{ color: '#eab308' }} className="font-medium">● L.Exit</span>
+        <span style={{ color: '#ef4444' }} className="font-medium">● S.Entry</span>
+        <span style={{ color: '#3b82f6' }} className="font-medium">● S.Cover</span>
+        {isLive && (
+          <>
+            <span style={{ color: '#e2e8f0' }}>— Entry</span>
+            <span style={{ color: '#10b981' }}>- - Target</span>
+            <span style={{ color: '#ef4444' }}>- - SL</span>
+            <span style={{ color: '#f97316' }}>··· Trail</span>
+          </>
+        )}
+        <span className="text-gray-500 ml-auto">{trades.length} execution{trades.length !== 1 ? 's' : ''} plotted</span>
+      </div>
     </div>
   );
 }

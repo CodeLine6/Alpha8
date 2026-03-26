@@ -5,104 +5,106 @@ import ErrorBoundary from '@/components/ErrorBoundary';
 import { formatINR, pnlColor, formatPct, API_BASE } from '@/lib/utils';
 import TradingChart from '@/components/TradingChart';
 
-// ─── Data fetching hook ──────────────────────────────────
-function usePolling(url, intervalMs = 5000) {
+// ── Shared Tailwind class strings ────────────────────────────
+const CARD  = 'rounded-2xl border border-slate-700/50 bg-slate-900 p-6';
+const LABEL = 'text-[10px] font-semibold uppercase tracking-widest text-slate-500 mb-2';
+const MUTED = 'text-xs text-slate-500';
+
+// ── Polling hook ─────────────────────────────────────────────
+function usePolling(url, ms = 5000) {
     const [data, setData] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
 
-    const fetchData = useCallback(async () => {
+    const fetch_ = useCallback(async () => {
         try {
-            const res = await fetch(url);
-            if (!res.ok) throw new Error(`${res.status}`);
-            const json = await res.json();
-            setData(json);
-            setError(null);
-        } catch (err) {
-            setError(err.message);
-        } finally {
-            setLoading(false);
-        }
+            const r = await fetch(url);
+            if (!r.ok) throw new Error(`${r.status}`);
+            setData(await r.json()); setError(null);
+        } catch (e) { setError(e.message); }
+        finally { setLoading(false); }
     }, [url]);
 
-    useEffect(() => {
-        fetchData();
-        const id = setInterval(fetchData, intervalMs);
-        return () => clearInterval(id);
-    }, [fetchData, intervalMs]);
-
-    return { data, loading, error, refetch: fetchData };
+    useEffect(() => { fetch_(); const id = setInterval(fetch_, ms); return () => clearInterval(id); }, [fetch_, ms]);
+    return { data, loading, error, refetch: fetch_ };
 }
 
-// ─── Skeleton helpers ────────────────────────────────────
-function SkeletonCard() {
-    return <div className="skeleton h-28 w-full rounded-xl" />;
-}
-function SkeletonRow() {
-    return <div className="skeleton h-10 w-full rounded-lg mb-2" />;
+// ── Skeletons ────────────────────────────────────────────────
+const SkeletonCard = () => (
+    <div className="rounded-2xl border border-white/[0.07] bg-[#141922] p-6 h-28 animate-pulse" />
+);
+const SkeletonRow = () => (
+    <div className="h-10 rounded-lg bg-white/[0.04] animate-pulse mb-2" />
+);
+
+// ── Stat card ────────────────────────────────────────────────
+function StatCard({ label, value, sub, pulse }) {
+    return (
+        <div className={`${CARD} ${pulse === 'green' ? 'pulse-green' : pulse === 'red' ? 'pulse-red' : ''}`}>
+            <p className={LABEL}>{label}</p>
+            <p className="text-3xl font-bold tracking-tight tabular-nums">{value}</p>
+            {sub && <p className={`${MUTED} mt-2`}>{sub}</p>}
+        </div>
+    );
 }
 
-// ═══════════════════════════════════════════════════════════
-// MAIN DASHBOARD PAGE
-// ═══════════════════════════════════════════════════════════
+// ── Badge ─────────────────────────────────────────────────────
+function Badge({ color, children }) {
+    const cls = {
+        green:  'bg-green-500/10 text-green-400 border-green-500/20',
+        red:    'bg-red-500/10 text-red-400 border-red-500/20',
+        yellow: 'bg-yellow-500/10 text-yellow-400 border-yellow-500/20',
+        blue:   'bg-blue-500/10 text-blue-400 border-blue-500/20',
+    }[color] ?? 'bg-white/5 text-slate-400 border-white/10';
+    return (
+        <span className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold ${cls}`}>
+            {children}
+        </span>
+    );
+}
 
+// ════════════════════════════════════════════════════════════
 export default function DashboardPage() {
-    const summary = usePolling(`${API_BASE}/api/summary`, 5000);
+    const summary   = usePolling(`${API_BASE}/api/summary`, 5000);
     const positions = usePolling(`${API_BASE}/api/positions`, 5000);
-    const health = usePolling(`${API_BASE}/api/health`, 10000);
+    const health    = usePolling(`${API_BASE}/api/health`, 10000);
 
     return (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '2.5rem' }}>
+        <div className="space-y-8">
             {/* Header */}
             <div className="flex items-center justify-between">
                 <div>
-                    <h1 className="text-3xl font-bold tracking-tight">Dashboard</h1>
-                    <p className="text-sm text-[var(--text-muted)] mt-2">
-                        Real-time trading overview
-                    </p>
+                    <h1 className="text-2xl font-bold tracking-tight text-white">Dashboard</h1>
+                    <p className="text-sm text-slate-500 mt-1">Real-time trading overview</p>
                 </div>
-                <div className="flex items-center gap-4">
+                <div className="flex items-center gap-3">
                     {summary.data?.paperMode !== undefined && (
-                        <span className={`badge ${summary.data.paperMode ? 'badge-yellow' : 'badge-green'}`}>
-                            {summary.data.paperMode ? '📝 Paper' : '🔴 LIVE'}
-                        </span>
+                        <Badge color={summary.data.paperMode ? 'yellow' : 'red'}>
+                            {summary.data.paperMode ? '📝 Paper Mode' : '🔴 LIVE'}
+                        </Badge>
                     )}
-                    <span className="text-xs text-[var(--text-muted)]">
-                        {new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' })}
+                    <span className="text-xs text-slate-600 tabular-nums">
+                        {new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' })}
                     </span>
                 </div>
             </div>
 
-            {/* Stats Cards */}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '1.5rem' }}>
-                <ErrorBoundary>
-                    <PnLCard data={summary.data} loading={summary.loading} />
-                </ErrorBoundary>
-                <ErrorBoundary>
-                    <TradesCard data={summary.data} loading={summary.loading} />
-                </ErrorBoundary>
-                <ErrorBoundary>
-                    <WinRateCard data={summary.data} loading={summary.loading} />
-                </ErrorBoundary>
-                <ErrorBoundary>
-                    <DrawdownCard data={summary.data} loading={summary.loading} />
-                </ErrorBoundary>
-                <ErrorBoundary>
-                    <DailyRoiCard data={summary.data} loading={summary.loading} />
-                </ErrorBoundary>
+            {/* Stat cards */}
+            <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-5">
+                <ErrorBoundary><PnLCard      data={summary.data} loading={summary.loading} /></ErrorBoundary>
+                <ErrorBoundary><DailyRoiCard data={summary.data} loading={summary.loading} /></ErrorBoundary>
+                <ErrorBoundary><TradesCard   data={summary.data} loading={summary.loading} /></ErrorBoundary>
+                <ErrorBoundary><WinRateCard  data={summary.data} loading={summary.loading} /></ErrorBoundary>
+                <ErrorBoundary><DrawdownCard data={summary.data} loading={summary.loading} /></ErrorBoundary>
             </div>
 
-            {/* Health + Kill Switch Row */}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(380px, 1fr))', gap: '1.5rem' }}>
-                <ErrorBoundary>
-                    <HealthWidget data={health.data} loading={health.loading} />
-                </ErrorBoundary>
-                <ErrorBoundary>
-                    <KillSwitchWidget data={summary.data} loading={summary.loading} />
-                </ErrorBoundary>
+            {/* Health + killswitch */}
+            <div className="grid grid-cols-1 gap-5 xl:grid-cols-2">
+                <ErrorBoundary><HealthWidget      data={health.data}  loading={health.loading}   /></ErrorBoundary>
+                <ErrorBoundary><KillSwitchWidget  data={summary.data} loading={summary.loading}  /></ErrorBoundary>
             </div>
 
-            {/* Positions Table */}
+            {/* Positions */}
             <ErrorBoundary>
                 <PositionsTable data={positions.data} loading={positions.loading} />
             </ErrorBoundary>
@@ -110,75 +112,17 @@ export default function DashboardPage() {
     );
 }
 
-// ═══════════════════════════════════════════════════════════
-// STAT CARDS
-// ═══════════════════════════════════════════════════════════
-
+// ── Stat cards ────────────────────────────────────────────────
 function PnLCard({ data, loading }) {
     if (loading) return <SkeletonCard />;
     const pnl = data?.pnl ?? 0;
     return (
-        <div className={`card ${pnl >= 0 ? 'pulse-green' : 'pulse-red'}`}>
-            <div className="text-xs text-[var(--text-muted)] uppercase tracking-wider mb-2">
-                Daily P&L
-            </div>
-            <div className={`text-3xl font-bold ${pnlColor(pnl)}`}>
+        <div className={`${CARD} ${pnl >= 0 ? 'pulse-green' : 'pulse-red'}`}>
+            <p className={LABEL}>Daily P&L</p>
+            <p className={`text-3xl font-bold tracking-tight tabular-nums ${pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                 {formatINR(pnl)}
-            </div>
-            <div className={`text-xs mt-2 ${pnlColor(pnl)}`}>
-                {formatPct(data?.pnlPct)}
-            </div>
-        </div>
-    );
-}
-
-function TradesCard({ data, loading }) {
-    if (loading) return <SkeletonCard />;
-    return (
-        <div className="card">
-            <div className="text-xs text-[var(--text-muted)] uppercase tracking-wider mb-2">
-                Trades Today
-            </div>
-            <div className="text-3xl font-bold">{data?.tradeCount ?? 0}</div>
-            <div className="text-xs text-[var(--text-muted)] mt-2">
-                {data?.filled ?? 0} filled · {data?.rejected ?? 0} rejected
-            </div>
-        </div>
-    );
-}
-
-function WinRateCard({ data, loading }) {
-    if (loading) return <SkeletonCard />;
-    const winRate = data?.tradeCount ? ((data.winCount || 0) / data.tradeCount * 100) : 0;
-    return (
-        <div className="card">
-            <div className="text-xs text-[var(--text-muted)] uppercase tracking-wider mb-2">
-                Win Rate
-            </div>
-            <div className={`text-3xl font-bold ${winRate >= 50 ? 'text-green-400' : 'text-red-400'}`}>
-                {winRate.toFixed(1)}%
-            </div>
-            <div className="text-xs text-[var(--text-muted)] mt-2">
-                {data?.winCount ?? 0}W / {data?.lossCount ?? 0}L
-            </div>
-        </div>
-    );
-}
-
-function DrawdownCard({ data, loading }) {
-    if (loading) return <SkeletonCard />;
-    const dd = data?.drawdownPct ?? 0;
-    return (
-        <div className="card">
-            <div className="text-xs text-[var(--text-muted)] uppercase tracking-wider mb-2">
-                Max Drawdown
-            </div>
-            <div className={`text-3xl font-bold ${dd > 3 ? 'text-red-400' : dd > 1 ? 'text-yellow-400' : 'text-green-400'}`}>
-                {dd.toFixed(2)}%
-            </div>
-            <div className="text-xs text-[var(--text-muted)] mt-2">
-                Capital: {formatINR(data?.capital)}
-            </div>
+            </p>
+            <p className={`${MUTED} mt-2 ${pnl >= 0 ? 'text-green-500' : 'text-red-500'}`}>{formatPct(data?.pnlPct)}</p>
         </div>
     );
 }
@@ -187,302 +131,282 @@ function DailyRoiCard({ data, loading }) {
     if (loading) return <SkeletonCard />;
     const roi = data?.dailyRoi ?? 0;
     const deployed = data?.totalCashRequired ?? 0;
-    // walletDeployed = fresh wallet cash still locked in open positions (always ≤ capital)
-    // currentDeployment can exceed capital via recycled profits — not shown directly
-    const walletDeployed = data?.walletDeployed ?? data?.currentDeployment ?? 0;
     return (
-        <div className={`card ${roi >= 0 ? 'pulse-green' : 'pulse-red'}`}>
-            <div className="text-xs text-[var(--text-muted)] uppercase tracking-wider mb-2">
-                Daily ROI
-            </div>
-            <div className={`text-3xl font-bold ${roi >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+        <div className={`${CARD} ${roi >= 0 ? 'pulse-green' : 'pulse-red'}`}>
+            <p className={LABEL}>Daily ROI</p>
+            <p className={`text-3xl font-bold tracking-tight tabular-nums ${roi >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                 {roi >= 0 ? '+' : ''}{roi.toFixed(2)}%
-            </div>
-            <div className="text-xs text-[var(--text-muted)] mt-2">
-                on {formatINR(deployed)} fresh capital used
-            </div>
-            {walletDeployed > 0 && (
-                <div className="text-xs mt-1 text-yellow-400">
-                    {formatINR(walletDeployed)} wallet currently deployed
-                </div>
-            )}
+            </p>
+            <p className={`${MUTED} mt-2`}>on {formatINR(deployed)}</p>
         </div>
     );
 }
 
-// ═══════════════════════════════════════════════════════════
-// HEALTH STATUS WIDGET — mirrors 5 Telegram alert types
-// ═══════════════════════════════════════════════════════════
-
-function HealthWidget({ data, loading }) {
-    if (loading) {
-        return (
-            <div className="card">
-                <div className="text-xs text-[var(--text-muted)] uppercase tracking-wide mb-3">
-                    System Health
-                </div>
-                <div className="space-y-2">
-                    <SkeletonRow /><SkeletonRow /><SkeletonRow />
-                </div>
-            </div>
-        );
-    }
-
-    const services = [
-        { name: 'Broker API', key: 'broker', icon: '🔗' },
-        { name: 'Broker Token', key: 'brokerTokenValid', icon: '🔑' },
-        { name: 'Redis', key: 'redis', icon: '🗄️' },
-        { name: 'Database', key: 'db', icon: '💾' },
-        { name: 'Data Feed', key: 'dataFeed', icon: '📡' },
-        { name: 'Telegram', key: 'telegram', icon: '📱' },
-    ];
-
-    const allHealthy = services.every((s) => data?.[s.key] !== false);
-
-    return (
-        <div className={`card ${allHealthy ? '' : 'border-red-500/50'}`}>
-            <div className="flex items-center justify-between mb-4">
-                <div className="text-xs text-[var(--text-muted)] uppercase tracking-wider">
-                    System Health
-                </div>
-                <span className={`badge ${allHealthy ? 'badge-green' : 'badge-red'}`}>
-                    {allHealthy ? '✅ All Systems Go' : '⚠️ Degraded'}
-                </span>
-            </div>
-            <div className="space-y-1">
-                {services.map((service) => {
-                    const status = data?.[service.key];
-                    const isUp = status !== false;
-                    const dotClass = status === null ? 'dot-yellow' : status !== false ? 'dot-green' : 'dot-red';
-                    const statusText = status === null ? 'Not checked' : status !== false ? 'Valid' : 'EXPIRED';
-
-                    return (
-                        <div key={service.key} className="flex items-center justify-between py-2.5 px-3 rounded-lg hover:bg-[var(--bg-card-hover)] transition-colors">
-                            <div className="flex items-center gap-2">
-                                <span>{service.icon}</span>
-                                <span className="text-sm">{service.name}</span>
-                            </div>
-                            <div className="flex items-center gap-2">
-                                <span className={`dot ${dotClass}`} />
-                                <span className={`text-xs font-medium ${status === null ? 'text-yellow-400' : status !== false ? 'text-green-400' : 'text-red-400'}`}>
-                                    {service.key === 'brokerTokenValid' ? statusText : (isUp ? 'Connected' : 'DOWN')}
-                                </span>
-                            </div>
-                        </div>
-                    );
-                })}
-            </div>
-            {data?.lastCheck && (
-                <div className="text-xs text-[var(--text-muted)] mt-3">
-                    Last check: {new Date(data.lastCheck).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })}
-                </div>
-            )}
-        </div>
-    );
-}
-
-// ═══════════════════════════════════════════════════════════
-// KILL SWITCH WIDGET
-// ═══════════════════════════════════════════════════════════
-
-function KillSwitchWidget({ data, loading }) {
+function TradesCard({ data, loading }) {
     if (loading) return <SkeletonCard />;
+    return (
+        <div className={CARD}>
+            <p className={LABEL}>Trades Today</p>
+            <p className="text-3xl font-bold tracking-tight tabular-nums text-white">{data?.tradeCount ?? 0}</p>
+            <p className={`${MUTED} mt-2`}>{data?.filled ?? 0} filled · {data?.rejected ?? 0} rejected</p>
+        </div>
+    );
+}
 
-    const engaged = data?.killSwitchEngaged;
+function WinRateCard({ data, loading }) {
+    if (loading) return <SkeletonCard />;
+    const wr = data?.tradeCount ? ((data.winCount || 0) / data.tradeCount * 100) : 0;
+    return (
+        <div className={CARD}>
+            <p className={LABEL}>Win Rate</p>
+            <p className={`text-3xl font-bold tracking-tight tabular-nums ${wr >= 50 ? 'text-green-400' : 'text-red-400'}`}>
+                {wr.toFixed(1)}%
+            </p>
+            <p className={`${MUTED} mt-2`}>{data?.winCount ?? 0}W / {data?.lossCount ?? 0}L</p>
+        </div>
+    );
+}
+
+function DrawdownCard({ data, loading }) {
+    if (loading) return <SkeletonCard />;
+    const dd = data?.drawdownPct ?? 0;
+    return (
+        <div className={CARD}>
+            <p className={LABEL}>Max Drawdown</p>
+            <p className={`text-3xl font-bold tracking-tight tabular-nums ${dd > 3 ? 'text-red-400' : dd > 1 ? 'text-yellow-400' : 'text-green-400'}`}>
+                {dd.toFixed(2)}%
+            </p>
+            <p className={`${MUTED} mt-2`}>Capital: {formatINR(data?.capital)}</p>
+        </div>
+    );
+}
+
+// ── Health widget ─────────────────────────────────────────────
+function HealthWidget({ data, loading }) {
+    const services = [
+        { name: 'Broker API',   key: 'broker',           icon: '🔗' },
+        { name: 'Broker Token', key: 'brokerTokenValid',  icon: '🔑' },
+        { name: 'Redis',        key: 'redis',             icon: '🗄️' },
+        { name: 'Database',     key: 'db',                icon: '💾' },
+        { name: 'Data Feed',    key: 'dataFeed',          icon: '📡' },
+        { name: 'Telegram',     key: 'telegram',          icon: '📱' },
+    ];
+    const allOk = services.every(s => data?.[s.key] !== false);
 
     return (
-        <div className={`card ${engaged ? 'border-red-500/50 pulse-red' : ''}`}>
-            <div className="flex items-center justify-between mb-3">
-                <div className="text-xs text-[var(--text-muted)] uppercase tracking-wide">
-                    Kill Switch
-                </div>
-                <span className={`badge ${engaged ? 'badge-red' : 'badge-green'}`}>
-                    {engaged ? '🛑 ENGAGED' : '✅ Normal'}
-                </span>
+        <div className={`${CARD} ${!allOk ? 'border-red-500/30' : ''}`}>
+            <div className="flex items-center justify-between mb-5">
+                <p className={LABEL}>System Health</p>
+                <Badge color={allOk ? 'green' : 'red'}>{allOk ? '✅ All Systems Go' : '⚠️ Degraded'}</Badge>
             </div>
-            {engaged ? (
-                <div>
-                    <p className="text-red-400 text-sm mb-2">
-                        All new orders are <strong>BLOCKED</strong>
-                    </p>
-                    {data?.killSwitchReason && (
-                        <p className="text-xs text-[var(--text-muted)]">
-                            Reason: {data.killSwitchReason}
-                        </p>
-                    )}
-                </div>
+            {loading ? (
+                <div className="space-y-2"><SkeletonRow /><SkeletonRow /><SkeletonRow /></div>
             ) : (
-                <p className="text-sm text-[var(--text-secondary)]">
-                    Trading is active. Kill switch can be engaged from{' '}
-                    <a href="/settings" className="text-blue-400 hover:underline">Settings</a>.
+                <div className="space-y-0.5">
+                    {services.map(s => {
+                        const ok  = data?.[s.key] !== false;
+                        const na  = data?.[s.key] == null;
+                        const dotColor = na ? 'bg-yellow-400' : ok ? 'bg-green-400' : 'bg-red-400';
+                        const dotGlow  = na ? '' : ok ? 'shadow-[0_0_6px_#22c55e]' : 'shadow-[0_0_6px_#ef4444]';
+                        const textColor = na ? 'text-yellow-400' : ok ? 'text-green-400' : 'text-red-400';
+                        const label = s.key === 'brokerTokenValid'
+                            ? (na ? 'Not checked' : ok ? 'Valid' : 'EXPIRED')
+                            : (ok ? 'Connected' : 'DOWN');
+                        return (
+                            <div key={s.key} className="flex items-center justify-between rounded-xl px-3 py-2 hover:bg-white/[0.04] transition-colors">
+                                <div className="flex items-center gap-2.5">
+                                    <span>{s.icon}</span>
+                                    <span className="text-sm text-slate-300">{s.name}</span>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <span className={`w-2 h-2 rounded-full ${dotColor} ${dotGlow}`} />
+                                    <span className={`text-xs font-semibold ${textColor}`}>{label}</span>
+                                </div>
+                            </div>
+                        );
+                    })}
+                </div>
+            )}
+            {data?.lastCheck && (
+                <p className={`${MUTED} mt-4`}>
+                    Last check: {new Date(data.lastCheck).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })}
                 </p>
             )}
         </div>
     );
 }
 
-// ═══════════════════════════════════════════════════════════
-// POSITIONS TABLE  (with manual exit)
-// ═══════════════════════════════════════════════════════════
+// ── Kill switch ───────────────────────────────────────────────
+function KillSwitchWidget({ data, loading }) {
+    if (loading) return <SkeletonCard />;
+    const engaged = data?.killSwitchEngaged;
+    return (
+        <div className={`${CARD} ${engaged ? 'border-red-500/40 pulse-red' : ''}`}>
+            <div className="flex items-center justify-between mb-4">
+                <p className={LABEL}>Kill Switch</p>
+                <Badge color={engaged ? 'red' : 'green'}>{engaged ? '🛑 ENGAGED' : '✅ Normal'}</Badge>
+            </div>
+            {engaged ? (
+                <div>
+                    <p className="text-red-400 text-sm mb-2">All new orders are <strong>BLOCKED</strong></p>
+                    {data?.killSwitchReason && <p className={MUTED}>Reason: {data.killSwitchReason}</p>}
+                </div>
+            ) : (
+                <p className="text-sm text-slate-400">
+                    Trading is active. Kill switch can be engaged from{' '}
+                    <a href="/settings" className="text-indigo-400 hover:underline">Settings</a>.
+                </p>
+            )}
+        </div>
+    );
+}
 
+// ── Positions table ───────────────────────────────────────────
 function PositionsTable({ data, loading }) {
-    const [confirm, setConfirm] = useState(null);   // { symbol, entryPrice, qty, side }
-    const [exiting, setExiting] = useState(null);   // symbol currently being exited
-    const [exitMsg, setExitMsg] = useState(null);   // { ok, text }
-    const [chartSymbol, setChartSymbol] = useState(null); // { symbol, trades }
+    const [confirm, setConfirm]       = useState(null);
+    const [exiting, setExiting]       = useState(null);
+    const [exitMsg, setExitMsg]       = useState(null);
+    const [chartSymbol, setChartSymbol] = useState(null);
 
-    const handleExitClick = (pos) => {
-        setExitMsg(null);
-        setConfirm({ symbol: pos.symbol, entryPrice: pos.entryPrice, qty: pos.quantity, side: pos.side });
-    };
+    const handleExitClick = (pos) => { setExitMsg(null); setConfirm({ symbol: pos.symbol, entryPrice: pos.entryPrice, qty: pos.quantity, side: pos.side }); };
 
     const handleExitConfirm = async () => {
         if (!confirm) return;
         const sym = confirm.symbol;
-        setExiting(sym);
-        setConfirm(null);
+        setExiting(sym); setConfirm(null);
         try {
-            const apiKey = process.env.NEXT_PUBLIC_API_KEY || '';
-            const res = await fetch(`${API_BASE}/api/positions/exit`, {
+            const key = process.env.NEXT_PUBLIC_API_KEY || '';
+            const r = await fetch(`${API_BASE}/api/positions/exit`, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    ...(apiKey ? { 'X-Api-Key': apiKey } : {}),
-                },
+                headers: { 'Content-Type': 'application/json', ...(key ? { 'X-Api-Key': key } : {}) },
                 body: JSON.stringify({ symbol: sym }),
             });
-            const result = await res.json();
-            if (!res.ok) throw new Error(result.error || 'Exit failed');
-            const pnlSign = (result.pnl ?? 0) >= 0 ? '+' : '';
-            setExitMsg({ ok: true, text: `✅ ${sym} exited @ ₹${result.exitPrice?.toFixed(2)} · P&L ${pnlSign}₹${(result.pnl ?? 0).toFixed(2)}` });
-        } catch (err) {
-            setExitMsg({ ok: false, text: `❌ ${err.message}` });
-        } finally {
-            setExiting(null);
-        }
+            const res = await r.json();
+            if (!r.ok) throw new Error(res.error || 'Exit failed');
+            const s = (res.pnl ?? 0) >= 0 ? '+' : '';
+            setExitMsg({ ok: true, text: `✅ ${sym} exited @ ₹${res.exitPrice?.toFixed(2)} · P&L ${s}₹${(res.pnl ?? 0).toFixed(2)}` });
+        } catch (e) { setExitMsg({ ok: false, text: `❌ ${e.message}` }); }
+        finally { setExiting(null); }
     };
-
-    if (loading) {
-        return (
-            <div className="card">
-                <div className="text-xs text-[var(--text-muted)] uppercase tracking-wide mb-3">Open Positions</div>
-                {[1, 2, 3].map((i) => <SkeletonRow key={i} />)}
-            </div>
-        );
-    }
 
     const positions = data?.positions || [];
 
+    const TH = 'py-3 px-4 text-left text-[10px] font-semibold uppercase tracking-widest text-slate-500 border-b border-white/[0.06] whitespace-nowrap';
+    const TD = 'py-4 px-4 text-sm text-slate-300 whitespace-nowrap';
+
     return (
         <>
-            {/* ── Confirmation modal ───────────────────────────── */}
+            {/* Confirm modal */}
             {confirm && (
-                <div
-                    onClick={() => setConfirm(null)}
-                    style={{ position: 'fixed', inset: 0, zIndex: 50, background: 'rgba(0,0,0,0.65)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-                >
-                    <div className="card" onClick={(e) => e.stopPropagation()}
-                        style={{ width: '22rem', padding: '1.75rem', boxShadow: '0 8px 40px rgba(0,0,0,0.5)' }}>
-                        <div style={{ fontSize: '1.1rem', fontWeight: 700, marginBottom: '0.75rem' }}>🔴 Exit position?</div>
-                        <div style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', marginBottom: '1.25rem', lineHeight: 1.6 }}>
-                            <strong>{confirm.symbol}</strong>&nbsp;
-                            <span className={`badge ${confirm.side === 'BUY' ? 'badge-green' : 'badge-red'}`}>{confirm.side}</span><br />
-                            Qty: {confirm.qty} · Entry: ₹{confirm.entryPrice?.toFixed(2)}<br />
-                            <span style={{ color: 'var(--text-muted)', fontSize: '0.78rem' }}>Will exit at current market price via broker.</span>
-                        </div>
-                        <div style={{ display: 'flex', gap: '0.75rem' }}>
-                            <button id={`exit-confirm-${confirm.symbol}`} className="btn btn-danger" style={{ flex: 1 }} onClick={handleExitConfirm}>Exit Now</button>
-                            <button className="btn btn-secondary" style={{ flex: 1 }} onClick={() => setConfirm(null)}>Cancel</button>
+                <div onClick={() => setConfirm(null)} className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
+                    <div onClick={e => e.stopPropagation()} className="w-80 rounded-2xl border border-white/[0.08] bg-[#141922] p-6 shadow-2xl">
+                        <p className="text-base font-bold text-white mb-1">🔴 Exit position?</p>
+                        <p className="text-sm text-slate-400 mb-4 leading-relaxed">
+                            <strong className="text-white">{confirm.symbol}</strong> &nbsp;
+                            <Badge color={confirm.side === 'BUY' ? 'green' : 'red'}>{confirm.side}</Badge>
+                            <br />Qty: {confirm.qty} · Entry: ₹{confirm.entryPrice?.toFixed(2)}
+                            <br /><span className="text-xs text-slate-600">Exits at current market price.</span>
+                        </p>
+                        <div className="flex gap-3">
+                            <button onClick={handleExitConfirm}
+                                className="flex-1 rounded-xl bg-red-500/15 border border-red-500/30 text-red-400 py-2 text-sm font-semibold hover:bg-red-500/25 transition">
+                                Exit Now
+                            </button>
+                            <button onClick={() => setConfirm(null)}
+                                className="flex-1 rounded-xl bg-white/5 border border-white/10 text-slate-400 py-2 text-sm font-semibold hover:bg-white/10 transition">
+                                Cancel
+                            </button>
                         </div>
                     </div>
                 </div>
             )}
 
-            {/* ── Chart modal ───────────────────────────── */}
+            {/* Chart modal */}
             {chartSymbol && (
-                <div
-                    onClick={() => setChartSymbol(null)}
-                    style={{ position: 'fixed', inset: 0, zIndex: 60, background: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', backdropFilter: 'blur(4px)' }}
-                >
-                    <div className="card" onClick={(e) => e.stopPropagation()}
-                        style={{ width: '90vw', maxWidth: '1000px', padding: '1.5rem', boxShadow: '0 8px 40px rgba(0,0,0,0.8)', border: '1px solid #374151', background: '#111827' }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-                            <div style={{ fontSize: '1.25rem', fontWeight: 700, color: 'white' }}>📈 {chartSymbol.symbol} Interactive Chart</div>
-                            <button onClick={() => setChartSymbol(null)} style={{ color: '#9ca3af', background: 'transparent', border: 'none', cursor: 'pointer', fontSize: '1.5rem', lineHeight: 1 }}>&times;</button>
+                <div onClick={() => setChartSymbol(null)} className="fixed inset-0 z-[60] flex items-center justify-center bg-black/85 backdrop-blur-md">
+                    <div onClick={e => e.stopPropagation()} className="w-[92vw] max-w-[1050px] rounded-2xl border border-white/10 bg-[#0d1117] p-6 shadow-2xl">
+                        <div className="flex items-center justify-between mb-5">
+                            <div>
+                                <h2 className="text-xl font-bold text-white">{chartSymbol.symbol}</h2>
+                                <p className="text-xs text-slate-500 mt-0.5">Live · 5-minute candles</p>
+                            </div>
+                            <button onClick={() => setChartSymbol(null)} className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-sm text-slate-400 hover:text-white transition">✕</button>
                         </div>
-                        <TradingChart symbol={chartSymbol.symbol} trades={chartSymbol.trades} />
+                        <TradingChart symbol={chartSymbol.symbol} trades={chartSymbol.trades} isLive={chartSymbol.isLive} liveData={chartSymbol.liveData ?? {}} />
                     </div>
                 </div>
             )}
 
-            <div className="card overflow-hidden">
-                <div className="flex items-center justify-between mb-3 px-1">
-                    <div className="text-xs text-[var(--text-muted)] uppercase tracking-wide">Open Positions</div>
-                    <span className="badge badge-blue">{positions.length} active</span>
+            {/* Table card */}
+            <div className="rounded-2xl border border-slate-700/50 bg-slate-900 overflow-hidden">
+                <div className="flex items-center justify-between px-6 py-4 border-b border-slate-700/40">
+                    <p className="text-sm font-semibold text-white">Open Positions</p>
+                    <Badge color="blue">{positions.length} active</Badge>
                 </div>
 
                 {exitMsg && (
-                    <div style={{
-                        margin: '0 0 1rem', padding: '0.6rem 1rem', borderRadius: '0.5rem', fontSize: '0.82rem',
-                        background: exitMsg.ok ? 'rgba(34,197,94,0.1)' : 'rgba(239,68,68,0.1)',
-                        color: exitMsg.ok ? '#4ade80' : '#f87171',
-                        border: `1px solid ${exitMsg.ok ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'}`,
-                    }}>{exitMsg.text}</div>
+                    <div className={`mx-6 mt-4 rounded-xl border px-4 py-2.5 text-sm ${exitMsg.ok ? 'bg-green-500/10 border-green-500/25 text-green-400' : 'bg-red-500/10 border-red-500/25 text-red-400'}`}>
+                        {exitMsg.text}
+                    </div>
                 )}
 
-                {positions.length === 0 ? (
-                    <div className="text-center py-8 text-[var(--text-muted)]">
-                        <p className="text-3xl mb-2">📭</p>
-                        <p className="text-sm">No open positions</p>
+                {loading ? (
+                    <div className="p-6 space-y-2"><SkeletonRow /><SkeletonRow /><SkeletonRow /></div>
+                ) : positions.length === 0 ? (
+                    <div className="py-16 text-center">
+                        <p className="text-3xl mb-3">📭</p>
+                        <p className="text-sm text-slate-500">No open positions</p>
                     </div>
                 ) : (
                     <div className="overflow-x-auto">
-                        <table className="data-table">
+                        <table className="w-full border-collapse">
                             <thead>
                                 <tr>
-                                    <th>Symbol</th><th>Side</th><th>Qty</th><th>Avg Price</th>
-                                    <th>Entry Price</th><th>Current</th><th>P&L</th><th>Target</th><th>Stop Loss</th><th>Chart</th><th></th>
+                                    {['Symbol','Side','Qty','Avg Price','Entry','Current','P&L','Target','Stop Loss','Chart',''].map(h => (
+                                        <th key={h} className={TH}>{h}</th>
+                                    ))}
                                 </tr>
                             </thead>
                             <tbody>
                                 {positions.map((pos, i) => {
-                                    const unrealized = pos.unrealisedPnL ?? 0;
+                                    const pnl = pos.unrealisedPnL ?? 0;
                                     const isExiting = exiting === pos.symbol;
                                     return (
-                                        <tr key={i}>
-                                            <td className="font-medium text-[var(--text-primary)]">{pos.symbol}</td>
-                                            <td><span className={`badge ${pos.side === 'BUY' ? 'badge-green' : 'badge-red'}`}>{pos.side}</span></td>
-                                            <td>{pos.quantity}</td>
-                                            <td>{formatINR(pos.avgPrice)}</td>
-                                            <td>{formatINR(pos.entryPrice)}</td>
-                                            <td>{formatINR(pos.currentPrice)}</td>
-                                            <td className={`font-medium ${pnlColor(unrealized)}`}>{formatINR(unrealized)}</td>
-                                            <td className="text-blue-400">{pos.targetPrice ? formatINR(pos.targetPrice) : '—'}</td>
-                                            <td className="text-yellow-400">{pos.stopLoss ? formatINR(pos.stopLoss) : '—'}</td>
-                                            <td>
+                                        <tr key={i} className="border-b border-white/[0.04] hover:bg-white/[0.025] transition-colors">
+                                            <td className={`${TD} font-semibold text-white`}>{pos.symbol}</td>
+                                            <td className={TD}><Badge color={pos.side === 'BUY' ? 'green' : 'red'}>{pos.side}</Badge></td>
+                                            <td className={`${TD} tabular-nums`}>{pos.quantity}</td>
+                                            <td className={`${TD} tabular-nums`}>{formatINR(pos.avgPrice)}</td>
+                                            <td className={`${TD} tabular-nums`}>{formatINR(pos.entryPrice)}</td>
+                                            <td className={`${TD} tabular-nums font-medium text-white`}>{formatINR(pos.currentPrice)}</td>
+                                            <td className={`${TD} tabular-nums font-semibold ${pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>{formatINR(pnl)}</td>
+                                            <td className={`${TD} tabular-nums text-blue-400`}>{pos.targetPrice ? formatINR(pos.targetPrice) : '—'}</td>
+                                            <td className={`${TD} tabular-nums text-yellow-400`}>{pos.stopLoss ? formatINR(pos.stopLoss) : '—'}</td>
+                                            <td className={TD}>
                                                 <button
-                                                    onClick={() => setChartSymbol({ symbol: pos.symbol, trades: [pos] })}
-                                                    title="View Chart"
-                                                    style={{ background: 'rgba(59, 130, 246, 0.1)', color: '#60a5fa', border: '1px solid rgba(59, 130, 246, 0.3)', borderRadius: '4px', padding: '2px 8px', fontSize: '0.9rem', cursor: 'pointer' }}
-                                                >
-                                                    📈
+                                                    onClick={() => setChartSymbol({
+                                                        symbol: pos.symbol,
+                                                        trades: [{
+                                                            ...pos, price: pos.entryPrice, pnl: pos.unrealisedPnL ?? null,
+                                                            tradeType: pos.side === 'BUY' ? 'LONG_ENTRY' : 'SHORT_ENTRY',
+                                                            timestamp: pos.entryTimestamp ?? null,
+                                                            date: pos.entryTimestamp ? new Date(pos.entryTimestamp).toLocaleDateString('en-IN') : new Date().toLocaleDateString('en-IN'),
+                                                            peakPnl: pos.highWaterMark != null ? (pos.side === 'BUY' ? +((pos.highWaterMark - pos.entryPrice) * pos.quantity).toFixed(2) : +((pos.entryPrice - pos.highWaterMark) * pos.quantity).toFixed(2)) : null,
+                                                        }],
+                                                        isLive: true,
+                                                        liveData: { currentPrice: pos.currentPrice, entryPrice: pos.entryPrice, stopLoss: pos.stopLoss ?? null, targetPrice: pos.targetPrice ?? null, trailingStop: pos.trailStopPrice ?? null },
+                                                    })}
+                                                    className="rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-400 hover:bg-emerald-500/20 transition">
+                                                    📈 Live
                                                 </button>
                                             </td>
-                                            <td>
+                                            <td className={TD}>
                                                 <button
                                                     id={`exit-btn-${pos.symbol}`}
                                                     onClick={() => handleExitClick(pos)}
                                                     disabled={isExiting}
-                                                    style={{
-                                                        padding: '0.3rem 0.75rem', fontSize: '0.75rem', fontWeight: 600,
-                                                        borderRadius: '0.375rem', border: '1px solid rgba(239,68,68,0.5)',
-                                                        background: isExiting ? 'rgba(239,68,68,0.05)' : 'rgba(239,68,68,0.1)',
-                                                        color: '#f87171', cursor: isExiting ? 'not-allowed' : 'pointer', transition: 'background 0.15s', whiteSpace: 'nowrap',
-                                                    }}
-                                                    onMouseEnter={(e) => { if (!isExiting) e.currentTarget.style.background = 'rgba(239,68,68,0.25)'; }}
-                                                    onMouseLeave={(e) => { if (!isExiting) e.currentTarget.style.background = 'rgba(239,68,68,0.1)'; }}
-                                                >
-                                                    {isExiting ? '⏳ Exiting…' : '🔴 Exit'}
+                                                    className="rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-1 text-xs font-medium text-red-400 hover:bg-red-500/20 transition disabled:opacity-40">
+                                                    {isExiting ? '⏳ …' : '🔴 Exit'}
                                                 </button>
                                             </td>
                                         </tr>

@@ -5,29 +5,38 @@ import ErrorBoundary from '@/components/ErrorBoundary';
 import { formatINR, pnlColor, API_BASE } from '@/lib/utils';
 import TradingChart from '@/components/TradingChart';
 
+const CARD = 'rounded-2xl border border-slate-700/50 bg-slate-900';
+const TH = 'py-3 px-4 text-left text-[10px] font-semibold uppercase tracking-widest text-slate-500 border-b border-slate-700/40 whitespace-nowrap';
+const TD = 'py-4 px-4 text-sm text-slate-300 whitespace-nowrap';
+
+function Badge({ color, children }) {
+    const cls = { green: 'bg-green-500/10 text-green-400 border-green-500/20', red: 'bg-red-500/10 text-red-400 border-red-500/20', yellow: 'bg-yellow-500/10 text-yellow-400 border-yellow-500/20', blue: 'bg-blue-500/10 text-blue-400 border-blue-500/20' }[color] ?? 'bg-white/5 text-slate-400 border-white/10';
+    return <span className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold ${cls}`}>{children}</span>;
+}
+
+const TYPE_CONFIG = {
+    LONG_ENTRY:  { label: 'L Entry',  color: 'green'  },
+    LONG_EXIT:   { label: 'L Exit',   color: 'yellow' },
+    SHORT_ENTRY: { label: 'S Entry',  color: 'red'    },
+    SHORT_COVER: { label: 'S Cover',  color: 'blue'   },
+};
+
 export default function HistoryPage() {
-    const [trades, setTrades] = useState([]);
-    const [loading, setLoading] = useState(true);
-    const [activeTab, setActiveTab] = useState('ALL');
+    const [trades,      setTrades]      = useState([]);
+    const [loading,     setLoading]     = useState(true);
+    const [activeTab,   setActiveTab]   = useState('ALL');
     const [chartSymbol, setChartSymbol] = useState(null);
-    const [filters, setFilters] = useState({
-        startDate: '',
-        endDate: '',
-        strategy: '',
-        symbol: '',
-        side: '',
-        tradeType: '',
-    });
+    const [filters,     setFilters]     = useState({ startDate: '', endDate: '', strategy: '', symbol: '', side: '', tradeType: '' });
 
     const fetchTrades = useCallback(async () => {
         setLoading(true);
         try {
-            const params = new URLSearchParams();
-            Object.entries(filters).forEach(([k, v]) => { if (v) params.set(k, v); });
-            const res = await fetch(`${API_BASE}/api/trades?${params}`);
-            const json = await res.json();
-            setTrades(json.trades || []);
-        } catch { /* handled by ErrorBoundary */ }
+            const p = new URLSearchParams();
+            Object.entries(filters).forEach(([k, v]) => { if (v) p.set(k, v); });
+            const r = await fetch(`${API_BASE}/api/trades?${p}`);
+            const j = await r.json();
+            setTrades(j.trades || []);
+        } catch { /* ErrorBoundary */ }
         finally { setLoading(false); }
     }, [filters]);
 
@@ -35,234 +44,139 @@ export default function HistoryPage() {
 
     const exportCSV = () => {
         if (!trades.length) return;
-        const headers = ['Date', 'Symbol', 'Type', 'Side', 'Qty', 'Price', 'P&L', 'Capital Deployed', 'ROI %', 'Strategy', 'Status'];
-        const rows = trades.map((t) => [
-            t.date, t.symbol, t.tradeType ?? '', t.side, t.quantity, t.price, t.pnl,
-            t.capitalDeployed ?? '', t.tradeRoi != null ? t.tradeRoi.toFixed(4) : '',
-            t.strategy, t.status,
-        ]);
-        const csv = [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
-        const blob = new Blob([csv], { type: 'text/csv' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `alpha8-trades-${new Date().toISOString().split('T')[0]}.csv`;
+        const hdr = ['Date','Symbol','Type','Side','Qty','Price','P&L','Capital Deployed','ROI %','Strategy','Status'];
+        const rows = trades.map(t => [t.date, t.symbol, t.tradeType ?? '', t.side, t.quantity, t.price, t.pnl, t.capitalDeployed ?? '', t.tradeRoi != null ? t.tradeRoi.toFixed(4) : '', t.strategy, t.status]);
+        const csv = [hdr.join(','), ...rows.map(r => r.join(','))].join('\n');
+        const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(new Blob([csv], { type: 'text/csv' })), download: `alpha8-trades-${new Date().toISOString().split('T')[0]}.csv` });
         a.click();
-        URL.revokeObjectURL(url);
     };
 
-    // Trade type arrives directly from the backend /api/trades
-    const resolveTradeType = (t) => t.tradeType || null;
-
-    // Client-side filter by tradeType and activeTab
-    const visibleTrades = trades.filter(t => {
-        const type = resolveTradeType(t);
+    const visible = trades.filter(t => {
+        const type = t.tradeType;
         if (filters.tradeType && type !== filters.tradeType) return false;
-        if (activeTab === 'LONG' && type !== 'LONG_ENTRY' && type !== 'LONG_EXIT') return false;
+        if (activeTab === 'LONG'  && type !== 'LONG_ENTRY'  && type !== 'LONG_EXIT')   return false;
         if (activeTab === 'SHORT' && type !== 'SHORT_ENTRY' && type !== 'SHORT_COVER') return false;
         return true;
     });
 
+    const INP = 'w-full rounded-xl border border-white/[0.08] bg-[#0d1117] px-3 py-2 text-sm text-slate-200 placeholder-slate-600 focus:border-indigo-500/50 focus:ring-1 focus:ring-indigo-500/20 outline-none transition';
+    const TABS = ['ALL', 'LONG', 'SHORT'];
+    const TAB_LABELS = { ALL: 'All Orders', LONG: 'Long', SHORT: 'Short' };
+
     return (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
-            <div className="flex items-center justify-between mb-8">
+        <div className="space-y-6">
+            {/* Header */}
+            <div className="flex items-center justify-between">
                 <div>
-                    <h1 className="text-3xl font-bold tracking-tight">Trade History</h1>
-                    <p className="text-sm text-[var(--text-muted)] mt-2">View and export past trades</p>
+                    <h1 className="text-2xl font-bold tracking-tight text-white">Trade History</h1>
+                    <p className="text-sm text-slate-500 mt-1">View and export past trades</p>
                 </div>
-                <button className="btn btn-primary" onClick={exportCSV} disabled={!trades.length}>
+                <button onClick={exportCSV} disabled={!trades.length}
+                    className="rounded-xl border border-indigo-500/30 bg-indigo-500/10 px-4 py-2 text-sm font-medium text-indigo-400 hover:bg-indigo-500/20 transition disabled:opacity-40">
                     📥 Export CSV
                 </button>
             </div>
 
             {/* Tabs */}
-            <div style={{ display: 'flex', gap: '2rem', borderBottom: '1px solid var(--border-color)', marginBottom: '1.5rem', padding: '0 0.5rem' }}>
-                <button 
-                    style={{ 
-                        paddingBottom: '0.75rem', 
-                        fontSize: '0.9rem', 
-                        fontWeight: '500', 
-                        borderBottom: `2px solid ${activeTab === 'ALL' ? '#3b82f6' : 'transparent'}`,
-                        color: activeTab === 'ALL' ? '#3b82f6' : 'var(--text-muted)',
-                        cursor: 'pointer',
-                        background: 'transparent',
-                        borderTop: 'none', borderLeft: 'none', borderRight: 'none',
-                        transition: 'all 0.2s'
-                    }}
-                    onClick={() => setActiveTab('ALL')}
-                >
-                    All Orders
-                </button>
-                <button 
-                    style={{ 
-                        paddingBottom: '0.75rem', 
-                        fontSize: '0.9rem', 
-                        fontWeight: '500', 
-                        borderBottom: `2px solid ${activeTab === 'LONG' ? '#3b82f6' : 'transparent'}`,
-                        color: activeTab === 'LONG' ? '#3b82f6' : 'var(--text-muted)',
-                        cursor: 'pointer',
-                        background: 'transparent',
-                        borderTop: 'none', borderLeft: 'none', borderRight: 'none',
-                        transition: 'all 0.2s'
-                    }}
-                    onClick={() => setActiveTab('LONG')}
-                >
-                    Long Orders
-                </button>
-                <button 
-                    style={{ 
-                        paddingBottom: '0.75rem', 
-                        fontSize: '0.9rem', 
-                        fontWeight: '500', 
-                        borderBottom: `2px solid ${activeTab === 'SHORT' ? '#3b82f6' : 'transparent'}`,
-                        color: activeTab === 'SHORT' ? '#3b82f6' : 'var(--text-muted)',
-                        cursor: 'pointer',
-                        background: 'transparent',
-                        borderTop: 'none', borderLeft: 'none', borderRight: 'none',
-                        transition: 'all 0.2s'
-                    }}
-                    onClick={() => setActiveTab('SHORT')}
-                >
-                    Short Orders
-                </button>
+            <div className="flex border-b border-white/[0.06]">
+                {TABS.map(tab => (
+                    <button key={tab} onClick={() => setActiveTab(tab)}
+                        className={`px-5 pb-3 text-sm font-medium transition border-b-2 -mb-px ${activeTab === tab ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-slate-500 hover:text-slate-300'}`}>
+                        {TAB_LABELS[tab]}
+                    </button>
+                ))}
             </div>
 
             {/* Filters */}
-            <div className="card">
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '1rem' }}>
+            <div className={`${CARD} p-5`}>
+                <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
+                    {[
+                        { label: 'Start Date', key: 'startDate', type: 'date' },
+                        { label: 'End Date',   key: 'endDate',   type: 'date' },
+                    ].map(({ label, key, type }) => (
+                        <div key={key}>
+                            <label className="block text-[10px] font-semibold uppercase tracking-widest text-slate-500 mb-1.5">{label}</label>
+                            <input type={type} className={INP} value={filters[key]} onChange={e => setFilters(f => ({ ...f, [key]: e.target.value }))} />
+                        </div>
+                    ))}
                     <div>
-                        <label className="text-xs text-[var(--text-muted)] mb-1 block">Start Date</label>
-                        <input type="date" className="input" value={filters.startDate}
-                            onChange={(e) => setFilters({ ...filters, startDate: e.target.value })} />
-                    </div>
-                    <div>
-                        <label className="text-xs text-[var(--text-muted)] mb-1 block">End Date</label>
-                        <input type="date" className="input" value={filters.endDate}
-                            onChange={(e) => setFilters({ ...filters, endDate: e.target.value })} />
-                    </div>
-                    <div>
-                        <label className="text-xs text-[var(--text-muted)] mb-1 block">Strategy</label>
-                        <select className="input" value={filters.strategy}
-                            onChange={(e) => setFilters({ ...filters, strategy: e.target.value })}>
+                        <label className="block text-[10px] font-semibold uppercase tracking-widest text-slate-500 mb-1.5">Strategy</label>
+                        <select className={INP} value={filters.strategy} onChange={e => setFilters(f => ({ ...f, strategy: e.target.value }))}>
                             <option value="">All</option>
-                            <option value="EMA_CROSSOVER">EMA Crossover</option>
-                            <option value="RSI_MEAN_REVERSION">RSI Reversion</option>
-                            <option value="VWAP_MOMENTUM">VWAP Momentum</option>
-                            <option value="BREAKOUT_VOLUME">Breakout Volume</option>
-                            <option value="ORB">ORB Breakout</option>
-                            <option value="BAVI">BAVI Order Flow</option>
+                            {['EMA_CROSSOVER','RSI_MEAN_REVERSION','VWAP_MOMENTUM','BREAKOUT_VOLUME','ORB','BAVI'].map(s => <option key={s} value={s}>{s}</option>)}
                         </select>
                     </div>
                     <div>
-                        <label className="text-xs text-[var(--text-muted)] mb-1 block">Symbol</label>
-                        <input type="text" className="input" placeholder="e.g. RELIANCE"
-                            value={filters.symbol}
-                            onChange={(e) => setFilters({ ...filters, symbol: e.target.value.toUpperCase() })} />
+                        <label className="block text-[10px] font-semibold uppercase tracking-widest text-slate-500 mb-1.5">Symbol</label>
+                        <input type="text" className={INP} placeholder="e.g. RELIANCE" value={filters.symbol} onChange={e => setFilters(f => ({ ...f, symbol: e.target.value.toUpperCase() }))} />
                     </div>
                     <div>
-                        <label className="text-xs text-[var(--text-muted)] mb-1 block">Side</label>
-                        <select className="input" value={filters.side}
-                            onChange={(e) => setFilters({ ...filters, side: e.target.value })}>
-                            <option value="">All</option>
-                            <option value="BUY">BUY</option>
-                            <option value="SELL">SELL</option>
+                        <label className="block text-[10px] font-semibold uppercase tracking-widest text-slate-500 mb-1.5">Side</label>
+                        <select className={INP} value={filters.side} onChange={e => setFilters(f => ({ ...f, side: e.target.value }))}>
+                            <option value="">All</option><option>BUY</option><option>SELL</option>
                         </select>
                     </div>
                     <div>
-                        <label className="text-xs text-[var(--text-muted)] mb-1 block">Type</label>
-                        <select className="input" value={filters.tradeType}
-                            onChange={(e) => setFilters({ ...filters, tradeType: e.target.value })}>
+                        <label className="block text-[10px] font-semibold uppercase tracking-widest text-slate-500 mb-1.5">Type</label>
+                        <select className={INP} value={filters.tradeType} onChange={e => setFilters(f => ({ ...f, tradeType: e.target.value }))}>
                             <option value="">All</option>
-                            <option value="LONG_ENTRY">Long Entry</option>
-                            <option value="LONG_EXIT">Long Exit</option>
-                            <option value="SHORT_ENTRY">Short Entry</option>
-                            <option value="SHORT_COVER">Short Cover</option>
+                            {Object.entries(TYPE_CONFIG).map(([v, c]) => <option key={v} value={v}>{c.label}</option>)}
                         </select>
                     </div>
                 </div>
             </div>
 
-            {/* ── Chart modal ───────────────────────────── */}
+            {/* Chart modal */}
             {chartSymbol && (
-                <div
-                    onClick={() => setChartSymbol(null)}
-                    style={{ position: 'fixed', inset: 0, zIndex: 60, background: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', backdropFilter: 'blur(4px)' }}
-                >
-                    <div className="card" onClick={(e) => e.stopPropagation()}
-                        style={{ width: '90vw', maxWidth: '1000px', padding: '1.5rem', boxShadow: '0 8px 40px rgba(0,0,0,0.8)', border: '1px solid #374151', background: '#111827' }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-                            <div style={{ fontSize: '1.25rem', fontWeight: 700, color: 'white' }}>📈 {chartSymbol.symbol} Interactive Chart</div>
-                            <button onClick={() => setChartSymbol(null)} style={{ color: '#9ca3af', background: 'transparent', border: 'none', cursor: 'pointer', fontSize: '1.5rem', lineHeight: 1 }}>&times;</button>
+                <div onClick={() => setChartSymbol(null)} className="fixed inset-0 z-[60] flex items-center justify-center bg-black/85 backdrop-blur-md">
+                    <div onClick={e => e.stopPropagation()} className="w-[92vw] max-w-[1050px] rounded-2xl border border-white/10 bg-[#0d1117] p-6 shadow-2xl">
+                        <div className="flex items-center justify-between mb-5">
+                            <h2 className="text-xl font-bold text-white">{chartSymbol.symbol}</h2>
+                            <button onClick={() => setChartSymbol(null)} className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-sm text-slate-400 hover:text-white transition">✕</button>
                         </div>
-                        <TradingChart symbol={chartSymbol.symbol} trades={chartSymbol.trades} />
+                        <TradingChart symbol={chartSymbol.symbol} trades={chartSymbol.trades} endDate={chartSymbol.endDate} />
                     </div>
                 </div>
             )}
 
-            {/* Results */}
+            {/* Table */}
             <ErrorBoundary>
-                <div className="card overflow-hidden">
+                <div className={`${CARD} overflow-hidden`}>
                     {loading ? (
-                        <div className="space-y-2">{[1, 2, 3, 4, 5].map((i) => <div key={i} className="skeleton h-10 w-full rounded-lg" />)}</div>
-                    ) : trades.length === 0 ? (
-                        <div className="text-center py-12 text-[var(--text-muted)]">
-                            <p className="text-3xl mb-2">📭</p>
-                            <p>No trades found matching filters</p>
-                        </div>
+                        <div className="p-6 space-y-2">{[1,2,3,4,5].map(i => <div key={i} className="h-10 rounded-xl bg-white/[0.04] animate-pulse" />)}</div>
+                    ) : visible.length === 0 ? (
+                        <div className="py-16 text-center"><p className="text-3xl mb-3">📭</p><p className="text-sm text-slate-500">No trades found</p></div>
                     ) : (
                         <div className="overflow-x-auto">
-                            <table className="data-table">
+                            <table className="w-full border-collapse">
                                 <thead>
-                                    <tr>
-                                        <th>Date</th>
-                                        <th>Symbol</th>
-                                        <th>Type</th>
-                                        <th>Qty</th>
-                                        <th>Price</th>
-                                        <th>P&L</th>
-                                        <th>Deployed</th>
-                                        <th>ROI</th>
-                                        <th>Strategy</th>
-                                        <th>Status</th>
-                                        <th>Chart</th>
-                                    </tr>
+                                    <tr>{['Date','Symbol','Type','Qty','Price','P&L','Deployed','ROI','Strategy','Status','Chart'].map(h => <th key={h} className={TH}>{h}</th>)}</tr>
                                 </thead>
                                 <tbody>
-                                    {visibleTrades.map((trade, i) => {
-                                        const typeConfig = {
-                                            LONG_ENTRY:  { label: 'L ENTRY',  cls: 'badge-green'  },
-                                            LONG_EXIT:   { label: 'L EXIT',   cls: 'badge-yellow' },
-                                            SHORT_ENTRY: { label: 'S ENTRY',  cls: 'badge-red'    },
-                                            SHORT_COVER: { label: 'S COVER',  cls: 'badge-blue'   },
-                                        };
-                                        const tc = typeConfig[resolveTradeType(trade)] ?? { label: trade.side, cls: trade.side === 'BUY' ? 'badge-green' : 'badge-red' };
+                                    {visible.map((tr, i) => {
+                                        const tc = TYPE_CONFIG[tr.tradeType] ?? { label: tr.side, color: tr.side === 'BUY' ? 'green' : 'red' };
+                                        const statusColor = { FILLED: 'green', REJECTED: 'red' }[tr.status] ?? 'yellow';
                                         return (
-                                            <tr key={i}>
-                                                <td className="whitespace-nowrap">{trade.date}</td>
-                                                <td className="font-medium text-[var(--text-primary)]">{trade.symbol}</td>
-                                                <td><span className={`badge ${tc.cls}`}>{tc.label}</span></td>
-                                                <td>{trade.quantity}</td>
-                                                <td>{formatINR(trade.price)}</td>
-                                                <td className={`font-medium ${pnlColor(trade.pnl)}`}>{formatINR(trade.pnl)}</td>
-                                                <td className="text-xs text-[var(--text-muted)]">
-                                                    {trade.capitalDeployed != null ? formatINR(trade.capitalDeployed) : '—'}
+                                            <tr key={i} className="border-b border-white/[0.04] hover:bg-white/[0.025] transition-colors">
+                                                <td className={`${TD} tabular-nums`}>{tr.date}</td>
+                                                <td className={`${TD} font-semibold text-white`}>{tr.symbol}</td>
+                                                <td className={TD}><Badge color={tc.color}>{tc.label}</Badge></td>
+                                                <td className={`${TD} tabular-nums`}>{tr.quantity}</td>
+                                                <td className={`${TD} tabular-nums`}>{formatINR(tr.price)}</td>
+                                                <td className={`${TD} tabular-nums font-semibold ${(tr.pnl ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{formatINR(tr.pnl)}</td>
+                                                <td className={`${TD} tabular-nums text-slate-400`}>{tr.capitalDeployed != null ? formatINR(tr.capitalDeployed) : '—'}</td>
+                                                <td className={`${TD} tabular-nums font-medium ${tr.tradeRoi == null ? 'text-slate-600' : tr.tradeRoi >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                                    {tr.tradeRoi != null ? `${tr.tradeRoi >= 0 ? '+' : ''}${tr.tradeRoi.toFixed(2)}%` : '—'}
                                                 </td>
-                                                <td className={`text-xs font-medium ${trade.tradeRoi == null ? '' : trade.tradeRoi >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                                                    {trade.tradeRoi != null ? `${trade.tradeRoi >= 0 ? '+' : ''}${trade.tradeRoi.toFixed(2)}%` : '—'}
-                                                </td>
-                                                <td className="text-xs">{trade.strategy}</td>
-                                                <td>
-                                                    <span className={`badge ${trade.status === 'FILLED' ? 'badge-green' :
-                                                        trade.status === 'REJECTED' ? 'badge-red' : 'badge-yellow'
-                                                        }`}>{trade.status}</span>
-                                                </td>
-                                                <td>
-                                                    <button
-                                                        onClick={() => setChartSymbol({ symbol: trade.symbol, trades: [trade] })}
-                                                        title="View Chart"
-                                                        style={{ background: 'rgba(59, 130, 246, 0.1)', color: '#60a5fa', border: '1px solid rgba(59, 130, 246, 0.3)', borderRadius: '4px', padding: '2px 8px', fontSize: '0.9rem', cursor: 'pointer' }}
-                                                    >
-                                                        📈
+                                                <td className={`${TD} text-slate-400`}>{tr.strategy}</td>
+                                                <td className={TD}><Badge color={statusColor}>{tr.status}</Badge></td>
+                                                <td className={TD}>
+                                                    <button onClick={() => {
+                                                        const t0 = tr.timestamp ? new Date(tr.timestamp).getTime() : new Date(tr.date.split('/').reverse().join('-')).getTime();
+                                                        const endD = new Date(t0 + 86400000).toISOString().split('T')[0];
+                                                        setChartSymbol({ symbol: tr.symbol, trades: trades.filter(t => t.symbol === tr.symbol && t.date === tr.date), endDate: endD });
+                                                    }} className="rounded-lg border border-blue-500/20 bg-blue-500/10 px-3 py-1 text-xs font-medium text-blue-400 hover:bg-blue-500/20 transition">
+                                                        📈 Chart
                                                     </button>
                                                 </td>
                                             </tr>
@@ -270,11 +184,9 @@ export default function HistoryPage() {
                                     })}
                                 </tbody>
                             </table>
+                            <p className="px-4 py-3 text-xs text-slate-600 border-t border-white/[0.04]">{trades.length} trades found</p>
                         </div>
                     )}
-                    <div className="text-xs text-[var(--text-muted)] mt-3 px-1">
-                        {trades.length} trades found
-                    </div>
                 </div>
             </ErrorBoundary>
         </div>

@@ -2,71 +2,100 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import { useState, useEffect } from 'react';
+import { API_BASE } from '@/lib/utils';
 
-/**
- * BUG #24 FIX — Duplicate ⚙️ icon on Live Params and Settings:
- *   Both nav items used the same ⚙️ emoji. On mobile viewports where
- *   sidebar-label text is hidden (width < 768px), both items were visually
- *   identical — a user could not distinguish them without tapping each one.
- *   Changed Live Params to use 🎛️ (control sliders), which is semantically
- *   appropriate for a parameter tuning panel.
- */
-const NAV_ITEMS = [
-    { href: '/', label: 'Dashboard', icon: '📊' },
-    { href: '/history', label: 'History', icon: '📋' },
-    { href: '/strategies', label: 'Strategies', icon: '🧠' },
-    { href: '/live-params', label: 'Live Params', icon: '🎛️' }, // ← was ⚙️ (BUG #24 FIX)
-    { href: '/settings', label: 'Settings', icon: '⚙️' },
+const NAV = [
+  { href: '/',            icon: '◈',  label: 'Dashboard'  },
+  { href: '/history',     icon: '≡',  label: 'History'    },
+  { href: '/screener',    icon: '◎',  label: 'Screener'   },
+  { href: '/strategies',  icon: '⬡',  label: 'Strategies' },
+  { href: '/live-params', icon: '⊞',  label: 'Live Params'},
+  { href: '/settings',    icon: '⊙',  label: 'Settings'   },
 ];
 
 export default function Sidebar() {
-    const pathname = usePathname();
+  const pathname = usePathname();
+  const [open, setOpen]     = useState(false);
+  const [health, setHealth] = useState(null);
 
-    return (
-        <aside
-            style={{ width: 'var(--sidebar-width)' }}
-            className="fixed left-0 top-0 bottom-0 bg-[var(--bg-secondary)] border-r border-[var(--border-subtle)] flex flex-col z-40 overflow-hidden transition-[width] duration-200"
-        >
-            {/* Logo */}
-            <div className="h-14 flex items-center gap-3 px-4 border-b border-[var(--border-subtle)] shrink-0">
-                <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white font-bold text-sm shrink-0">
-                    Q
-                </div>
-                <span className="text-lg font-bold bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent whitespace-nowrap sidebar-label">
-                    Alpha8
-                </span>
-            </div>
+  useEffect(() => {
+    const check = async () => {
+      try {
+        const r = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(3000) });
+        setHealth(r.ok ? 'ok' : 'err');
+      } catch { setHealth('err'); }
+    };
+    check();
+    const id = setInterval(check, 30_000);
+    return () => clearInterval(id);
+  }, []);
 
-            {/* Navigation */}
-            <nav className="flex-1 p-2 space-y-1 overflow-y-auto">
-                {NAV_ITEMS.map((item) => {
-                    const isActive = pathname === item.href;
-                    return (
-                        <Link
-                            key={item.href}
-                            href={item.href}
-                            title={item.label}
-                            className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 ${isActive
-                                    ? 'bg-blue-500/10 text-blue-400 border border-blue-500/30'
-                                    : 'text-[var(--text-secondary)] hover:bg-[var(--bg-card-hover)] hover:text-[var(--text-primary)] border border-transparent'
-                                }`}
-                        >
-                            <span className="text-lg shrink-0">{item.icon}</span>
-                            <span className="whitespace-nowrap sidebar-label">{item.label}</span>
-                            {isActive && (
-                                <div className="ml-auto w-1.5 h-1.5 rounded-full bg-blue-400 sidebar-label" />
-                            )}
-                        </Link>
-                    );
-                })}
-            </nav>
+  return (
+    <aside
+      onMouseEnter={() => setOpen(true)}
+      onMouseLeave={() => setOpen(false)}
+      className="fixed left-0 top-0 bottom-0 z-50 flex flex-col overflow-hidden transition-[width] duration-200"
+      style={{
+        width: open ? '220px' : '60px',
+        background: '#0f172a',
+        borderRight: '1px solid rgba(100,116,139,0.25)',
+      }}
+    >
+      {/* Logo */}
+      <div className="flex h-14 shrink-0 items-center gap-3 px-4 overflow-hidden"
+           style={{ borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+        <div className="w-8 h-8 shrink-0 rounded-lg flex items-center justify-center text-white font-bold text-sm"
+             style={{ background: 'linear-gradient(135deg, #6366f1, #8b5cf6)' }}>
+          α
+        </div>
+        <span className="sidebar-label whitespace-nowrap text-sm font-semibold text-white overflow-hidden transition-opacity duration-150"
+              style={{ opacity: open ? 1 : 0 }}>
+          Alpha8
+        </span>
+      </div>
 
-            {/* Footer */}
-            <div className="px-4 py-3 border-t border-[var(--border-subtle)] shrink-0">
-                <div className="text-xs text-[var(--text-muted)] sidebar-label whitespace-nowrap">
-                    Alpha8 v1.0
-                </div>
-            </div>
-        </aside>
-    );
+      {/* Nav */}
+      <nav className="flex-1 flex flex-col gap-1 p-3 overflow-y-auto overflow-x-hidden">
+        {NAV.map(({ href, icon, label }) => {
+          const active = pathname === href;
+          return (
+            <Link
+              key={href}
+              href={href}
+              title={!open ? label : undefined}
+              className="flex items-center gap-3 rounded-xl px-3 py-3 text-sm font-medium overflow-hidden transition-all duration-150"
+              style={{
+                color: active ? '#fff' : 'rgba(255,255,255,0.45)',
+                background: active ? 'rgba(99,102,241,0.15)' : 'transparent',
+                borderLeft: `2px solid ${active ? '#6366f1' : 'transparent'}`,
+              }}
+              onMouseEnter={e => { if (!active) e.currentTarget.style.background = 'rgba(255,255,255,0.05)'; e.currentTarget.style.color = 'rgba(255,255,255,0.75)'; }}
+              onMouseLeave={e => { if (!active) { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'rgba(255,255,255,0.45)'; }}}
+            >
+              <span className="shrink-0 w-5 text-center font-mono text-base">{icon}</span>
+              <span className="sidebar-label whitespace-nowrap transition-opacity duration-150"
+                    style={{ opacity: open ? 1 : 0 }}>
+                {label}
+              </span>
+            </Link>
+          );
+        })}
+      </nav>
+
+      {/* Health dot */}
+      <div className="flex items-center gap-2.5 px-4 py-3 overflow-hidden"
+           style={{ borderTop: '1px solid rgba(255,255,255,0.06)' }}>
+        <span className="shrink-0 w-2 h-2 rounded-full"
+              style={{
+                background: health === 'ok' ? '#22c55e' : health === 'err' ? '#ef4444' : '#4b5563',
+                boxShadow: health === 'ok' ? '0 0 6px #22c55e' : health === 'err' ? '0 0 6px #ef4444' : 'none',
+              }} />
+        <span className="sidebar-label text-xs whitespace-nowrap transition-opacity duration-150"
+              style={{ opacity: open ? 1 : 0, color: 'rgba(255,255,255,0.3)' }}>
+          {health === 'ok' ? 'System Online' : health === 'err' ? 'Offline' : '…'}
+        </span>
+      </div>
+    </aside>
+  );
 }

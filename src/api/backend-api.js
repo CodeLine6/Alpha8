@@ -2,6 +2,7 @@ import { createLogger } from '../lib/logger.js';
 import { query, checkDatabaseHealth } from '../lib/db.js';
 import { checkRedisHealth, cacheGet, cacheSet } from '../lib/redis.js';
 import { fetchHistoricalData } from '../data/historical-data.js';
+import { getScreenerResults } from '../intelligence/screener-engine.js';
 
 const log = createLogger('backend-api');
 
@@ -716,6 +717,7 @@ export function createApiHandler(deps) {
 
         return {
           date: new Date(t.created_at).toLocaleDateString('en-IN'),
+          timestamp: new Date(t.created_at).toISOString(),
           symbol: t.symbol,
           side: t.side,
           tradeType,
@@ -1224,9 +1226,76 @@ export function createApiHandler(deps) {
     }
   }
 
+  async function handleScreenerGet(req, res) {
+    try {
+      const params  = parseQuery(req.url);
+      const refresh = params.refresh === '1';
+
+      const { results, fromCache, scannedAt } = await getScreenerResults({
+        broker,
+        forceRefresh: refresh,
+      });
+
+      // Apply optional query filters
+      const minScore    = parseFloat(params.minScore)  || 0;
+      const regime      = (params.regime || '').toUpperCase() || null;
+      const minTurnover = parseFloat(params.minTurnover) || 0;
+      const limit       = parseInt(params.limit) || 300;
+
+      let filtered = results;
+      if (minScore > 0)    filtered = filtered.filter(r => r.score >= minScore);
+      if (regime)          filtered = filtered.filter(r => r.regime === regime);
+      if (minTurnover > 0) filtered = filtered.filter(r => (r.breakdown?.liquidity?.turnoverCr ?? 0) >= minTurnover);
+
+      json(res, {
+        results:    filtered.slice(0, limit),
+        total:      filtered.length,
+        scanned:    results.length,
+        fromCache,
+        scannedAt:  scannedAt ?? null,
+      });
+    } catch (err) {
+      log.error({ err }, 'Error in /api/screener');
+      json(res, { error: err.message }, 500);
+    }
+  }
+
   async function handleKillSwitchGet(req, res) {
     if (!checkAuth(req, res)) return;
     json(res, killSwitch.getStatus());
+  }
+
+  async function handleLivePriceGet(req, res) {
+    try {
+      const params = parseQuery(req.url);
+      const symbol = params.symbol;
+      if (!symbol) return json(res, { error: 'symbol is required' }, 400);
+
+      let ltp = null;
+      let source = 'none';
+
+      // 1. Try broker LTP first (cheapest call, no rate-limit concern)
+      if (broker?.getLTP) {
+        try {
+          const result = await broker.getLTP([`NSE:${symbol.toUpperCase()}`]);
+          ltp = result?.[`NSE:${symbol.toUpperCase()}`]?.last_price ?? null;
+          if (ltp != null) source = 'broker';
+        } catch { /* fallthrough */ }
+      }
+
+      // 2. Try from live tick data (tickFeed last price cache)
+      if (ltp == null && tickFeed?.getLastTick) {
+        const tick = tickFeed.getLastTick(symbol.toUpperCase());
+        if (tick?.last_price) { ltp = tick.last_price; source = 'tick'; }
+      }
+
+      if (ltp == null) return json(res, { error: 'Price unavailable' }, 503);
+
+      json(res, { symbol: symbol.toUpperCase(), ltp, timestamp: new Date().toISOString(), source });
+    } catch (err) {
+      log.error({ err }, 'Error in /api/live-price');
+      json(res, { error: err.message }, 500);
+    }
   }
 
   async function handleCandlesGet(req, res) {
@@ -1240,8 +1309,13 @@ export function createApiHandler(deps) {
         return json(res, { error: 'symbol is required' }, 400);
       }
 
-      const toDate = new Date();
-      const fromDate = new Date();
+      const endDateStr = params.endDate;
+      const toDate = endDateStr ? new Date(endDateStr) : new Date();
+      if (endDateStr && !toDate.toISOString().includes('T23')) {
+          toDate.setHours(23, 59, 59, 999);
+      }
+      
+      const fromDate = new Date(toDate);
       fromDate.setDate(toDate.getDate() - days);
 
       const fmt = d => d.toISOString().split('T')[0];
@@ -1273,6 +1347,7 @@ export function createApiHandler(deps) {
 
       // In lightweight-charts, time arrays MUST be strictly ascending with no duplicates.
       // fetchHistoricalData might return duplicates if fallback/Kite stitched poorly, so let's guarantee uniqueness/sorting.
+      formatted.sort((a, b) => a.time - b.time);
       const unique = [];
       let lastTime = 0;
       for (const c of formatted) {
@@ -1320,7 +1395,9 @@ export function createApiHandler(deps) {
           case '/api/live-settings': return handleLiveSettingsGet(req, res);
           case '/api/live-settings/schema': return handleLiveSettingsSchema(req, res);
           case '/api/killswitch': return handleKillSwitchGet(req, res);
-          case '/api/candles': return handleCandlesGet(req, res); // ← ADD
+          case '/api/candles': return handleCandlesGet(req, res);
+          case '/api/live-price': return handleLivePriceGet(req, res);
+          case '/api/screener': return handleScreenerGet(req, res);
 
         }
       }
