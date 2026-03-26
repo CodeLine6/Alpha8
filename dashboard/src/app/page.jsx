@@ -107,7 +107,13 @@ export default function DashboardPage() {
 
             {/* Market Overview */}
             <ErrorBoundary>
-                <MarketOverview data={market.data} loading={market.loading} />
+                <MarketOverview 
+                    data={market.data} 
+                    loading={market.loading} 
+                    watchlist={summary.data?.watchlist}
+                    dynamicWatchlist={summary.data?.dynamicWatchlist}
+                    onSummaryRefetch={summary.refetch}
+                />
             </ErrorBoundary>
 
             {/* Positions */}
@@ -268,8 +274,22 @@ function KillSwitchWidget({ data, loading }) {
 }
 
 // ── Market Overview ───────────────────────────────────────────
-function MarketOverview({ data, loading }) {
+function MarketOverview({ data, loading, watchlist, dynamicWatchlist, onSummaryRefetch }) {
     const [activeTab, setActiveTab] = useState('NSE');
+
+    const toggleWatchlist = async (symbol, listType) => {
+        try {
+            const key = process.env.NEXT_PUBLIC_API_KEY || '';
+            const r = await fetch(`${API_BASE}/api/settings/watchlist`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', ...(key ? { 'X-Api-Key': key } : {}) },
+                body: JSON.stringify({ action: 'toggle', symbol, list: listType }),
+            });
+            if (r.ok && onSummaryRefetch) onSummaryRefetch();
+        } catch (e) {
+            console.error('Failed to toggle watchlist', e);
+        }
+    };
 
     if (loading && !data) return (
         <div className="grid grid-cols-1 gap-5 lg:grid-cols-3">
@@ -361,13 +381,25 @@ function MarketOverview({ data, loading }) {
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-white/4">
-                            {gainers.map((s, i) => (
-                                <tr key={`${s.symbol}-${i}`} className="hover:bg-white/2 transition-colors">
-                                    <td className={`${TD} font-semibold text-white`}>{s.symbol}</td>
+                            {gainers.map((s, i) => {
+                                const isPinned = watchlist?.includes(s.symbol);
+                                const isDynamic = dynamicWatchlist?.includes(s.symbol);
+                                return (
+                                <tr key={`${s.symbol}-${i}`} className="hover:bg-white/2 transition-colors group">
+                                    <td className={TD}>
+                                        <div className="flex items-center justify-between">
+                                            <span className="font-semibold text-white">{s.symbol}</span>
+                                            <div className="flex opacity-0 group-hover:opacity-100 transition-opacity items-center gap-1 scale-90 origin-right">
+                                                <button onClick={(e) => { e.stopPropagation(); toggleWatchlist(s.symbol, 'pinned'); }} className={`px-1.5 py-0.5 rounded transition ${isPinned ? 'opacity-100 ring-1 ring-blue-500/50 bg-blue-500/20' : 'opacity-40 hover:opacity-100 bg-white/5'} flex items-center shrink-0`} title="Toggle Pinned"><span className="text-[10px]">📌</span></button>
+                                                <button onClick={(e) => { e.stopPropagation(); toggleWatchlist(s.symbol, 'dynamic'); }} className={`px-1.5 py-0.5 rounded transition ${isDynamic ? 'opacity-100 ring-1 ring-purple-500/50 bg-purple-500/20' : 'opacity-40 hover:opacity-100 bg-white/5'} flex items-center shrink-0`} title="Toggle Dynamic"><span className="text-[10px]">⚡</span></button>
+                                            </div>
+                                        </div>
+                                    </td>
                                     <td className={`${TD} tabular-nums`}>{s.price?.toFixed(2)}</td>
                                     <td className={`${TD} text-right font-semibold text-green-400 tabular-nums`}>+{(s.changePct ?? 0).toFixed(2)}%</td>
                                 </tr>
-                            ))}
+                                );
+                            })}
                             {gainers.length === 0 && <tr><td colSpan="3" className="py-8 text-center text-xs text-slate-500 italic">No gainers in {activeTab} universe</td></tr>}
                         </tbody>
                     </table>
@@ -399,13 +431,25 @@ function MarketOverview({ data, loading }) {
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-white/4">
-                            {losers.map((s, i) => (
-                                <tr key={`${s.symbol}-${i}`} className="hover:bg-white/2 transition-colors">
-                                    <td className={`${TD} font-semibold text-white`}>{s.symbol}</td>
+                            {losers.map((s, i) => {
+                                const isPinned = watchlist?.includes(s.symbol);
+                                const isDynamic = dynamicWatchlist?.includes(s.symbol);
+                                return (
+                                <tr key={`${s.symbol}-${i}`} className="hover:bg-white/2 transition-colors group">
+                                    <td className={TD}>
+                                        <div className="flex items-center justify-between">
+                                            <span className="font-semibold text-white">{s.symbol}</span>
+                                            <div className="flex opacity-0 group-hover:opacity-100 transition-opacity items-center gap-1 scale-90 origin-right">
+                                                <button onClick={(e) => { e.stopPropagation(); toggleWatchlist(s.symbol, 'pinned'); }} className={`px-1.5 py-0.5 rounded transition ${isPinned ? 'opacity-100 ring-1 ring-blue-500/50 bg-blue-500/20' : 'opacity-40 hover:opacity-100 bg-white/5'} flex items-center shrink-0`} title="Toggle Pinned"><span className="text-[10px]">📌</span></button>
+                                                <button onClick={(e) => { e.stopPropagation(); toggleWatchlist(s.symbol, 'dynamic'); }} className={`px-1.5 py-0.5 rounded transition ${isDynamic ? 'opacity-100 ring-1 ring-purple-500/50 bg-purple-500/20' : 'opacity-40 hover:opacity-100 bg-white/5'} flex items-center shrink-0`} title="Toggle Dynamic"><span className="text-[10px]">⚡</span></button>
+                                            </div>
+                                        </div>
+                                    </td>
                                     <td className={`${TD} tabular-nums`}>{s.price?.toFixed(2)}</td>
                                     <td className={`${TD} text-right font-semibold text-red-400 tabular-nums`}>{(s.changePct ?? 0).toFixed(2)}%</td>
                                 </tr>
-                            ))}
+                                );
+                            })}
                             {losers.length === 0 && <tr><td colSpan="3" className="py-8 text-center text-xs text-slate-500 italic">No losers in {activeTab} universe</td></tr>}
                         </tbody>
                     </table>

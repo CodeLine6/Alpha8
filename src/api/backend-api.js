@@ -421,6 +421,16 @@ export function createApiHandler(deps) {
       } catch { /* OK — no trades yet */ }
 
       const liveCapital = getLiveSetting ? await getLiveSetting('TRADING_CAPITAL', config.TRADING_CAPITAL) : config.TRADING_CAPITAL;
+      let watchlist = [];
+      let dynamicWatchlist = [];
+      try {
+        const resSettings = await query("SELECT key, value FROM settings WHERE key IN ('watchlist', 'dynamic_watchlist')");
+        for (const row of resSettings.rows) {
+            if (row.key === 'watchlist') watchlist = JSON.parse(row.value) || [];
+            if (row.key === 'dynamic_watchlist') dynamicWatchlist = JSON.parse(row.value) || [];
+        }
+      } catch { /* */ }
+
       json(res, {
         pnl: tradeStats.totalPnl || 0,
         pnlPct: (tradeStats.totalPnl / liveCapital * 100) || 0,
@@ -440,8 +450,10 @@ export function createApiHandler(deps) {
         dailyRoi: roiData.dailyRoi,
         totalCashRequired: roiData.totalCashRequired,
         currentDeployment: roiData.currentDeployment,
-        walletDeployed: roiData.walletDeployed,   // net fresh wallet cash still locked in positions (≤ capital)
+        walletDeployed: roiData.walletDeployed,
         peakDeployment: roiData.peakDeployment,
+        watchlist,
+        dynamicWatchlist,
       });
     } catch (err) {
       log.error({ err }, 'Error in /api/summary');
@@ -993,25 +1005,64 @@ export function createApiHandler(deps) {
     try {
       const body = await parseBody(req);
 
-      let watchlist = [];
+      const isDynamic = body.list === 'dynamic';
+      const targetList = isDynamic ? 'dynamic_watchlist' : 'watchlist';
+
+      let pinnedList = [];
+      let dynamicList = [];
       try {
-        const result = await query("SELECT value FROM settings WHERE key = 'watchlist'");
-        watchlist = result.rows[0] ? JSON.parse(result.rows[0].value) : [];
+        const result = await query("SELECT key, value FROM settings WHERE key IN ('watchlist', 'dynamic_watchlist')");
+        for (const row of result.rows) {
+            if (row.key === 'watchlist') pinnedList = JSON.parse(row.value) || [];
+            if (row.key === 'dynamic_watchlist') dynamicList = JSON.parse(row.value) || [];
+        }
       } catch { /* */ }
 
-      if (body.action === 'add' && body.symbol) {
-        if (!watchlist.includes(body.symbol)) watchlist.push(body.symbol);
+      let modifiedOther = false;
+
+      if (body.action === 'add' || body.action === 'toggle') {
+        const isAdding = body.action === 'add' || 
+                         (body.action === 'toggle' && (isDynamic ? !dynamicList.includes(body.symbol) : !pinnedList.includes(body.symbol)));
+
+        if (isAdding && body.symbol) {
+            if (isDynamic) {
+                if (!dynamicList.includes(body.symbol)) dynamicList.push(body.symbol);
+                if (pinnedList.includes(body.symbol)) {
+                    pinnedList = pinnedList.filter((s) => s !== body.symbol);
+                    modifiedOther = true;
+                }
+            } else {
+                if (!pinnedList.includes(body.symbol)) pinnedList.push(body.symbol);
+                if (dynamicList.includes(body.symbol)) {
+                    dynamicList = dynamicList.filter((s) => s !== body.symbol);
+                    modifiedOther = true;
+                }
+            }
+        } else if (!isAdding && body.symbol) {
+            if (isDynamic) dynamicList = dynamicList.filter((s) => s !== body.symbol);
+            else pinnedList = pinnedList.filter((s) => s !== body.symbol);
+        }
       } else if (body.action === 'remove' && body.symbol) {
-        watchlist = watchlist.filter((s) => s !== body.symbol);
+        if (isDynamic) dynamicList = dynamicList.filter((s) => s !== body.symbol);
+        else pinnedList = pinnedList.filter((s) => s !== body.symbol);
       }
 
       await query(
-        `INSERT INTO settings (key, value, updated_at) VALUES ('watchlist', $1, NOW())
-         ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()`,
-        [JSON.stringify(watchlist)]
+        `INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
+        [targetList, JSON.stringify(isDynamic ? dynamicList : pinnedList)]
       );
 
-      json(res, { success: true, watchlist });
+      if (modifiedOther) {
+        const otherList = isDynamic ? 'watchlist' : 'dynamic_watchlist';
+        await query(
+          `INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW())
+           ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
+          [otherList, JSON.stringify(isDynamic ? pinnedList : dynamicList)]
+        );
+      }
+
+      json(res, { success: true, watchlist: isDynamic ? dynamicList : pinnedList, list: targetList });
     } catch (err) {
       log.error({ err }, 'Error in /api/settings/watchlist');
       json(res, { error: err.message }, 500);
@@ -1101,7 +1152,6 @@ export function createApiHandler(deps) {
       // ── Validate value ─────────────────────────────────────────────────────
       const schema = LIVE_SETTINGS_SCHEMA[key];
 
-      // ADD THIS BLOCK before the numValue lines:
       // Handle boolean type params (PARTIAL_EXIT_ENABLED, SIGNAL_REVERSAL_ENABLED)
       if (schema.type === 'boolean') {
         if (value !== 'true' && value !== 'false' && value !== true && value !== false) {
@@ -1348,12 +1398,24 @@ export function createApiHandler(deps) {
       if (regime)          filtered = filtered.filter(r => r.regime === regime);
       if (minTurnover > 0) filtered = filtered.filter(r => (r.breakdown?.liquidity?.turnoverCr ?? 0) >= minTurnover);
 
+      let watchlist = [];
+      let dynamicWatchlist = [];
+      try {
+        const resSettings = await query("SELECT key, value FROM settings WHERE key IN ('watchlist', 'dynamic_watchlist')");
+        for (const row of resSettings.rows) {
+            if (row.key === 'watchlist') watchlist = JSON.parse(row.value) || [];
+            if (row.key === 'dynamic_watchlist') dynamicWatchlist = JSON.parse(row.value) || [];
+        }
+      } catch { /* */ }
+
       json(res, {
         results:    filtered.slice(0, limit),
         total:      filtered.length,
         scanned:    results.length,
         fromCache,
         scannedAt:  scannedAt ?? null,
+        watchlist,
+        dynamicWatchlist,
       });
     } catch (err) {
       log.error({ err }, 'Error in /api/screener');

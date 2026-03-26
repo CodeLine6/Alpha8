@@ -94,6 +94,9 @@ export default function ScreenerPage() {
   const [error,       setError]       = useState(null);
   const [chartSymbol, setChartSymbol] = useState(null);
 
+  const [watchlist, setWatchlist]               = useState([]);
+  const [dynamicWatchlist, setDynamicWatchlist] = useState([]);
+
   const [minScore,    setMinScore]    = useState(0);
   const [regime,      setRegime]      = useState('ALL');
   const [minTurnover, setMinTurnover] = useState(0);
@@ -114,12 +117,32 @@ export default function ScreenerPage() {
       setScanned(d.scanned || d.results?.length || 0);
       setFromCache(d.fromCache);
       setScannedAt(d.scannedAt);
+      setWatchlist(d.watchlist || []);
+      setDynamicWatchlist(d.dynamicWatchlist || []);
       didFetch.current = true;
     } catch (e) { setError(e.message); }
     finally     { setLoading(false); }
   }, []);
 
   useEffect(() => { loadScreener(); }, [loadScreener]);
+
+  const toggleWatchlist = async (symbol, listType) => {
+    if (listType === 'pinned') {
+      setWatchlist(prev => prev.includes(symbol) ? prev.filter(s => s !== symbol) : [...prev, symbol]);
+      setDynamicWatchlist(prev => prev.filter(s => s !== symbol));
+    } else {
+      setDynamicWatchlist(prev => prev.includes(symbol) ? prev.filter(s => s !== symbol) : [...prev, symbol]);
+      setWatchlist(prev => prev.filter(s => s !== symbol));
+    }
+    try {
+      const key = process.env.NEXT_PUBLIC_API_KEY || '';
+      await fetch(`${API_BASE}/api/settings/watchlist`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(key ? { 'X-Api-Key': key } : {}) },
+        body: JSON.stringify({ action: 'toggle', symbol, list: listType }),
+      });
+    } catch (e) { console.error('Failed to toggle watchlist', e); }
+  };
 
   const displayed = results
     .filter(r => {
@@ -291,11 +314,14 @@ export default function ScreenerPage() {
                       key={r.symbol}
                       className="border-b border-white/[0.03] transition-colors hover:bg-white/[0.025]"
                     >
-                      {/* # Symbol */}
                       <td className="pl-5 pr-4 py-4 font-bold text-white whitespace-nowrap">
-                        <div className="flex items-center gap-2.5">
+                        <div className="flex items-center gap-2.5 group">
                           <span className="w-5 text-right text-xs text-gray-600 tabular-nums">{i + 1}</span>
-                          <span className="tracking-wide">{r.symbol}</span>
+                          <span className="tracking-wide text-base">{r.symbol}</span>
+                          <div className="flex opacity-0 group-hover:opacity-100 transition-opacity items-center gap-1 scale-90 origin-left ml-2">
+                             <button onClick={(e) => { e.stopPropagation(); toggleWatchlist(r.symbol, 'pinned'); }} className={`px-1.5 py-0.5 rounded transition ${watchlist.includes(r.symbol) ? 'opacity-100 ring-1 ring-blue-500/50 bg-blue-500/20' : 'opacity-40 hover:opacity-100 bg-white/5'} flex items-center shrink-0`} title="Toggle Pinned"><span className="text-[10px]">📌</span></button>
+                             <button onClick={(e) => { e.stopPropagation(); toggleWatchlist(r.symbol, 'dynamic'); }} className={`px-1.5 py-0.5 rounded transition ${dynamicWatchlist.includes(r.symbol) ? 'opacity-100 ring-1 ring-purple-500/50 bg-purple-500/20' : 'opacity-40 hover:opacity-100 bg-white/5'} flex items-center shrink-0`} title="Toggle Dynamic"><span className="text-[10px]">⚡</span></button>
+                          </div>
                         </div>
                       </td>
 
