@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
+import Link from 'next/link';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import { formatINR, pnlColor, formatPct, API_BASE } from '@/lib/utils';
 
@@ -22,24 +23,7 @@ function StatRow({ label, value, valueClass = 'text-white' }) {
     );
 }
 
-function StrategyCard({ strategy: s }) {
-    return (
-        <div className={`${CARD} p-6`}>
-            <div className="flex items-center justify-between mb-5">
-                <h3 className="font-semibold text-white">{s.name}</h3>
-                <Badge color={s.winRate >= 50 ? 'green' : 'red'}>{s.winRate?.toFixed(1)}% WR</Badge>
-            </div>
-            <div className="grid grid-cols-2 gap-4">
-                <StatRow label="Avg Return"   value={formatPct(s.avgReturn)}           valueClass={s.avgReturn >= 0 ? 'text-green-400' : 'text-red-400'} />
-                <StatRow label="Total P&L"    value={formatINR(s.totalPnl)}            valueClass={s.totalPnl >= 0 ? 'text-green-400' : 'text-red-400'} />
-                <StatRow label="Sharpe Ratio" value={s.sharpe?.toFixed(2) ?? 'N/A'}    valueClass={s.sharpe >= 1 ? 'text-green-400' : 'text-yellow-400'} />
-                <StatRow label="Max Drawdown" value={`${s.maxDrawdown?.toFixed(2) ?? '0.00'}%`} valueClass="text-red-400" />
-            </div>
-            <p className="mt-5 text-xs text-slate-600">{s.tradeCount ?? 0} trades · W: {s.wins ?? 0} / L: {s.losses ?? 0}</p>
-        </div>
-    );
-}
-
+// Main Hub Page
 export default function StrategiesPage() {
     const [strategies, setStrategies] = useState([]);
     const [signals,    setSignals]    = useState([]);
@@ -61,25 +45,52 @@ export default function StrategiesPage() {
 
     const sigColor = (s) => s === 'BUY' ? 'green' : s === 'SELL' ? 'red' : 'yellow';
 
+    const summaryTable = (
+        <div className={`${CARD} overflow-hidden mb-6`}>
+            <div className="flex items-center justify-between px-6 py-4 border-b border-white/[0.06]">
+                <p className="text-sm font-semibold text-white">Strategy Summary</p>
+                <Link href="/strategies/performance" className="text-[10px] font-bold uppercase tracking-wider text-blue-400 hover:text-blue-300 transition-colors pointer-events-auto">
+                    View Detailed Metrics →
+                </Link>
+            </div>
+            {loading ? (
+                <div className="p-6 space-y-2">{[1, 2].map(i => <div key={i} className="h-8 rounded-lg bg-white/[0.04] animate-pulse" />)}</div>
+            ) : strategies.length === 0 ? (
+                <div className="py-8 text-center text-slate-500 text-xs italic">No performance data available</div>
+            ) : (
+                <div className="overflow-x-auto">
+                    <table className="w-full border-collapse">
+                        <thead><tr>{['Strategy', 'Win Rate', 'Total P&L', 'Trades'].map(h => <th key={h} className={TH}>{h}</th>)}</tr></thead>
+                        <tbody>
+                            {strategies.slice(0, 5).map((s, i) => (
+                                <tr key={i} className="border-b border-white/[0.04] hover:bg-white/[0.02] transition-colors">
+                                    <td className={`${TD} font-medium text-white max-w-[200px] truncate`} title={s.name}>{s.name}</td>
+                                    <td className={TD}><Badge color={s.winRate >= 50 ? 'green' : 'red'}>{s.winRate?.toFixed(1)}%</Badge></td>
+                                    <td className={`${TD} ${s.totalPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>{formatINR(s.totalPnl)}</td>
+                                    <td className={`${TD} text-slate-500`}>{s.tradeCount}</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+            )}
+        </div>
+    );
+
     return (
         <div className="space-y-6">
-            <div>
-                <h1 className="text-2xl font-bold tracking-tight text-white">Strategy Performance</h1>
-                <p className="text-sm text-slate-500 mt-1">Per-strategy metrics and signal log</p>
+            <div className="flex items-center justify-between">
+                <div>
+                    <h1 className="text-2xl font-bold tracking-tight text-white">Strategy Hub</h1>
+                    <p className="text-sm text-slate-500 mt-1">Live signal log and performance overview</p>
+                </div>
+                <Link href="/strategies/performance" className="hidden sm:inline-flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-semibold transition-all shadow-lg shadow-blue-500/20">
+                    📊 Detailed Performance
+                </Link>
             </div>
 
             <ErrorBoundary>
-                {loading ? (
-                    <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
-                        {[1,2,3].map(i => <div key={i} className="h-44 rounded-2xl bg-[#141922] border border-white/[0.07] animate-pulse" />)}
-                    </div>
-                ) : strategies.length === 0 ? (
-                    <div className="py-12 text-center text-slate-500 text-sm">No strategy data available</div>
-                ) : (
-                    <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
-                        {strategies.map(s => <StrategyCard key={s.name} strategy={s} />)}
-                    </div>
-                )}
+                {summaryTable}
             </ErrorBoundary>
 
             <ErrorBoundary>

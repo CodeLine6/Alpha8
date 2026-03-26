@@ -177,7 +177,12 @@ export default function TradingChart({
           let lastT = 0;
           for (const m of rawM) {
             if (m.time <= lastT) m.time = lastT + 1;
-            markerMeta.push({ time: m.time, trade: m.trade, color: m.color });
+            markerMeta.push({
+              time: m.time,
+              trade: m.trade,
+              color: m.color,
+              position: m.position, // Important for distance scoring
+            });
             lastT = m.time;
           }
           candleSeries.setMarkers(rawM.map(({ trade: _t, ...rest }) => rest));
@@ -195,8 +200,39 @@ export default function TradingChart({
           const vol    = param.seriesData.get(volSeries);
           if (candle) setLegend({ ...candle, volume: vol?.value });
 
-          const hit = markerMeta.find(m => Math.abs(m.time - param.time) < 3 * 5 * 60);
-          setTooltip(hit ? { trade: hit.trade, color: hit.color, x: param.point.x, y: param.point.y } : null);
+          if (!candle) { setTooltip(null); return; }
+
+          // Find markers within a small time window (e.g., +/- 1 candle)
+          const timeWindow = interval === '1minute' ? 60 : interval === '5minute' ? 300 : interval === '15minute' ? 900 : 300;
+          const candidates = markerMeta.filter(m => Math.abs(m.time - param.time) < timeWindow * 1.5);
+
+          if (candidates.length === 0) {
+            setTooltip(null);
+          } else {
+            // Find vertically closest marker
+            const highY = candleSeries.priceToCoordinate(candle.high);
+            const lowY = candleSeries.priceToCoordinate(candle.low);
+            const mouseY = param.point.y;
+
+            let best = null;
+            let minDiv = Infinity;
+
+            for (const m of candidates) {
+              const markerY = m.position === 'aboveBar' ? highY : lowY;
+              const div = Math.abs(mouseY - markerY);
+              if (div < minDiv) {
+                minDiv = div;
+                best = m;
+              }
+            }
+
+            // Only show if reasonably close to the marker's vertical area (tolerance: 40px)
+            if (minDiv < 40) {
+              setTooltip({ trade: best.trade, color: best.color, x: param.point.x, y: param.point.y });
+            } else {
+              setTooltip(null);
+            }
+          }
         });
 
         chart.timeScale().fitContent();

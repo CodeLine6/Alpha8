@@ -277,13 +277,15 @@ export class SymbolScout {
         
         // Remove symbols that Yahoo Finance can't look up:
         //   • Invalid chars (only A-Z, 0-9, hyphen, ampersand are valid NSE equity symbols)
-        //   • Length > 15 (too long to be an equity ticker)
+        //   • Length > 12 (too long for most equities, usually indicates debt/series)
         //   • Starts with a digit  → government bonds/securities (e.g. 939SCL27-ZZ)
+        //   • Starts with GS + digit → G-Secs (e.g. GS220236C-GS)
         //   • Contains a dot      → mutual fund units (e.g. AXIS.MF)
         toScan = toScan.filter(s =>
-            /^[A-Z][A-Z0-9\-&]*$/.test(s) &&   // must start with a letter
-            s.length <= 15 &&
-            !s.includes('.')
+            /^[A-Z][A-Z0-9\-&]*$/.test(s) &&   // must start with a letter (blocks 5PAISA for safety, but also blocks most debt)
+            s.length <= 12 &&
+            !s.includes('.') &&
+            !(s.startsWith('GS') && /\d/.test(s))
         );
 
         this._log(`[Scout] Scanning ${toScan.length} symbols...`);
