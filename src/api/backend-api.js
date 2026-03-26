@@ -328,6 +328,14 @@ export function createApiHandler(deps) {
       type: 'number', min: 10, max: 500, step: 10,
       default: 50, category: 'bavi',
     },
+    // ── Symbol Scout ─────────────────────────────────────────────────────────
+    SCOUT_MAX_DYNAMIC: {
+      label: 'Max Dynamic Symbols',
+      description: 'Maximum number of nightly scouted symbols to add to watchlist',
+      type: 'number', min: 1, max: 100, step: 1,
+      default: config.SCOUT_MAX_DYNAMIC ?? 10,
+      category: 'scout',
+    },
   };
 
   // ═══════════════════════════════════════════════════════
@@ -437,6 +445,92 @@ export function createApiHandler(deps) {
       });
     } catch (err) {
       log.error({ err }, 'Error in /api/summary');
+      json(res, { error: err.message }, 500);
+    }
+  }
+
+  async function handleMarketOverview(req, res) {
+    try {
+      const timestamp = new Date().toISOString();
+      const overview = {
+        indices: [],
+        gold: null,
+        gainers: [],
+        losers: [],
+        timestamp,
+      };
+
+      // 1. Fetch Indices and Gold data if broker is available
+      if (broker) {
+        try {
+          const keys = ['NSE:NIFTY 50', 'NSE:NIFTY BANK', 'BSE:SENSEX', 'NSE:GOLDBEES'];
+          const quotes = await broker.getQuote(keys);
+          
+          const addIndex = (name, key) => {
+             const d = quotes[key];
+             if (d) {
+                const ltp = d.last_price;
+                const close = d.ohlc?.close || d.close || 0;
+                overview.indices.push({ 
+                  name, 
+                  ltp, 
+                  change: ltp - close, 
+                  changePct: close > 0 ? ((ltp - close) / close * 100) : 0 
+                });
+             }
+          };
+
+          addIndex('Nifty 50', 'NSE:NIFTY 50');
+          addIndex('Bank Nifty', 'NSE:NIFTY BANK');
+          addIndex('Sensex', 'BSE:SENSEX');
+
+          if (quotes['NSE:GOLDBEES']) {
+            const d = quotes['NSE:GOLDBEES'];
+            const ltp = d.last_price;
+            const close = d.ohlc?.close || d.close || 0;
+            overview.gold = { 
+              name: 'Gold ETF', 
+              ltp, 
+              change: ltp - close, 
+              changePct: close > 0 ? ((ltp - close) / close * 100) : 0 
+            };
+          }
+        } catch (err) {
+          log.warn({ err: err.message }, 'MarketOverview: failed to fetch indices quote');
+        }
+      }
+
+      // 2. Fetch Gainers and Losers from Screener
+      try {
+        const forceRefresh = req.query?.forceRefresh === 'true';
+        const [nseScreener, bseScreener] = await Promise.all([
+            getScreenerResults({ broker, instrumentManager, exchange: 'NSE', forceRefresh, forOverview: true }),
+            getScreenerResults({ broker, instrumentManager, exchange: 'BSE', forceRefresh, forOverview: true })
+        ]);
+        
+        const processMovers = (results) => {
+            const sorted = [...results].sort((a, b) => b.changePct - a.changePct);
+            const fmtSym = (s) => s.includes(':') ? s.split(':')[1] : s;
+            return {
+                gainers: sorted.filter(r => (r.changePct || 0) > 0).slice(0, 5).map(r => ({ symbol: fmtSym(r.symbol), price: r.price, changePct: r.changePct })),
+                losers: sorted.filter(r => (r.changePct || 0) < 0).reverse().slice(0, 5).map(r => ({ symbol: fmtSym(r.symbol), price: r.price, changePct: r.changePct }))
+            };
+        };
+
+        overview.nse = processMovers(nseScreener.results || []);
+        overview.bse = processMovers(bseScreener.results || []);
+
+        // Backward compatibility (defaults to NSE for now)
+        overview.gainers = overview.nse.gainers;
+        overview.losers = overview.nse.losers;
+
+      } catch (err) {
+        log.warn({ err: err.message }, 'MarketOverview: failed to fetch screener results');
+      }
+
+      json(res, overview);
+    } catch (err) {
+      log.error({ err }, 'Error in /api/market-overview');
       json(res, { error: err.message }, 500);
     }
   }
@@ -816,10 +910,15 @@ export function createApiHandler(deps) {
   async function handleSettingsGet(req, res) {
     try {
       let watchlist = [];
+      let dynamicWatchlist = [];
       try {
-        const result = await query("SELECT value FROM settings WHERE key = 'watchlist'");
-        watchlist = result.rows[0] ? JSON.parse(result.rows[0].value) : [];
+        const result = await query("SELECT key, value FROM settings WHERE key IN ('watchlist', 'dynamic_watchlist')");
+        for (const row of result.rows) {
+            if (row.key === 'watchlist') watchlist = JSON.parse(row.value) || [];
+            if (row.key === 'dynamic_watchlist') dynamicWatchlist = JSON.parse(row.value) || [];
+        }
       } catch { /* */ }
+
 
       let telegramStatus = { enabled: false, totalSent: 0, totalFailed: 0, queueLength: 0 };
       if (telegram) {
@@ -847,6 +946,7 @@ export function createApiHandler(deps) {
         killSwitchDrawdownPct: liveKillSwitchDrawdown,
         killSwitchEngaged: killSwitch.isEngaged(),
         watchlist,
+        dynamicWatchlist,
         telegram: telegramStatus,
       });
     } catch (err) {
@@ -1389,6 +1489,7 @@ export function createApiHandler(deps) {
           case '/health': return handlePublicHealth(req, res);
           case '/api/health': return handleHealth(req, res);
           case '/api/summary': return handleSummary(req, res);
+          case '/api/market-overview': return handleMarketOverview(req, res);
           case '/api/positions': return handlePositions(req, res);
           case '/api/trades': return handleTrades(req, res);
           case '/api/strategies/performance': return handleStrategiesPerformance(req, res);

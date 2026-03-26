@@ -204,7 +204,17 @@ export class KiteClient {
    * @returns {Promise<Object>} Quotes keyed by instrument
    */
   async getQuote(instruments) {
-    return this.breaker.execute(() => this.kite.getQuote(instruments));
+    return this.breaker.execute(async () => {
+      const raw = await Promise.resolve(this.kite.getQuote(instruments));
+      // M2 FIX: KiteConnect v3 wraps response in { data: {...} }
+      if (raw && typeof raw === 'object' && raw.data && typeof raw.data === 'object') {
+        const topKeys = Object.keys(raw);
+        if (topKeys.length === 1 && topKeys[0] === 'data') {
+          return raw.data;
+        }
+      }
+      return raw;
+    });
   }
 
   /**

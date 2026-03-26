@@ -68,6 +68,7 @@ export default function DashboardPage() {
     const summary   = usePolling(`${API_BASE}/api/summary`, 5000);
     const positions = usePolling(`${API_BASE}/api/positions`, 5000);
     const health    = usePolling(`${API_BASE}/api/health`, 10000);
+    const market    = usePolling(`${API_BASE}/api/market-overview`, 30000); // slower polling for overview
 
     return (
         <div className="space-y-8">
@@ -103,6 +104,11 @@ export default function DashboardPage() {
                 <ErrorBoundary><HealthWidget      data={health.data}  loading={health.loading}   /></ErrorBoundary>
                 <ErrorBoundary><KillSwitchWidget  data={summary.data} loading={summary.loading}  /></ErrorBoundary>
             </div>
+
+            {/* Market Overview */}
+            <ErrorBoundary>
+                <MarketOverview data={market.data} loading={market.loading} />
+            </ErrorBoundary>
 
             {/* Positions */}
             <ErrorBoundary>
@@ -257,6 +263,154 @@ function KillSwitchWidget({ data, loading }) {
                     <a href="/settings" className="text-indigo-400 hover:underline">Settings</a>.
                 </p>
             )}
+        </div>
+    );
+}
+
+// ── Market Overview ───────────────────────────────────────────
+function MarketOverview({ data, loading }) {
+    const [activeTab, setActiveTab] = useState('NSE');
+
+    if (loading && !data) return (
+        <div className="grid grid-cols-1 gap-5 lg:grid-cols-3">
+            <SkeletonCard />
+            <SkeletonCard />
+            <SkeletonCard />
+        </div>
+    );
+
+    const indices = (data?.indices || []).slice(0, 3);
+    const gold = data?.gold;
+    const movers = activeTab === 'NSE' ? data?.nse : data?.bse;
+    const gainers = movers?.gainers || [];
+    const losers = movers?.losers || [];
+
+    const TH = 'py-2 px-3 text-left text-[10px] font-semibold uppercase tracking-widest text-slate-500 border-b border-white/5';
+    const TD = 'py-2 px-3 text-sm text-slate-300';
+    
+    return (
+        <div className="grid grid-cols-1 gap-5 lg:grid-cols-3">
+            {/* Indices & Gold */}
+            <div className="space-y-5">
+                <div className={CARD}>
+                    <p className={LABEL}>Market Indices</p>
+                    <div className="space-y-4">
+                        {indices.map(idx => (
+                            <div key={idx.name} className="flex items-center justify-between">
+                                <div>
+                                    <p className="text-sm font-medium text-slate-300">{idx.name}</p>
+                                    <p className="text-xl font-bold text-white tabular-nums">{formatINR(idx.ltp)}</p>
+                                </div>
+                                <div className="text-right">
+                                    <p className={`text-sm font-semibold ${idx.change >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                        {idx.change >= 0 ? '+' : ''}{idx.change.toFixed(2)}
+                                    </p>
+                                    <p className={`text-xs ${idx.change >= 0 ? 'text-green-500/80' : 'text-red-500/80'}`}>
+                                        {idx.changePct.toFixed(2)}%
+                                    </p>
+                                </div>
+                            </div>
+                        ))}
+                        {gold && (
+                            <div className="pt-4 border-t border-slate-700/40">
+                                <div className="flex items-center justify-between">
+                                    <div className="flex items-center gap-2">
+                                        <span className="text-xl">🟡</span>
+                                        <div>
+                                            <p className="text-sm font-medium text-slate-300">{gold.name}</p>
+                                            <p className="text-lg font-bold text-white tabular-nums">{formatINR(gold.ltp)}</p>
+                                        </div>
+                                    </div>
+                                    <div className="text-right">
+                                        <p className={`text-sm font-semibold ${gold.change >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                            {gold.change >= 0 ? '+' : ''}{gold.change.toFixed(2)}
+                                        </p>
+                                        <p className={`text-xs ${gold.change >= 0 ? 'text-green-500/80' : 'text-red-500/80'}`}>
+                                            {gold.changePct.toFixed(2)}%
+                                        </p>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </div>
+
+            {/* Top Gainers */}
+            <div className={CARD}>
+                <div className="flex items-center justify-between mb-4">
+                    <p className={LABEL}>Top Gainers</p>
+                    <div className="flex items-center bg-slate-800/80 p-0.5 rounded-lg border border-white/5 shrink-0 scale-90 origin-right">
+                        <button 
+                            onClick={(e) => { e.stopPropagation(); setActiveTab('NSE'); }} 
+                            className={`px-2 py-0.5 text-[9px] font-bold rounded-md transition-all ${activeTab === 'NSE' ? 'bg-blue-500/30 text-blue-400 border border-blue-500/40' : 'text-slate-500 hover:text-slate-300'}`}
+                        >NSE</button>
+                        <button 
+                            onClick={(e) => { e.stopPropagation(); setActiveTab('BSE'); }} 
+                            className={`px-2 py-0.5 text-[9px] font-bold rounded-md transition-all ${activeTab === 'BSE' ? 'bg-blue-500/30 text-blue-400 border border-blue-500/40' : 'text-slate-500 hover:text-slate-300'}`}
+                        >BSE</button>
+                    </div>
+                </div>
+                <div className="overflow-hidden">
+                    <table className="w-full">
+                        <thead>
+                            <tr>
+                                <th className={TH}>Symbol</th>
+                                <th className={TH}>LTP</th>
+                                <th className={`${TH} text-right`}>Change</th>
+                            </tr>
+                        </thead>
+                        <tbody className="divide-y divide-white/4">
+                            {gainers.map((s, i) => (
+                                <tr key={`${s.symbol}-${i}`} className="hover:bg-white/2 transition-colors">
+                                    <td className={`${TD} font-semibold text-white`}>{s.symbol}</td>
+                                    <td className={`${TD} tabular-nums`}>{s.price?.toFixed(2)}</td>
+                                    <td className={`${TD} text-right font-semibold text-green-400 tabular-nums`}>+{(s.changePct ?? 0).toFixed(2)}%</td>
+                                </tr>
+                            ))}
+                            {gainers.length === 0 && <tr><td colSpan="3" className="py-8 text-center text-xs text-slate-500 italic">No gainers in {activeTab} universe</td></tr>}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            {/* Top Losers */}
+            <div className={CARD}>
+                <div className="flex items-center justify-between mb-4">
+                    <p className={LABEL}>Top Losers</p>
+                    <div className="flex items-center bg-slate-800/80 p-0.5 rounded-lg border border-white/5 shrink-0 scale-90 origin-right">
+                        <button 
+                            onClick={(e) => { e.stopPropagation(); setActiveTab('NSE'); }} 
+                            className={`px-2 py-0.5 text-[9px] font-bold rounded-md transition-all ${activeTab === 'NSE' ? 'bg-blue-500/30 text-blue-400 border border-blue-500/40' : 'text-slate-500 hover:text-slate-300'}`}
+                        >NSE</button>
+                        <button 
+                            onClick={(e) => { e.stopPropagation(); setActiveTab('BSE'); }} 
+                            className={`px-2 py-0.5 text-[9px] font-bold rounded-md transition-all ${activeTab === 'BSE' ? 'bg-blue-500/30 text-blue-400 border border-blue-500/40' : 'text-slate-500 hover:text-slate-300'}`}
+                        >BSE</button>
+                    </div>
+                </div>
+                <div className="overflow-hidden">
+                    <table className="w-full">
+                        <thead>
+                            <tr>
+                                <th className={TH}>Symbol</th>
+                                <th className={TH}>LTP</th>
+                                <th className={`${TH} text-right`}>Change</th>
+                            </tr>
+                        </thead>
+                        <tbody className="divide-y divide-white/4">
+                            {losers.map((s, i) => (
+                                <tr key={`${s.symbol}-${i}`} className="hover:bg-white/2 transition-colors">
+                                    <td className={`${TD} font-semibold text-white`}>{s.symbol}</td>
+                                    <td className={`${TD} tabular-nums`}>{s.price?.toFixed(2)}</td>
+                                    <td className={`${TD} text-right font-semibold text-red-400 tabular-nums`}>{(s.changePct ?? 0).toFixed(2)}%</td>
+                                </tr>
+                            ))}
+                            {losers.length === 0 && <tr><td colSpan="3" className="py-8 text-center text-xs text-slate-500 italic">No losers in {activeTab} universe</td></tr>}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
         </div>
     );
 }

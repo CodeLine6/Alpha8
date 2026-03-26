@@ -81,7 +81,12 @@ export async function fetchHistoricalData({
   const isDaily = interval === 'day';
   let candles;
 
-  if (broker && (isDaily || isMarketHoursIST())) {
+  // Prioritize broker if token is provided. 
+  //   • 'day' interval: Always try broker first (Static historical data)
+  //   • intraday: Broker only during market hours (to avoid circuit breaker trips)
+  const canTryBroker = broker && instrumentToken && (isDaily || isMarketHoursIST());
+
+  if (canTryBroker) {
     try {
       log.info({ symbol, interval, from, to }, 'Fetching historical data from broker');
       const rawData = await broker.getHistoricalData(instrumentToken, interval, from, to);
@@ -91,13 +96,15 @@ export async function fetchHistoricalData({
       candles = await fetchYahooFinanceFallback(symbol, from, to, interval);
     }
   } else {
-    if (broker && !isMarketHoursIST()) {
+    // If no token or outside market hours (intraday), use Yahoo Finance
+    if (broker && !isMarketHoursIST() && !isDaily) {
       log.debug({ symbol, interval }, 'Outside market hours (intraday) — using Yahoo Finance to avoid circuit breaker');
     }
     candles = await fetchYahooFinanceFallback(symbol, from, to, interval);
 
-    // If Yahoo returned nothing and broker is available, try broker as last resort
-    if ((!candles || candles.length === 0) && broker) {
+    // Final retry with broker if Yahoo failed and we have a broker (even if no token, 
+    // it will try its best or fail gracefully)
+    if ((!candles || candles.length === 0) && broker && instrumentToken) {
       log.info({ symbol, interval }, 'Yahoo Finance returned no data — retrying with broker');
       try {
         const rawData = await broker.getHistoricalData(instrumentToken, interval, from, to);
@@ -108,12 +115,16 @@ export async function fetchHistoricalData({
     }
   }
 
-  // Cache the result
-  try {
-    await cacheSet(cacheKey, candles, cacheTTL);
-    log.debug({ symbol, candles: candles.length }, 'Historical data cached');
-  } catch (err) {
-    log.warn({ err: err.message }, 'Failed to cache historical data');
+  // Cache the result (guard: candles may be undefined if all sources failed)
+  if (candles && candles.length > 0) {
+    try {
+      await cacheSet(cacheKey, candles, cacheTTL);
+      log.debug({ symbol, candles: candles.length }, 'Historical data cached');
+    } catch (err) {
+      log.warn({ err: err.message }, 'Failed to cache historical data');
+    }
+  } else {
+    candles = candles || [];
   }
 
   return candles;
@@ -181,7 +192,14 @@ export async function fetchYahooFinanceFallback(symbol, from, to, interval) {
   };
 
   const yahooInterval = intervalMap[interval] || '1d';
-  const yahooSymbol = `${symbol}.NS`; // NSE suffix for Yahoo
+  
+  let yahooSymbol = symbol;
+  if (symbol.includes(':')) {
+    const [exch, sym] = symbol.split(':');
+    yahooSymbol = exch.toUpperCase() === 'BSE' ? `${sym}.BO` : `${sym}.NS`;
+  } else {
+    yahooSymbol = `${symbol}.NS`;
+  }
 
   const fromEpoch = Math.floor(new Date(from).getTime() / 1000);
   const toEpoch = Math.floor(new Date(to).getTime() / 1000);

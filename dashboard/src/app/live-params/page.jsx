@@ -13,6 +13,7 @@ const CATEGORY_META = {
     orb:       { label: 'ORB Breakout',              icon: '🌅' },
     bavi:      { label: 'BAVI Order Flow',           icon: '🌊' },
     consensus: { label: 'Signal Consensus',          icon: '🤝' },
+    scout:     { label: 'Nightly Symbol Scout',      icon: '🔍' },
 };
 
 const TH = 'py-3 px-4 text-left text-[10px] font-semibold uppercase tracking-widest text-slate-500 border-b border-slate-700/40 whitespace-nowrap';

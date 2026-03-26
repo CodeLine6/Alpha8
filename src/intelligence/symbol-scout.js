@@ -68,6 +68,16 @@ export const NSE_UNIVERSE = [
     'JUBLFOOD', 'ZOMATO',
 ];
 
+// BSE Sensex 30 symbols
+export const BSE_UNIVERSE = [
+  'ASIANPAINT', 'AXISBANK', 'BAJAJ-AUTO', 'BAJFINANCE', 'BAJAJFINSV', 
+  'BHARTIARTL', 'HCLTECH', 'HDFCBANK', 'HINDUNILVR', 'ICICIBANK', 
+  'INDUSINDBK', 'INFY', 'ITC', 'JSWSTEEL', 'KOTAKBANK', 
+  'LT', 'M&M', 'MARUTI', 'NESTLEIND', 'NTPC', 
+  'POWERGRID', 'RELIANCE', 'SBIN', 'SUNPHARMA', 'TATASTEEL', 
+  'TATAMOTORS', 'TCS', 'TECHM', 'TITAN', 'ULTRACEMCO'
+];
+
 // ── Scoring config ────────────────────────────────────────────────────────────
 const ADD_THRESHOLD = 55;   // min score to add to dynamic watchlist
 const REMOVE_THRESHOLD = 35;   // below this → remove
@@ -234,14 +244,16 @@ export class SymbolScout {
      * @param {string[]} [opts.excludeSymbols]   - Permanent exclusion list
      * @param {Function} [opts.logger]
      */
-    constructor({ broker, telegram, instrumentManager, pinnedSymbols, maxDynamic, excludeSymbols, logger }) {
+    constructor({ broker, telegram, instrumentManager, pinnedSymbols, maxDynamic, excludeSymbols, logger, getLiveSetting }) {
         this.broker = broker;
         this.telegram = telegram;
         this.instrumentManager = instrumentManager;
         this.pinnedSymbols = (pinnedSymbols || []).map(s => s.toUpperCase());
-        this.maxDynamic = maxDynamic ?? MAX_DYNAMIC;
+        this._baseMaxDynamic = maxDynamic ?? MAX_DYNAMIC;
+        this.maxDynamic = this._baseMaxDynamic;
         this.excludeSymbols = (excludeSymbols || []).map(s => s.toUpperCase());
         this._log = logger || ((msg, meta) => log.info(meta || {}, msg));
+        this._getLiveSetting = getLiveSetting || null;
     }
 
     /**
@@ -252,6 +264,10 @@ export class SymbolScout {
     async runNightly() {
         this._log('[Scout] ═══ NIGHTLY SYMBOL SCOUT STARTING ═══');
         const startAt = Date.now();
+
+        if (this._getLiveSetting) {
+            this.maxDynamic = await this._getLiveSetting('SCOUT_MAX_DYNAMIC', this._baseMaxDynamic);
+        }
 
         // 1. Get current dynamic watchlist
         const currentDynamic = await this._loadDynamic();
@@ -341,6 +357,10 @@ export class SymbolScout {
      * @returns {Promise<string[]>}
      */
     async getActiveWatchlist() {
+        if (this._getLiveSetting) {
+            this.maxDynamic = await this._getLiveSetting('SCOUT_MAX_DYNAMIC', this._baseMaxDynamic);
+        }
+        
         const dynamic = await this._loadDynamic();
 
         // S4 FIX: cap dynamic symbols at maxDynamic (already controlled by
@@ -414,48 +434,50 @@ export class SymbolScout {
     }
 
     _computeChanges(scored, currentDynamic) {
-        // Sort by score descending
+        // Sort all scanned symbols by score descending
         const sortedScored = scored.filter(Boolean).sort((a, b) => b.score - a.score);
 
-        // Symbols that should be in dynamic watchlist
-        const shouldAdd = sortedScored
-            .filter(s => s.score >= ADD_THRESHOLD && !this.pinnedSymbols.includes(s.symbol))
-            .slice(0, this.maxDynamic)
+        // 1. Identify eligible candidates from current dynamic list (score >= 35, no hard fail)
+        const eligibleOld = currentDynamic.filter(sym => {
+            const s = sortedScored.find(x => x.symbol === sym.toUpperCase());
+            // If not scanned, we keep it temporarily (or drop it? Better to drop if no data)
+            return s && !s.hardFail && s.score >= REMOVE_THRESHOLD;
+        });
+
+        // 2. Identify eligible NEW candidates (score >= 55, not pinned)
+        const eligibleNew = sortedScored
+            .filter(s => s.score >= ADD_THRESHOLD && !this.pinnedSymbols.includes(s.symbol) && !currentDynamic.map(d=>d.toUpperCase()).includes(s.symbol))
             .map(s => s.symbol);
 
-        // What's being added (new entries)
-        const added = shouldAdd
-            .filter(s => !currentDynamic.map(d => d.toUpperCase()).includes(s.toUpperCase()))
+        // 3. Combine them, map to their score objects, and sort by score descending
+        const combined = [...new Set([...eligibleOld, ...eligibleNew])].map(sym => {
+            return sortedScored.find(s => s.symbol === sym.toUpperCase());
+        }).filter(Boolean).sort((a, b) => b.score - a.score);
+
+        // 4. Target dynamic watchlist is the top maxDynamic symbols
+        const targetDynamic = combined.slice(0, this.maxDynamic).map(s => s.symbol);
+
+        // 5. Compute what is actually being added and removed
+        const added = targetDynamic
+            .filter(sym => !currentDynamic.map(d=>d.toUpperCase()).includes(sym.toUpperCase()))
             .map(sym => {
-                const s = sortedScored.find(x => x.symbol === sym);
+                const s = sortedScored.find(x => x.symbol === sym.toUpperCase());
                 return { symbol: sym, score: s.score, reason: this._addReason(s) };
             });
 
-        // What's being removed
         const removed = currentDynamic
-            .filter(sym => {
-                const upperSym = sym.toUpperCase();
-                const s = sortedScored.find(x => x.symbol === upperSym);
-                if (!s) return true; // wasn't even scanned / no data → remove
-                if (s.hardFail) return true;
-                if (s.score < REMOVE_THRESHOLD) return true;
-                if (!shouldAdd.map(a => a.toUpperCase()).includes(upperSym) && currentDynamic.length > this.maxDynamic) return true;
-                return false;
-            })
+            .filter(sym => !targetDynamic.map(d=>d.toUpperCase()).includes(sym.toUpperCase()))
             .map(sym => {
-                const s = sortedScored.find(x => x.symbol === sym);
+                const s = sortedScored.find(x => x.symbol === sym.toUpperCase());
                 return { symbol: sym, score: s?.score ?? 0, reason: this._removeReason(s) };
             });
 
-        return { added, removed, shouldBe: shouldAdd };
+        return { added, removed, shouldBe: targetDynamic };
     }
 
     async _applyChanges(changes, currentDynamic, scored = []) {
 
-        const newDynamic = [
-            ...currentDynamic.filter(s => !changes.removed.map(r => r.symbol.toUpperCase()).includes(s.toUpperCase())),
-            ...changes.added.map(a => a.symbol),
-        ].slice(0, this.maxDynamic);
+        const newDynamic = changes.shouldBe;
 
         // Write to settings table
         await this._saveDynamic(newDynamic);

@@ -108,7 +108,7 @@ export default function SettingsPage() {
                 {/* Watchlist */}
                 <ErrorBoundary>
                     <div className={CARD}>
-                        <p className={LABEL}>Watchlist</p>
+                        <p className={LABEL}>Pinned Symbols</p>
                         <div className="flex gap-2 mb-4 mt-2">
                             <input type="text" className={INP} placeholder="Add symbol e.g. RELIANCE"
                                 value={watchlistInput}
@@ -127,6 +127,18 @@ export default function SettingsPage() {
                                 </span>
                             ))}
                             {!settings?.watchlist?.length && <span className="text-xs text-slate-600">No symbols added</span>}
+                        </div>
+
+                        <div className="mt-6 pt-4 border-t border-white/[0.04]">
+                            <p className={LABEL}>Dynamic Universe (Auto-Scouted)</p>
+                            <div className="flex flex-wrap gap-2 mt-3">
+                                {(settings?.dynamicWatchlist || []).map(sym => (
+                                    <span key={sym} className="inline-flex items-center gap-1.5 rounded-full border border-purple-500/20 bg-purple-500/10 px-3 py-1 text-xs font-semibold text-purple-400">
+                                        ⚡ {sym}
+                                    </span>
+                                ))}
+                                {!settings?.dynamicWatchlist?.length && <span className="text-xs text-slate-600">No dynamic symbols scouted yet</span>}
+                            </div>
                         </div>
                     </div>
                 </ErrorBoundary>

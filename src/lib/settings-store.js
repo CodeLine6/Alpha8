@@ -75,6 +75,9 @@ const DEFAULTS = {
     MIN_CONFIDENCE: null,
     MIN_AGREEMENT: null,
     SUPER_CONVICTION_THRESHOLD: null,
+
+    // ── Symbol Scout ────────────────────────────────────────────────────────────
+    SCOUT_MAX_DYNAMIC: null,
 };
 
 export async function getLiveSetting(key, configFallback) {

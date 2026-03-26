@@ -211,7 +211,7 @@ async function main() {
   if (broker) {
     try {
       instrumentManager = new InstrumentManager(broker);
-      const count = await instrumentManager.load(['NSE']);
+      const count = await instrumentManager.load(['NSE', 'BSE']);
       log.info({ instruments: count }, '✅ Instrument manager loaded');
     } catch (err) {
       log.warn({ err: err.message }, '⚠️  Instrument loading failed — strategies will use fallback data');
@@ -620,6 +620,7 @@ async function main() {
       excludeSymbols: config.SCOUT_EXCLUDE_SYMBOLS
         ? config.SCOUT_EXCLUDE_SYMBOLS.split(',').map(s => s.trim()).filter(Boolean)
         : [],
+      getLiveSetting,
     });
     log.info({
       pinned: pinnedSymbols.length,
