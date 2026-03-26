@@ -72,9 +72,16 @@ export async function fetchHistoricalData({
     }
   }
 
-  // Fetch from broker API — only inside market hours to avoid circuit breaker trips
+  // Fetch strategy depends on interval:
+  //   • 'day' interval  → try broker anytime (daily OHLCV is static historical data, no circuit breaker risk)
+  //                        then fall back to Yahoo Finance
+  //   • intraday        → broker only during market hours (outside triggers circuit breaker trips)
+  //                        then fall back to Yahoo Finance
+  // In all cases: if Yahoo returns empty AND broker is available, try broker as a final fallback.
+  const isDaily = interval === 'day';
   let candles;
-  if (broker && isMarketHoursIST()) {
+
+  if (broker && (isDaily || isMarketHoursIST())) {
     try {
       log.info({ symbol, interval, from, to }, 'Fetching historical data from broker');
       const rawData = await broker.getHistoricalData(instrumentToken, interval, from, to);
@@ -85,9 +92,20 @@ export async function fetchHistoricalData({
     }
   } else {
     if (broker && !isMarketHoursIST()) {
-      log.debug({ symbol, interval }, 'Outside market hours — using Yahoo Finance (skipping broker to avoid circuit breaker)');
+      log.debug({ symbol, interval }, 'Outside market hours (intraday) — using Yahoo Finance to avoid circuit breaker');
     }
     candles = await fetchYahooFinanceFallback(symbol, from, to, interval);
+
+    // If Yahoo returned nothing and broker is available, try broker as last resort
+    if ((!candles || candles.length === 0) && broker) {
+      log.info({ symbol, interval }, 'Yahoo Finance returned no data — retrying with broker');
+      try {
+        const rawData = await broker.getHistoricalData(instrumentToken, interval, from, to);
+        candles = normalizeKiteCandles(rawData);
+      } catch (brokerErr) {
+        log.warn({ symbol, err: brokerErr.message }, 'Broker fallback also failed');
+      }
+    }
   }
 
   // Cache the result
@@ -196,7 +214,8 @@ export async function fetchYahooFinanceFallback(symbol, from, to, interval) {
       volume: quote.volume?.[i] ?? 0,
     }));
   } catch (err) {
-    log.error({ err: err.message }, 'Yahoo Finance fallback also failed');
+    // Use warn not error — 404s for obscure/unlisted symbols are expected (especially during scout scans)
+    log.warn({ symbol: yahooSymbol, err: err.message }, 'Yahoo Finance fallback also failed');
     return [];
   }
 }

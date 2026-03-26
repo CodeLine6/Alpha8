@@ -1261,7 +1261,7 @@ async function main() {
   // ─── Start REST API Server ─────────────────────────────
   const { createServer } = await import('node:http');
   const apiHandler = createApiHandler({
-    killSwitch, riskManager, engine, config, broker, telegram, scout, holdingsManager, tickFeed,
+    killSwitch, riskManager, engine, config, broker, telegram, scout, holdingsManager, tickFeed, instrumentManager,
     getLiveSetting: redisHealthy ? getLiveSetting : null,
     setLiveSetting: redisHealthy ? setLiveSetting : null,
     getAllLiveSettings: redisHealthy ? getAllLiveSettings : null,

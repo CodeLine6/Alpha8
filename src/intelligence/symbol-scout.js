@@ -275,8 +275,16 @@ export class SymbolScout {
 
         let toScan = universe.filter(s => !this.excludeSymbols.includes(s));
         
-        // Remove symbols with invalid characters or long names that Yahoo Finance might struggle with
-        toScan = toScan.filter(s => /^[A-Z0-9\-&]+$/.test(s) && s.length <= 15);
+        // Remove symbols that Yahoo Finance can't look up:
+        //   • Invalid chars (only A-Z, 0-9, hyphen, ampersand are valid NSE equity symbols)
+        //   • Length > 15 (too long to be an equity ticker)
+        //   • Starts with a digit  → government bonds/securities (e.g. 939SCL27-ZZ)
+        //   • Contains a dot      → mutual fund units (e.g. AXIS.MF)
+        toScan = toScan.filter(s =>
+            /^[A-Z][A-Z0-9\-&]*$/.test(s) &&   // must start with a letter
+            s.length <= 15 &&
+            !s.includes('.')
+        );
 
         this._log(`[Scout] Scanning ${toScan.length} symbols...`);
 
@@ -536,10 +544,16 @@ export class SymbolScout {
         from.setDate(from.getDate() - SCAN_HISTORY_DAYS);
         const fmt = d => d.toISOString().split('T')[0];
 
+        // Resolve the Kite instrument token so fetchHistoricalData can use the
+        // broker as a fallback when Yahoo Finance doesn't list the symbol.
+        const instrumentToken = this.instrumentManager
+            ? (this.instrumentManager.getToken(symbol) ?? null)
+            : null;
+
         return fetchHistoricalData({
             broker: this.broker,    // null → Yahoo Finance fallback
             symbol,
-            instrumentToken: null,    // Yahoo Finance doesn't need a token
+            instrumentToken,        // null is fine; broker fallback uses it only if set
             interval: 'day',
             from: fmt(from),
             to: fmt(to),

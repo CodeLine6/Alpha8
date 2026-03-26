@@ -94,10 +94,10 @@ function scoreSymbol(symbol, candles, signalStats) {
 
 /**
  * Run a full screener scan.
- * @param {{ broker, progressCb }} opts
+ * @param {{ broker, instrumentManager, progressCb }} opts
  * @returns {Promise<Array>} sorted results
  */
-export async function runScreener({ broker = null, progressCb = null } = {}) {
+export async function runScreener({ broker = null, instrumentManager = null, progressCb = null } = {}) {
   const fmt = (d) => d.toISOString().split('T')[0];
   const toDate   = new Date();
   const fromDate = new Date(); fromDate.setDate(toDate.getDate() - SCAN_DAYS);
@@ -113,10 +113,12 @@ export async function runScreener({ broker = null, progressCb = null } = {}) {
 
     await Promise.all(batch.map(async (symbol) => {
       try {
+        const instrumentToken = instrumentManager ? instrumentManager.getToken(symbol) : null;
+
         const candles = await fetchHistoricalData({
           broker,
           symbol,
-          instrumentToken: null,
+          instrumentToken,
           interval: 'day',
           from: fmt(fromDate),
           to:   fmt(toDate),
@@ -147,9 +149,9 @@ export async function runScreener({ broker = null, progressCb = null } = {}) {
 
 /**
  * Get screener results — serves from cache if fresh, otherwise re-scans.
- * @param {{ broker, forceRefresh }} opts
+ * @param {{ broker, instrumentManager, forceRefresh }} opts
  */
-export async function getScreenerResults({ broker = null, forceRefresh = false } = {}) {
+export async function getScreenerResults({ broker = null, instrumentManager = null, forceRefresh = false } = {}) {
   if (!forceRefresh) {
     try {
       const cached = await cacheGet(CACHE_KEY);
@@ -161,7 +163,7 @@ export async function getScreenerResults({ broker = null, forceRefresh = false }
   }
 
   log.info('Screener: cache miss — running live scan');
-  const results  = await runScreener({ broker });
+  const results  = await runScreener({ broker, instrumentManager });
   const scannedAt = new Date().toISOString();
 
   try {

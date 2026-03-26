@@ -43,7 +43,7 @@ const log = createLogger('backend-api');
  */
 export function createApiHandler(deps) {
   const {
-    killSwitch, riskManager, engine, config, broker, telegram, holdingsManager, tickFeed,
+    killSwitch, riskManager, engine, config, broker, telegram, holdingsManager, tickFeed, instrumentManager,
     getLiveSetting, setLiveSetting, getAllLiveSettings, resetLiveSetting,
   } = deps;
 
@@ -1233,6 +1233,7 @@ export function createApiHandler(deps) {
 
       const { results, fromCache, scannedAt } = await getScreenerResults({
         broker,
+        instrumentManager,
         forceRefresh: refresh,
       });
 
@@ -1321,10 +1322,12 @@ export function createApiHandler(deps) {
       const fmt = d => d.toISOString().split('T')[0];
 
       // Use broker if available to fetch intraday data securely
+      const instrumentToken = instrumentManager ? instrumentManager.getToken(symbol.toUpperCase()) : null;
+
       const candles = await fetchHistoricalData({
         broker,
-        symbol,
-        instrumentToken: null, 
+        symbol: symbol.toUpperCase(),
+        instrumentToken, 
         interval,
         from: fmt(fromDate),
         to: fmt(toDate),
