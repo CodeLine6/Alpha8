@@ -614,6 +614,7 @@ async function main() {
     scout = new SymbolScout({
       broker,
       telegram,
+      instrumentManager,
       pinnedSymbols,
       maxDynamic: config.SCOUT_MAX_DYNAMIC ?? 10,
       excludeSymbols: config.SCOUT_EXCLUDE_SYMBOLS
@@ -637,8 +638,8 @@ async function main() {
 
         telegram.sendRaw(
           `🔍 <b>Symbol Scout Starting</b>\n` +
-          `Scanning ${pinnedSymbols.length > 0 ? `~85 symbols` : 'NSE universe'}...\n` +
-          `<i>This takes ~30–60 seconds. Results will follow automatically.</i>`
+          `Scanning ~2000 active NSE equities (Dynamic Universe)...\n` +
+          `<i>This takes around 5-10 minutes. Results will follow automatically.</i>`
         );
 
         scout.runNightly()

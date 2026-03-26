@@ -3,11 +3,13 @@
 import { useState, useCallback, useEffect } from 'react';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import { formatINR, pnlColor, API_BASE } from '@/lib/utils';
+import TradingChart from '@/components/TradingChart';
 
 export default function HistoryPage() {
     const [trades, setTrades] = useState([]);
     const [loading, setLoading] = useState(true);
     const [activeTab, setActiveTab] = useState('ALL');
+    const [chartSymbol, setChartSymbol] = useState(null);
     const [filters, setFilters] = useState({
         startDate: '',
         endDate: '',
@@ -180,6 +182,23 @@ export default function HistoryPage() {
                 </div>
             </div>
 
+            {/* ── Chart modal ───────────────────────────── */}
+            {chartSymbol && (
+                <div
+                    onClick={() => setChartSymbol(null)}
+                    style={{ position: 'fixed', inset: 0, zIndex: 60, background: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', backdropFilter: 'blur(4px)' }}
+                >
+                    <div className="card" onClick={(e) => e.stopPropagation()}
+                        style={{ width: '90vw', maxWidth: '1000px', padding: '1.5rem', boxShadow: '0 8px 40px rgba(0,0,0,0.8)', border: '1px solid #374151', background: '#111827' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+                            <div style={{ fontSize: '1.25rem', fontWeight: 700, color: 'white' }}>📈 {chartSymbol.symbol} Interactive Chart</div>
+                            <button onClick={() => setChartSymbol(null)} style={{ color: '#9ca3af', background: 'transparent', border: 'none', cursor: 'pointer', fontSize: '1.5rem', lineHeight: 1 }}>&times;</button>
+                        </div>
+                        <TradingChart symbol={chartSymbol.symbol} trades={chartSymbol.trades} />
+                    </div>
+                </div>
+            )}
+
             {/* Results */}
             <ErrorBoundary>
                 <div className="card overflow-hidden">
@@ -205,6 +224,7 @@ export default function HistoryPage() {
                                         <th>ROI</th>
                                         <th>Strategy</th>
                                         <th>Status</th>
+                                        <th>Chart</th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -235,6 +255,15 @@ export default function HistoryPage() {
                                                     <span className={`badge ${trade.status === 'FILLED' ? 'badge-green' :
                                                         trade.status === 'REJECTED' ? 'badge-red' : 'badge-yellow'
                                                         }`}>{trade.status}</span>
+                                                </td>
+                                                <td>
+                                                    <button
+                                                        onClick={() => setChartSymbol({ symbol: trade.symbol, trades: [trade] })}
+                                                        title="View Chart"
+                                                        style={{ background: 'rgba(59, 130, 246, 0.1)', color: '#60a5fa', border: '1px solid rgba(59, 130, 246, 0.3)', borderRadius: '4px', padding: '2px 8px', fontSize: '0.9rem', cursor: 'pointer' }}
+                                                    >
+                                                        📈
+                                                    </button>
                                                 </td>
                                             </tr>
                                         );

@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import { formatINR, pnlColor, formatPct, API_BASE } from '@/lib/utils';
+import TradingChart from '@/components/TradingChart';
 
 // ─── Data fetching hook ──────────────────────────────────
 function usePolling(url, intervalMs = 5000) {
@@ -328,6 +329,7 @@ function PositionsTable({ data, loading }) {
     const [confirm, setConfirm] = useState(null);   // { symbol, entryPrice, qty, side }
     const [exiting, setExiting] = useState(null);   // symbol currently being exited
     const [exitMsg, setExitMsg] = useState(null);   // { ok, text }
+    const [chartSymbol, setChartSymbol] = useState(null); // { symbol, trades }
 
     const handleExitClick = (pos) => {
         setExitMsg(null);
@@ -396,6 +398,23 @@ function PositionsTable({ data, loading }) {
                 </div>
             )}
 
+            {/* ── Chart modal ───────────────────────────── */}
+            {chartSymbol && (
+                <div
+                    onClick={() => setChartSymbol(null)}
+                    style={{ position: 'fixed', inset: 0, zIndex: 60, background: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', backdropFilter: 'blur(4px)' }}
+                >
+                    <div className="card" onClick={(e) => e.stopPropagation()}
+                        style={{ width: '90vw', maxWidth: '1000px', padding: '1.5rem', boxShadow: '0 8px 40px rgba(0,0,0,0.8)', border: '1px solid #374151', background: '#111827' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+                            <div style={{ fontSize: '1.25rem', fontWeight: 700, color: 'white' }}>📈 {chartSymbol.symbol} Interactive Chart</div>
+                            <button onClick={() => setChartSymbol(null)} style={{ color: '#9ca3af', background: 'transparent', border: 'none', cursor: 'pointer', fontSize: '1.5rem', lineHeight: 1 }}>&times;</button>
+                        </div>
+                        <TradingChart symbol={chartSymbol.symbol} trades={chartSymbol.trades} />
+                    </div>
+                </div>
+            )}
+
             <div className="card overflow-hidden">
                 <div className="flex items-center justify-between mb-3 px-1">
                     <div className="text-xs text-[var(--text-muted)] uppercase tracking-wide">Open Positions</div>
@@ -422,7 +441,7 @@ function PositionsTable({ data, loading }) {
                             <thead>
                                 <tr>
                                     <th>Symbol</th><th>Side</th><th>Qty</th><th>Avg Price</th>
-                                    <th>Entry Price</th><th>Current</th><th>P&L</th><th>Target</th><th>Stop Loss</th><th></th>
+                                    <th>Entry Price</th><th>Current</th><th>P&L</th><th>Target</th><th>Stop Loss</th><th>Chart</th><th></th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -440,6 +459,15 @@ function PositionsTable({ data, loading }) {
                                             <td className={`font-medium ${pnlColor(unrealized)}`}>{formatINR(unrealized)}</td>
                                             <td className="text-blue-400">{pos.targetPrice ? formatINR(pos.targetPrice) : '—'}</td>
                                             <td className="text-yellow-400">{pos.stopLoss ? formatINR(pos.stopLoss) : '—'}</td>
+                                            <td>
+                                                <button
+                                                    onClick={() => setChartSymbol({ symbol: pos.symbol, trades: [pos] })}
+                                                    title="View Chart"
+                                                    style={{ background: 'rgba(59, 130, 246, 0.1)', color: '#60a5fa', border: '1px solid rgba(59, 130, 246, 0.3)', borderRadius: '4px', padding: '2px 8px', fontSize: '0.9rem', cursor: 'pointer' }}
+                                                >
+                                                    📈
+                                                </button>
+                                            </td>
                                             <td>
                                                 <button
                                                     id={`exit-btn-${pos.symbol}`}

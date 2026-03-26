@@ -1,6 +1,7 @@
 import { createLogger } from '../lib/logger.js';
 import { query, checkDatabaseHealth } from '../lib/db.js';
 import { checkRedisHealth, cacheGet, cacheSet } from '../lib/redis.js';
+import { fetchHistoricalData } from '../data/historical-data.js';
 
 const log = createLogger('backend-api');
 
@@ -1228,6 +1229,66 @@ export function createApiHandler(deps) {
     json(res, killSwitch.getStatus());
   }
 
+  async function handleCandlesGet(req, res) {
+    try {
+      const params = parseQuery(req.url);
+      const symbol = params.symbol;
+      const interval = params.interval || '5minute';
+      const days = parseInt(params.days) || 5;
+      
+      if (!symbol) {
+        return json(res, { error: 'symbol is required' }, 400);
+      }
+
+      const toDate = new Date();
+      const fromDate = new Date();
+      fromDate.setDate(toDate.getDate() - days);
+
+      const fmt = d => d.toISOString().split('T')[0];
+
+      // Use broker if available to fetch intraday data securely
+      const candles = await fetchHistoricalData({
+        broker,
+        symbol,
+        instrumentToken: null, 
+        interval,
+        from: fmt(fromDate),
+        to: fmt(toDate),
+      });
+
+      if (!candles || candles.length === 0) {
+        return json(res, { candles: [] });
+      }
+
+      // Format for TradingView lightweight charts: { time, open, high, low, close }
+      // The time needs to be UNIX timestamp in seconds
+      const formatted = candles.map(c => ({
+        time: Math.floor(new Date(c.timestamp).getTime() / 1000),
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        volume: c.volume
+      }));
+
+      // In lightweight-charts, time arrays MUST be strictly ascending with no duplicates.
+      // fetchHistoricalData might return duplicates if fallback/Kite stitched poorly, so let's guarantee uniqueness/sorting.
+      const unique = [];
+      let lastTime = 0;
+      for (const c of formatted) {
+          if (c.time > lastTime) {
+              unique.push(c);
+              lastTime = c.time;
+          }
+      }
+
+      json(res, { candles: unique, symbol, interval });
+    } catch (err) {
+      log.error({ err }, 'Error in /api/candles');
+      json(res, { error: err.message }, 500);
+    }
+  }
+
   // ═══════════════════════════════════════════════════════
   // MAIN ROUTER
   // ═══════════════════════════════════════════════════════
@@ -1258,7 +1319,8 @@ export function createApiHandler(deps) {
           case '/api/holdings': return handleHoldings(req, res);
           case '/api/live-settings': return handleLiveSettingsGet(req, res);
           case '/api/live-settings/schema': return handleLiveSettingsSchema(req, res);
-          case '/api/killswitch': return handleKillSwitchGet(req, res); // ← ADD
+          case '/api/killswitch': return handleKillSwitchGet(req, res);
+          case '/api/candles': return handleCandlesGet(req, res); // ← ADD
 
         }
       }

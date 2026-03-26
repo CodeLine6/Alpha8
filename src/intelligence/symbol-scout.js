@@ -234,9 +234,10 @@ export class SymbolScout {
      * @param {string[]} [opts.excludeSymbols]   - Permanent exclusion list
      * @param {Function} [opts.logger]
      */
-    constructor({ broker, telegram, pinnedSymbols, maxDynamic, excludeSymbols, logger }) {
+    constructor({ broker, telegram, instrumentManager, pinnedSymbols, maxDynamic, excludeSymbols, logger }) {
         this.broker = broker;
         this.telegram = telegram;
+        this.instrumentManager = instrumentManager;
         this.pinnedSymbols = (pinnedSymbols || []).map(s => s.toUpperCase());
         this.maxDynamic = maxDynamic ?? MAX_DYNAMIC;
         this.excludeSymbols = (excludeSymbols || []).map(s => s.toUpperCase());
@@ -256,10 +257,27 @@ export class SymbolScout {
         const currentDynamic = await this._loadDynamic();
         this._log(`[Scout] Current dynamic watchlist: [${currentDynamic.join(', ')}]`);
 
-        // 2. Build scan universe (avoid already-pinned + excluded)
-        const toScan = NSE_UNIVERSE.filter(s =>
-            !this.excludeSymbols.includes(s)
-        );
+        // 2. Build scan universe
+        let universe = NSE_UNIVERSE;
+
+        if (this.instrumentManager) {
+            try {
+                // Fetch dynamic universe of ALL NSE equities if fully loaded
+                const equities = this.instrumentManager.getEquities('NSE');
+                if (equities.length > 500) {
+                    universe = equities.map(e => e.tradingSymbol);
+                    this._log(`[Scout] Replaced static universe with ${universe.length} dynamic NSE equities`);
+                }
+            } catch(e) {
+                this._log(`[Scout] Failed to load dynamic universe, falling back to static NSE_UNIVERSE: ${e.message}`);
+            }
+        }
+
+        let toScan = universe.filter(s => !this.excludeSymbols.includes(s));
+        
+        // Remove symbols with invalid characters or long names that Yahoo Finance might struggle with
+        toScan = toScan.filter(s => /^[A-Z0-9\-&]+$/.test(s) && s.length <= 15);
+
         this._log(`[Scout] Scanning ${toScan.length} symbols...`);
 
         // 3. Fetch signal track records from DB (one query for all)
