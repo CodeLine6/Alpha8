@@ -829,13 +829,19 @@ export function createApiHandler(deps) {
         };
       }
 
+      const liveCapital = getLiveSetting ? await getLiveSetting('TRADING_CAPITAL', config.TRADING_CAPITAL) : config.TRADING_CAPITAL;
+      const liveMaxDailyLoss = getLiveSetting ? await getLiveSetting('MAX_DAILY_LOSS_PCT', config.MAX_DAILY_LOSS_PCT) : config.MAX_DAILY_LOSS_PCT;
+      const livePerTradeStopLoss = getLiveSetting ? await getLiveSetting('PER_TRADE_STOP_LOSS_PCT', config.PER_TRADE_STOP_LOSS_PCT) : config.PER_TRADE_STOP_LOSS_PCT;
+      const liveMaxPositionCount = getLiveSetting ? await getLiveSetting('MAX_POSITION_COUNT', config.MAX_POSITION_COUNT) : config.MAX_POSITION_COUNT;
+      const liveKillSwitchDrawdown = getLiveSetting ? await getLiveSetting('KILL_SWITCH_DRAWDOWN_PCT', config.KILL_SWITCH_DRAWDOWN_PCT) : config.KILL_SWITCH_DRAWDOWN_PCT;
+
       json(res, {
         paperMode: !config.LIVE_TRADING,
-        capital: config.TRADING_CAPITAL,
-        maxDailyLossPct: config.MAX_DAILY_LOSS_PCT,
-        perTradeStopLossPct: config.PER_TRADE_STOP_LOSS_PCT,
-        maxPositionCount: config.MAX_POSITION_COUNT,
-        killSwitchDrawdownPct: config.KILL_SWITCH_DRAWDOWN_PCT,
+        capital: liveCapital,
+        maxDailyLossPct: liveMaxDailyLoss,
+        perTradeStopLossPct: livePerTradeStopLoss,
+        maxPositionCount: liveMaxPositionCount,
+        killSwitchDrawdownPct: liveKillSwitchDrawdown,
         killSwitchEngaged: killSwitch.isEngaged(),
         watchlist,
         telegram: telegramStatus,
