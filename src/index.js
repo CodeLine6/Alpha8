@@ -250,9 +250,10 @@ async function main() {
   // Wire tick classification into the tick feed (if available)
   if (tickFeed) {
     tickFeed.on('tick', (tick) => {
-      // The symbolMap natively maps { token_string: tradingsymbol }
-      const token = tick.instrumentToken?.toString();
-      const symbol = tickFeed.symbolMap ? tickFeed.symbolMap[token] : token;
+      // tick.symbol is already resolved by tick-feed.js from its own symbolMap.
+      // Using it directly avoids a timing race where index.js symbolMap may not
+      // yet have been assigned when the first ticks arrive.
+      const symbol = tick.symbol;
       if (!symbol || symbol.startsWith('TOKEN:')) return;
 
       // Let the position manager evaluate this tick instantly for exact-moment trailing stops

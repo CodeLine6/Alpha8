@@ -36,6 +36,12 @@ const DEFAULTS = {
     // ── Position Exit — Signal Reversal ─────────────────────────────────────────
     SIGNAL_REVERSAL_ENABLED: null, // boolean — exit when opening strategy fires opposite
 
+    // ── Position Exit — PnL Trail ────────────────────────────────────────────────
+    PNL_TRAIL_PCT: null,       // % of peak PnL to give back before exiting
+    PNL_TRAIL_FLOOR: null,     // Min ₹ profit before PnL trail activates
+    TRAIL_MODE: null,          // 'PNL_TRAIL' | 'PRICE_TRAIL' | 'HYBRID'
+    USE_ATR_TRAIL: null,       // boolean — derive trail width from ATR vs fixed %
+
     // ── Position Exit — Time ────────────────────────────────────────────────────
     MAX_HOLD_MINUTES: null, // Max minutes to hold a flat/losing position
 

@@ -158,10 +158,26 @@ export default function TradingChart({
         // Markers
         const markerMeta = [];
         if (trades.length > 0) {
+          // Build a sorted list of candle times for snapping
+          const candleTimes = data.candles.map(c => c.time).sort((a, b) => a - b);
+
+          // Snap a raw unix-second timestamp to the nearest candle bar time
+          const snapToCandle = (rawTime) => {
+            if (!rawTime || candleTimes.length === 0) return candleTimes[candleTimes.length - 1] ?? rawTime;
+            // Find the candle bar that contains or immediately precedes rawTime
+            let snapped = candleTimes[0];
+            for (const ct of candleTimes) {
+              if (ct <= rawTime) snapped = ct;
+              else break;
+            }
+            return snapped;
+          };
+
           const rawM = [];
           for (const t of trades) {
-            let time = parseTradeTime(t);
-            if (!time) time = data.candles[data.candles.length - 1].time;
+            const rawTime = parseTradeTime(t);
+            // Snap to the candle bar that was open at entry time
+            const time = rawTime > 0 ? snapToCandle(rawTime) : candleTimes[candleTimes.length - 1];
 
             const cfg = TYPE_CFG[t.tradeType] ?? {
               text: t.side === 'BUY' ? 'Buy' : 'Sell',
@@ -187,6 +203,7 @@ export default function TradingChart({
           }
           candleSeries.setMarkers(rawM.map(({ trade: _t, ...rest }) => rest));
         }
+
 
         // If live, draw price lines now
         if (isLive) refreshPriceLines(liveData);
