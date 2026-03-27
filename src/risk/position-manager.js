@@ -267,12 +267,20 @@ export class PositionManager {
                 this._executePartialExit(symbol, posCtx, currentPrice, result)
                     .finally(() => { posCtx.isExiting = false; });
             } else if (result.exit) {
+                // Sim protection: if a minimum hold window is set, suppress exits until it expires.
+                // Peak tracking still runs above — only forceExit is blocked.
+                if (posCtx._simProtectedUntil && Date.now() < posCtx._simProtectedUntil) {
+                    const secsLeft = Math.ceil((posCtx._simProtectedUntil - Date.now()) / 1000);
+                    log.debug({ symbol, reason: result.reason, secsLeft }, '[SIM] Exit suppressed during protected hold window');
+                } else {
                 posCtx.isExiting = true;
+                posCtx._exitReason = result.reason; // captured for /api/sim/tick response
                 log.info({ symbol, currentPrice, reason: result.reason }, '🚨 Real-time TICK breached trailing/stop-loss floor! Force exiting immediately!');
                 this.engine.forceExit(symbol, currentPrice, result.reason)
                     .then(exitResult => this._notifyExit(symbol, posCtx, currentPrice, result.reason, result.meta, exitResult))
                     .catch(err => log.error({ symbol, err: err.message }, 'Real-time tick exit failed'))
                     .finally(() => { posCtx.isExiting = false; });
+                }
             } else {
                 // Sync to Redis only when the peak advances to prevent spamming I/O on every tick
                 if (posCtx.peakUnrealizedPnl !== undefined && posCtx.peakUnrealizedPnl !== posCtx._lastSavedPeak) {

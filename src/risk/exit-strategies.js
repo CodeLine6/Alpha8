@@ -220,37 +220,41 @@ export function updateTrailStop(
     if (trailMode === TRAIL_MODE.PNL_TRAIL || trailMode === TRAIL_MODE.HYBRID) {
         const currentPeak = posCtx.peakUnrealizedPnl ?? 0;
 
-        // Update peak PnL if current is higher
+        // Always ratchet peak to the highest profit seen — regardless of whether
+        // the trail floor has been crossed yet. This ensures peakUnrealizedPnl
+        // reflects the true maximum even in early profit before the floor is reached.
         if (unrealizedPnl > currentPeak) {
             updates.peakUnrealizedPnl = unrealizedPnl;
             updates.peakPnlAt = Date.now();
+        }
 
-            // Activate trail once profit crosses the floor threshold
-            if (unrealizedPnl >= pnlFloor) {
-                // PnL trail stop: retain (100 - pnlTrailPct)% of peak
-                // Example: peak ₹10,000, trail 25% → floor = ₹7,500
-                const newPnlTrailStop = unrealizedPnl * (1 - pnlTrailPct / 100);
+        // Activate / advance trail stop only once profit crosses the floor threshold
+        const effectivePeak = updates.peakUnrealizedPnl ?? currentPeak;
+        if (effectivePeak >= pnlFloor && effectivePeak > 0) {
+            // PnL trail stop: retain (100 - pnlTrailPct)% of peak
+            // Example: peak ₹10,000, trail 25% → floor = ₹7,500
+            const newPnlTrailStop = effectivePeak * (1 - pnlTrailPct / 100);
 
-                // Trail only ratchets UP (protects more profit as peak grows)
-                // Never moves DOWN even if we recompute a lower value
-                const currentPnlTrailStop = posCtx.pnlTrailStop ?? -Infinity;
+            // Trail only ratchets UP (protects more profit as peak grows)
+            // Never moves DOWN even if we recompute a lower value
+            const currentPnlTrailStop = posCtx.pnlTrailStop ?? -Infinity;
 
-                if (newPnlTrailStop > currentPnlTrailStop) {
-                    updates.pnlTrailStop = newPnlTrailStop;
-                    updates.pnlTrailActivated = true;
+            if (newPnlTrailStop > currentPnlTrailStop) {
+                updates.pnlTrailStop = newPnlTrailStop;
+                updates.pnlTrailActivated = true;
 
-                    // Diagnostics for dashboard/Telegram
-                    updates.pnlTrailHistory = [
-                        ...(posCtx.pnlTrailHistory ?? []).slice(-9), // keep last 10
-                        {
-                            pnl: +unrealizedPnl.toFixed(2),
-                            floor: +newPnlTrailStop.toFixed(2),
-                            price: currentPrice,
-                            pct: pnlTrailPct,
-                            ts: Date.now(),
-                        },
-                    ];
-                }
+                // Diagnostics for dashboard/Telegram
+                updates.pnlTrailHistory = [
+                    ...(posCtx.pnlTrailHistory ?? []).slice(-9), // keep last 10
+                    {
+                        pnl: +unrealizedPnl.toFixed(2),
+                        peak: +effectivePeak.toFixed(2),
+                        floor: +newPnlTrailStop.toFixed(2),
+                        price: currentPrice,
+                        pct: pnlTrailPct,
+                        ts: Date.now(),
+                    },
+                ];
             }
         }
     }

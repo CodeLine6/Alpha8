@@ -1274,15 +1274,36 @@ async function main() {
 
   // ─── Start REST API Server ─────────────────────────────
   const { createServer } = await import('node:http');
-  const apiHandler = createApiHandler({
+  const apiDeps = {
     killSwitch, riskManager, engine, config, broker, telegram, scout, holdingsManager, tickFeed, instrumentManager,
     getLiveSetting: redisHealthy ? getLiveSetting : null,
     setLiveSetting: redisHealthy ? setLiveSetting : null,
     getAllLiveSettings: redisHealthy ? getAllLiveSettings : null,
     resetLiveSetting: redisHealthy ? resetLiveSetting : null,
-  });
+  };
+  const apiHandler = createApiHandler(apiDeps);
+
+  // ─── Simulation Mode: wire simCandleStore into engine._fetchCandles ─────────
+  // When SIMULATE_MODE=true, the Alpha8Sim project pushes synthetic candles via
+  // POST /api/sim/candles into apiDeps.simCandleStore.
+  // engine._fetchCandles is patched to serve from the store for simulated symbols,
+  // so the strategy scanner gets realistic candle data on market holidays.
+  if (process.env.SIMULATE_MODE === 'true') {
+    log.info('🎮 SIMULATE_MODE active — sim endpoints enabled, candle store wired');
+    const realFetchCandles = engine._fetchCandles;
+    engine._fetchCandles = async (symbol, limit) => {
+      const simCandles = apiDeps.simCandleStore?.get(symbol);
+      if (simCandles && simCandles.length > 0) {
+        return simCandles.slice(-limit);
+      }
+      // Fall back to real broker fetch for all other symbols
+      if (realFetchCandles) return realFetchCandles(symbol, limit);
+      return [];
+    };
+  }
 
   const apiServer = createServer(apiHandler);
+
 
   apiServer.on('error', (err) => {
     log.error({ err }, 'API Server error (port in use?)');

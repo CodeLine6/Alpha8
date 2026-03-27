@@ -464,7 +464,29 @@ function PositionsTable({ data, loading }) {
     const [confirm, setConfirm]       = useState(null);
     const [exiting, setExiting]       = useState(null);
     const [exitMsg, setExitMsg]       = useState(null);
+    // Store only the symbol string — derive live data from positions on every render
     const [chartSymbol, setChartSymbol] = useState(null);
+    // positions must be declared before livePos references it
+    const positions = data?.positions || [];
+    const livePos = chartSymbol ? positions.find(p => p.symbol === chartSymbol) : null;
+    const chartTrades = livePos ? [{
+        ...livePos,
+        price:     livePos.entryPrice,
+        pnl:       livePos.unrealisedPnL ?? null,
+        tradeType: livePos.side === 'BUY' ? 'LONG_ENTRY' : 'SHORT_ENTRY',
+        timestamp: livePos.entryTimestamp ?? null,
+        date:      livePos.entryTimestamp
+                       ? new Date(livePos.entryTimestamp).toLocaleDateString('en-IN')
+                       : new Date().toLocaleDateString('en-IN'),
+        peakPnl:   livePos.peakUnrealizedPnl ?? null,
+    }] : [];
+    const chartLiveData = livePos ? {
+        currentPrice:  livePos.currentPrice,
+        entryPrice:    livePos.entryPrice,
+        stopLoss:      livePos.stopLoss      ?? null,
+        targetPrice:   livePos.targetPrice   ?? null,
+        trailingStop:  livePos.trailStopPrice ?? null,
+    } : {};
 
     const handleExitClick = (pos) => { setExitMsg(null); setConfirm({ symbol: pos.symbol, entryPrice: pos.entryPrice, qty: pos.quantity, side: pos.side }); };
 
@@ -487,7 +509,7 @@ function PositionsTable({ data, loading }) {
         finally { setExiting(null); }
     };
 
-    const positions = data?.positions || [];
+
 
     const TH = 'py-3 px-4 text-left text-[10px] font-semibold uppercase tracking-widest text-slate-500 border-b border-white/[0.06] whitespace-nowrap';
     const TD = 'py-4 px-4 text-sm text-slate-300 whitespace-nowrap';
@@ -519,18 +541,18 @@ function PositionsTable({ data, loading }) {
                 </div>
             )}
 
-            {/* Chart modal */}
+            {/* Chart modal — trades & liveData derived from live positions on every poll */}
             {chartSymbol && (
                 <div onClick={() => setChartSymbol(null)} className="fixed inset-0 z-[60] flex items-center justify-center bg-black/85 backdrop-blur-md">
                     <div onClick={e => e.stopPropagation()} className="w-[92vw] max-w-[1050px] rounded-2xl border border-white/10 bg-[#0d1117] p-6 shadow-2xl">
                         <div className="flex items-center justify-between mb-5">
                             <div>
-                                <h2 className="text-xl font-bold text-white">{chartSymbol.symbol}</h2>
-                                <p className="text-xs text-slate-500 mt-0.5">Live · 5-minute candles</p>
+                                <h2 className="text-xl font-bold text-white">{chartSymbol}</h2>
+                                <p className="text-xs text-slate-500 mt-0.5">Live · 5-minute candles · updates every 5s</p>
                             </div>
                             <button onClick={() => setChartSymbol(null)} className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-sm text-slate-400 hover:text-white transition">✕</button>
                         </div>
-                        <TradingChart symbol={chartSymbol.symbol} trades={chartSymbol.trades} isLive={chartSymbol.isLive} liveData={chartSymbol.liveData ?? {}} />
+                        <TradingChart symbol={chartSymbol} trades={chartTrades} isLive={true} liveData={chartLiveData} />
                     </div>
                 </div>
             )}
@@ -582,18 +604,7 @@ function PositionsTable({ data, loading }) {
                                             <td className={`${TD} tabular-nums text-yellow-400`}>{pos.stopLoss ? formatINR(pos.stopLoss) : '—'}</td>
                                             <td className={TD}>
                                                 <button
-                                                    onClick={() => setChartSymbol({
-                                                        symbol: pos.symbol,
-                                                        trades: [{
-                                                            ...pos, price: pos.entryPrice, pnl: pos.unrealisedPnL ?? null,
-                                                            tradeType: pos.side === 'BUY' ? 'LONG_ENTRY' : 'SHORT_ENTRY',
-                                                            timestamp: pos.entryTimestamp ?? null,  // FIX: use actual entry time for marker
-                                                            date: pos.entryTimestamp ? new Date(pos.entryTimestamp).toLocaleDateString('en-IN') : new Date().toLocaleDateString('en-IN'),
-                                                            peakPnl: pos.peakUnrealizedPnl ?? null,  // FIX: use real peak PnL from backend
-                                                        }],
-                                                        isLive: true,
-                                                        liveData: { currentPrice: pos.currentPrice, entryPrice: pos.entryPrice, stopLoss: pos.stopLoss ?? null, targetPrice: pos.targetPrice ?? null, trailingStop: pos.trailStopPrice ?? null },
-                                                    })}
+                                                    onClick={() => setChartSymbol(pos.symbol)}
                                                     className="rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-400 hover:bg-emerald-500/20 transition">
                                                     📈 Live
                                                 </button>
