@@ -239,7 +239,15 @@ export class PositionManager {
         if (currentPrice <= 0) return;
 
         // Concurrency guard to prevent tick avalanches while an API exit is mid-flight
-        if (posCtx.isExiting) return;
+        if (posCtx.isExiting) {
+            // Rate-limited warn: isExiting stuck could freeze peak tracking
+            const now = Date.now();
+            if (!posCtx._isExitingWarnAt || now - posCtx._isExitingWarnAt > 30_000) {
+                log.warn({ symbol, currentPrice }, 'evaluateTick: posCtx.isExiting=true — skipping tick (possible stuck exit)');
+                posCtx._isExitingWarnAt = now;
+            }
+            return;
+        }
 
         try {
             const result = evaluateExits({
@@ -260,7 +268,7 @@ export class PositionManager {
                     .finally(() => { posCtx.isExiting = false; });
             } else if (result.exit) {
                 posCtx.isExiting = true;
-                log.info({ symbol, currentPrice }, '🚨 Real-time TICK breached trailing/stop-loss floor! Force exiting immediately!');
+                log.info({ symbol, currentPrice, reason: result.reason }, '🚨 Real-time TICK breached trailing/stop-loss floor! Force exiting immediately!');
                 this.engine.forceExit(symbol, currentPrice, result.reason)
                     .then(exitResult => this._notifyExit(symbol, posCtx, currentPrice, result.reason, result.meta, exitResult))
                     .catch(err => log.error({ symbol, err: err.message }, 'Real-time tick exit failed'))
@@ -268,11 +276,26 @@ export class PositionManager {
             } else {
                 // Sync to Redis only when the peak advances to prevent spamming I/O on every tick
                 if (posCtx.peakUnrealizedPnl !== undefined && posCtx.peakUnrealizedPnl !== posCtx._lastSavedPeak) {
+                    log.debug({ symbol, peak: posCtx.peakUnrealizedPnl }, 'Peak PnL advanced — saving to Redis');
                     posCtx._lastSavedPeak = posCtx.peakUnrealizedPnl;
                     getRedis().hset(`trail:${symbol}`,
                         'peakUnrealizedPnl', String(posCtx.peakUnrealizedPnl),
                         'pnlTrailStop', String(posCtx.pnlTrailStop)
                     ).catch(() => { });
+                } else {
+                    // Diagnostic: warn once per 30s if peak is stuck at 0 while in profit
+                    const isShort = posCtx.isShort ?? posCtx.direction === 'SELL';
+                    const entry   = posCtx.entryPrice ?? posCtx.price;
+                    const unrealizedPnl = isShort
+                        ? (entry - currentPrice) * posCtx.quantity
+                        : (currentPrice - entry)  * posCtx.quantity;
+                    const now = Date.now();
+                    if (unrealizedPnl > 0 && (posCtx.peakUnrealizedPnl ?? 0) <= 0
+                        && (!posCtx._peakStuckWarnAt || now - posCtx._peakStuckWarnAt > 30_000)) {
+                        log.warn({ symbol, unrealizedPnl, peak: posCtx.peakUnrealizedPnl,
+                            trailMode: posCtx.trailMode, currentPrice, entry }, 'evaluateTick: position in profit but peak not advancing — check trailMode');
+                        posCtx._peakStuckWarnAt = now;
+                    }
                 }
             }
         } catch (err) {

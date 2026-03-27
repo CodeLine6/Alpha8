@@ -59,6 +59,7 @@ export default function TradingChart({
   const priceLinesRef = useRef({});    // keyed by label
   const lastCandleRef = useRef(null);  // last full candle for live update
   const markerMetaRef = useRef([]);    // always-current marker metadata for tooltip
+  const entryLineCreatedRef = useRef(false); // true when a trade marker created the entry price line
 
   const [loading, setLoading]  = useState(true);
   const [error, setError]      = useState(null);
@@ -72,7 +73,12 @@ export default function TradingChart({
     if (!series) return;
 
     const lines = {
-      entry:         { price: data.entryPrice,    color: '#e2e8f0', title: '  Entry',         lineStyle: LineStyle.Solid,   lineWidth: 1 },
+      // 'entry' removed — entry price lines are now created from LONG_ENTRY/SHORT_ENTRY
+      // trade markers so they carry the correct direction label (L.Entry / S.Entry).
+      // Fallback: if no entry trade marker created the line, show a generic 'Entry'.
+      ...(!entryLineCreatedRef.current && data.entryPrice
+        ? { entry: { price: data.entryPrice, color: '#e2e8f0', title: '  Entry', lineStyle: LineStyle.Solid, lineWidth: 1 } }
+        : {}),
       stopLoss:      { price: data.stopLoss,       color: '#ef4444', title: '  Stop Loss',     lineStyle: LineStyle.Dashed,  lineWidth: 1 },
       trailingStop:  { price: data.trailingStop,   color: '#f97316', title: '  Trail Stop',    lineStyle: LineStyle.Dotted,  lineWidth: 1 },
       target:        { price: data.targetPrice,    color: '#10b981', title: '  Target',         lineStyle: LineStyle.Dashed,  lineWidth: 1 },
@@ -110,6 +116,7 @@ export default function TradingChart({
     priceLinesRef.current = {};
     lastCandleRef.current = null;
     markerMetaRef.current = [];  // clear stale markers from previous symbol
+    entryLineCreatedRef.current = false;  // reset so refreshPriceLines can add fallback if needed
 
     async function init() {
       try {
@@ -188,7 +195,38 @@ export default function TradingChart({
             };
 
             const lbl = t.strategy === 'PARTIAL_EXIT' ? 'P.' + cfg.text.split('.')[1] : cfg.text;
-            if (time > 0) rawM.push({ time, trade: t, ...cfg, text: lbl, shape: 'circle' });
+
+            // ── Option B: Entry trades → price line at exact fill price ──────
+            // LONG_ENTRY / SHORT_ENTRY: a horizontal price line at the fill price
+            // gives pixel-perfect alignment on the axis. We still push a small
+            // directional arrow at the candle time so the time is visible.
+            const isEntryTrade = t.tradeType === 'LONG_ENTRY' || t.tradeType === 'SHORT_ENTRY';
+            const fillPrice = t.entryPrice ?? t.price ?? 0;
+
+            if (isEntryTrade && fillPrice > 0) {
+              // Price line at exact fill price, styled like the other level lines
+              candleSeries.createPriceLine({
+                price: fillPrice,
+                color: cfg.color,
+                lineWidth: 1,
+                lineStyle: LineStyle.Solid,
+                axisLabelVisible: true,
+                title: `  ${lbl}`,   // e.g. "  L.Entry" / "  S.Entry"
+              });
+              entryLineCreatedRef.current = true; // suppress generic 'Entry' fallback
+              // Small arrow at the candle time — gives temporal reference without
+              // the visual price mismatch of belowBar/aboveBar circle markers
+              if (time > 0) rawM.push({
+                time,
+                trade: t,
+                color: cfg.color,
+                position: cfg.position,
+                text: '',          // no label — the price line carries the label
+                shape: t.tradeType === 'LONG_ENTRY' ? 'arrowUp' : 'arrowDown',
+              });
+            } else {
+              if (time > 0) rawM.push({ time, trade: t, ...cfg, text: lbl, shape: 'circle' });
+            }
           }
 
           rawM.sort((a, b) => a.time - b.time);
