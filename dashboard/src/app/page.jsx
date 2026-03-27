@@ -587,9 +587,9 @@ function PositionsTable({ data, loading }) {
                                                         trades: [{
                                                             ...pos, price: pos.entryPrice, pnl: pos.unrealisedPnL ?? null,
                                                             tradeType: pos.side === 'BUY' ? 'LONG_ENTRY' : 'SHORT_ENTRY',
-                                                            timestamp: pos.entryTimestamp ?? null,
+                                                            timestamp: pos.entryTimestamp ?? null,  // FIX: use actual entry time for marker
                                                             date: pos.entryTimestamp ? new Date(pos.entryTimestamp).toLocaleDateString('en-IN') : new Date().toLocaleDateString('en-IN'),
-                                                            peakPnl: pos.highWaterMark != null ? (pos.side === 'BUY' ? +((pos.highWaterMark - pos.entryPrice) * pos.quantity).toFixed(2) : +((pos.entryPrice - pos.highWaterMark) * pos.quantity).toFixed(2)) : null,
+                                                            peakPnl: pos.peakUnrealizedPnl ?? null,  // FIX: use real peak PnL from backend
                                                         }],
                                                         isLive: true,
                                                         liveData: { currentPrice: pos.currentPrice, entryPrice: pos.entryPrice, stopLoss: pos.stopLoss ?? null, targetPrice: pos.targetPrice ?? null, trailingStop: pos.trailStopPrice ?? null },

@@ -48,6 +48,7 @@ export class PositionManager {
             pnlTrailPct: config.PNL_TRAIL_PCT ?? 25,
             pnlTrailFloor: config.PNL_TRAIL_FLOOR ?? 0,
             trailMode: config.TRAIL_MODE ?? 'PNL_TRAIL',
+            useAtrTrail: config.USE_ATR_TRAIL ?? true,
         };
 
         this._active = { ...this._base };
@@ -78,6 +79,8 @@ export class PositionManager {
                 pnlTrailPct: Number(await this._getLiveSetting('PNL_TRAIL_PCT', this._base.pnlTrailPct)),
                 pnlTrailFloor: Number(await this._getLiveSetting('PNL_TRAIL_FLOOR', this._base.pnlTrailFloor)),
                 trailMode: await this._getLiveSetting('TRAIL_MODE', this._base.trailMode),
+                useAtrTrail: (await this._getLiveSetting('USE_ATR_TRAIL', this._base.useAtrTrail)) !== false
+                    && (await this._getLiveSetting('USE_ATR_TRAIL', this._base.useAtrTrail)) !== 'false',
             };
         } catch (err) {
             log.warn({ err: err.message }, '_refreshParams failed — keeping current values');
@@ -98,8 +101,8 @@ export class PositionManager {
             const entry = posCtx.entryPrice ?? posCtx.price;
             const isShort = posCtx.isShort ?? posCtx.direction === 'SELL';
 
-            const newStop = isShort 
-                ? entry * (1 + stopPct / 100) 
+            const newStop = isShort
+                ? entry * (1 + stopPct / 100)
                 : entry * (1 - stopPct / 100);
 
             const MEAN_REVERSION = new Set(['RSI_MEAN_REVERSION']);
@@ -117,11 +120,12 @@ export class PositionManager {
             }
 
             // Static bounds sync natively on global change
-            posCtx.stopPrice = newStop;
+
             posCtx.profitTargetPrice = newTarget;
             posCtx.profitTargetMode = targetMode;
-            
+
             if (posCtx.hydratedFromDB) {
+                posCtx.stopPrice = newStop;
                 posCtx.hydratedFromDB = false; // Synced!
             }
         }
@@ -197,7 +201,7 @@ export class PositionManager {
                     // Redis Trail Persistence Hook — execute synchronously so memory matches Redis
                     if (!result.exit || result.partial) {
                         if (posCtx.peakUnrealizedPnl !== undefined && posCtx.pnlTrailStop !== undefined) {
-                            getRedis().hset(`trail:${symbol}`, 
+                            getRedis().hset(`trail:${symbol}`,
                                 'peakUnrealizedPnl', String(posCtx.peakUnrealizedPnl),
                                 'pnlTrailStop', String(posCtx.pnlTrailStop)
                             ).catch(e => log.debug({ err: e.message }, 'Failed to save trail to Redis'));
@@ -245,7 +249,7 @@ export class PositionManager {
                 recentCloses: [],
                 recentHighs: [],
                 recentLows: [],
-                regime: null, 
+                regime: null,
                 latestSignals: {}, // Ignore reversal signals here (they wait for candle close)
                 config: this._active,
             });
@@ -265,10 +269,10 @@ export class PositionManager {
                 // Sync to Redis only when the peak advances to prevent spamming I/O on every tick
                 if (posCtx.peakUnrealizedPnl !== undefined && posCtx.peakUnrealizedPnl !== posCtx._lastSavedPeak) {
                     posCtx._lastSavedPeak = posCtx.peakUnrealizedPnl;
-                    getRedis().hset(`trail:${symbol}`, 
+                    getRedis().hset(`trail:${symbol}`,
                         'peakUnrealizedPnl', String(posCtx.peakUnrealizedPnl),
                         'pnlTrailStop', String(posCtx.pnlTrailStop)
-                    ).catch(() => {});
+                    ).catch(() => { });
                 }
             }
         } catch (err) {
@@ -298,7 +302,7 @@ export class PositionManager {
         // Explicitly create the initial trail data in Redis instantly, removing the
         // dependency on the lazy check in evaluateTick() or the 5-minute cron.
         try {
-            await getRedis().hset(`trail:${symbol}`, 
+            await getRedis().hset(`trail:${symbol}`,
                 'peakUnrealizedPnl', String(levels.peakUnrealizedPnl),
                 'pnlTrailStop', String(levels.pnlTrailStop)
             );
@@ -403,11 +407,11 @@ export class PositionManager {
         if (!this.engine.telegram?.enabled) return;
 
         const isShort = posCtx.isShort ?? posCtx.direction === 'SELL';
-        
+
         const grossFallback = isShort
             ? (posCtx.entryPrice - exitPrice) * posCtx.quantity
             : (exitPrice - posCtx.entryPrice) * posCtx.quantity;
-            
+
         const grossPnl = exitResult?.order?.grossPnl ?? grossFallback;
         const charges = exitResult?.order?.costPaid ?? 0;
         const netPnl = exitResult?.order?.pnl ?? (grossPnl - charges);
@@ -417,7 +421,7 @@ export class PositionManager {
             ? (isShort
                 ? ((posCtx.entryPrice - exitPrice) / posCtx.entryPrice * 100)
                 : ((exitPrice - posCtx.entryPrice) / posCtx.entryPrice * 100)
-              ).toFixed(2)
+            ).toFixed(2)
             : '0.00';
 
         const emoji = netPnl >= 0 ? '✅' : '🛑';

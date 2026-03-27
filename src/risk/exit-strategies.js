@@ -65,6 +65,8 @@ export function computeExitLevels({
     const partialExitEnabled = config.partialExitEnabled ?? config.PARTIAL_EXIT_ENABLED ?? true;
     const partialExitPct = config.partialExitPct ?? config.PARTIAL_EXIT_PCT ?? 50;
     const signalReversalEnabled = config.signalReversalEnabled ?? config.SIGNAL_REVERSAL_ENABLED ?? true;
+    // ATR override toggle: when false, always use the configured trailingStopPct
+    const useAtrTrail = config.useAtrTrail ?? config.USE_ATR_TRAIL ?? true;
 
     // ── NEW: PnL trail configuration ──────────────────────────────────────────
     // pnlTrailPct: what % of peak PnL to give back before exiting
@@ -111,7 +113,7 @@ export function computeExitLevels({
         : 0;
 
     // ── ATR for price-trail component ─────────────────────────────────────────
-    const atrPct = recentCloses.length >= 14
+    const atrPct = useAtrTrail && recentCloses.length >= 14
         ? computeAtrPct(recentHighs, recentLows, recentCloses)
         : null;
     const trailMultiplier = REGIME_TRAIL_MULTIPLIER[regime] ?? REGIME_TRAIL_MULTIPLIER.UNKNOWN;
@@ -264,7 +266,8 @@ export function updateTrailStop(
             updates.highWaterMark = currentPrice;
             updates.currentRegime = regime;
 
-            const atrPct = recentCloses.length >= 14
+            const useAtrTrail = posCtx.useAtrTrail ?? true;
+            const atrPct = useAtrTrail && recentCloses.length >= 14
                 ? computeAtrPct(recentHighs, recentLows, recentCloses)
                 : null;
             const multiplier = REGIME_TRAIL_MULTIPLIER[regime] ?? REGIME_TRAIL_MULTIPLIER.UNKNOWN;

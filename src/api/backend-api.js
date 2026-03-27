@@ -169,6 +169,13 @@ export function createApiHandler(deps) {
       default: config.TRAIL_MODE ?? 'PNL_TRAIL',
       category: 'exits',
     },
+    USE_ATR_TRAIL: {
+      label: 'ATR-Based Trail Width',
+      description: 'When ON, trail % is derived from ATR volatility (overrides Trailing Stop %). When OFF, always uses the configured Trailing Stop % exactly.',
+      type: 'boolean',
+      default: config.USE_ATR_TRAIL ?? true,
+      category: 'exits',
+    },
     SIGNAL_REVERSAL_ENABLED: {
       label: 'Signal Reversal Exit',
       description: 'Exit when the strategy that opened the position fires the opposite signal',
@@ -614,12 +621,14 @@ export function createApiHandler(deps) {
             quantity: ctx.quantity,
             avgPrice: entryPrice,
             entryPrice,
+            entryTimestamp: ctx.timestamp ?? null,        // FIX: chart marker placement
             currentPrice,
             targetPrice: ctx.profitTargetPrice ?? null,
             stopPrice: ctx.stopPrice ?? null,
             stopLoss: ctx.stopPrice ?? null,
             trailStopPrice: ctx.trailStopPrice ?? null,
             highWaterMark: ctx.highWaterMark ?? null,
+            peakUnrealizedPnl: ctx.peakUnrealizedPnl ?? null,  // FIX: real peak PnL for tooltip
             unrealisedPnL: unrealisedPnL != null ? +unrealisedPnL.toFixed(2) : null,
             unrealisedPnLPct: unrealisedPnLPct != null ? +unrealisedPnLPct.toFixed(2) : null,
             holdMinutes: +holdMinutes.toFixed(1),
