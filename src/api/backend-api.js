@@ -626,7 +626,21 @@ export function createApiHandler(deps) {
             targetPrice: ctx.profitTargetPrice ?? null,
             stopPrice: ctx.stopPrice ?? null,
             stopLoss: ctx.stopPrice ?? null,
-            trailStopPrice: ctx.trailStopPrice ?? null,
+            // Effective trailing stop price for chart display:
+            // In PNL_TRAIL mode, pnlTrailStop (₹) is the active trail.
+            // Convert it to an equivalent price: the price at which unrealizedPnl = pnlTrailStop.
+            //   SHORT: exitPrice = entryPrice - pnlTrailStop / qty
+            //   LONG:  exitPrice = entryPrice + pnlTrailStop / qty
+            // Fall back to trailStopPrice (initial price trail) if PNL trail not yet active.
+            trailStopPrice: (() => {
+              if (ctx.pnlTrailActivated && ctx.pnlTrailStop != null && isFinite(ctx.pnlTrailStop)) {
+                const qty = ctx.quantity;
+                return isShort
+                  ? +(entryPrice - ctx.pnlTrailStop / qty).toFixed(2)
+                  : +(entryPrice + ctx.pnlTrailStop / qty).toFixed(2);
+              }
+              return ctx.trailStopPrice ?? null;
+            })(),
             highWaterMark: ctx.highWaterMark ?? null,
             peakUnrealizedPnl: ctx.peakUnrealizedPnl ?? null,  // FIX: real peak PnL for tooltip
             unrealisedPnL: unrealisedPnL != null ? +unrealisedPnL.toFixed(2) : null,

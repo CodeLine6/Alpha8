@@ -58,6 +58,7 @@ export default function TradingChart({
   const volRef       = useRef();
   const priceLinesRef = useRef({});    // keyed by label
   const lastCandleRef = useRef(null);  // last full candle for live update
+  const markerMetaRef = useRef([]);    // always-current marker metadata for tooltip
 
   const [loading, setLoading]  = useState(true);
   const [error, setError]      = useState(null);
@@ -108,6 +109,7 @@ export default function TradingChart({
     let destroyed = false;
     priceLinesRef.current = {};
     lastCandleRef.current = null;
+    markerMetaRef.current = [];  // clear stale markers from previous symbol
 
     async function init() {
       try {
@@ -193,7 +195,7 @@ export default function TradingChart({
           let lastT = 0;
           for (const m of rawM) {
             if (m.time <= lastT) m.time = lastT + 1;
-            markerMeta.push({
+            markerMetaRef.current.push({
               time: m.time,
               trade: m.trade,
               color: m.color,
@@ -221,7 +223,7 @@ export default function TradingChart({
 
           // Find markers within a small time window (e.g., +/- 1 candle)
           const timeWindow = interval === '1minute' ? 60 : interval === '5minute' ? 300 : interval === '15minute' ? 900 : 300;
-          const candidates = markerMeta.filter(m => Math.abs(m.time - param.time) < timeWindow * 1.5);
+          const candidates = markerMetaRef.current.filter(m => Math.abs(m.time - param.time) < timeWindow * 1.5);
 
           if (candidates.length === 0) {
             setTooltip(null);
@@ -273,7 +275,27 @@ export default function TradingChart({
     };
   }, [symbol, interval, days, endDate]); // eslint-disable-line
 
-  // ── 3. Update price lines when liveData prop changes (from parent polling) ──
+  // ── 3. Keep markerMeta trade data live — runs every time trades polls ──────
+  // The chart useEffect only runs on symbol/interval changes (no re-init flash).
+  // This effect patches only the trade payload inside each markerMeta entry so
+  // peakPnl, pnl, quantity etc. always reflect the latest API response.
+  useEffect(() => {
+    if (!trades?.length || !markerMetaRef.current.length) return;
+    // Build a lookup: entryTimestamp (unix-s) → trade object
+    const byTime = new Map();
+    for (const t of trades) {
+      const rawTime = parseTradeTime(t);
+      if (rawTime > 0) byTime.set(rawTime, t);
+      // Also index by symbol in case timestamps don't align perfectly
+      if (t.symbol) byTime.set(t.symbol, t);
+    }
+    for (const meta of markerMetaRef.current) {
+      const fresh = byTime.get(meta.time) ?? byTime.get(meta.trade?.symbol);
+      if (fresh) meta.trade = fresh; // mutate in-place — crosshair closure reads ref
+    }
+  }, [trades]);
+
+  // ── 4. Update price lines when liveData prop changes (from parent polling) ──
   useEffect(() => {
     if (isLive && candleRef.current) refreshPriceLines(liveData);
   }, [isLive, liveData, refreshPriceLines]);
