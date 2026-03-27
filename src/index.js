@@ -23,7 +23,7 @@ import {
   ORBStrategy,
   BAVIStrategy,
 } from './strategies/index.js';
-import { TickClassifier }    from './data/tick-classifier.js';
+import { TickClassifier } from './data/tick-classifier.js';
 import { RollingTickBuffer } from './data/rolling-tick-buffer.js';
 import { createApiHandler } from './api/backend-api.js';
 import { EnhancedSignalPipeline } from './intelligence/enhanced-pipeline.js';
@@ -250,18 +250,18 @@ async function main() {
   // Wire tick classification into the tick feed (if available)
   if (tickFeed) {
     tickFeed.on('tick', (tick) => {
-        // The symbolMap natively maps { token_string: tradingsymbol }
-        const token = tick.instrumentToken?.toString();
-        const symbol = tickFeed.symbolMap ? tickFeed.symbolMap[token] : token;
-        if (!symbol || symbol.startsWith('TOKEN:')) return;
+      // The symbolMap natively maps { token_string: tradingsymbol }
+      const token = tick.instrumentToken?.toString();
+      const symbol = tickFeed.symbolMap ? tickFeed.symbolMap[token] : token;
+      if (!symbol || symbol.startsWith('TOKEN:')) return;
 
-        // Let the position manager evaluate this tick instantly for exact-moment trailing stops
-        if (engine && engine.positionManager) {
-            engine.positionManager.evaluateTick(symbol, tick);
-        }
+      // Let the position manager evaluate this tick instantly for exact-moment trailing stops
+      if (engine && engine.positionManager) {
+        engine.positionManager.evaluateTick(symbol, tick);
+      }
 
-        const classified = tickClassifier.classify(symbol, tick);
-        rollingTickBuf.push(symbol, classified);
+      const classified = tickClassifier.classify(symbol, tick);
+      rollingTickBuf.push(symbol, classified);
     });
     log.info('✅ Tick classifier + rolling buffer wired into tick feed');
   }
@@ -311,9 +311,9 @@ async function main() {
   // rsiStrategy is kept alive as a long-exit helper (RSI_OVERBOUGHT_EXIT).
 
   // Instantiate all strategies
-  const orbStrategy  = new ORBStrategy({ getLiveSetting: redisHealthy ? getLiveSetting : null });
+  const orbStrategy = new ORBStrategy({ getLiveSetting: redisHealthy ? getLiveSetting : null });
   const baviStrategy = new BAVIStrategy({ getLiveSetting: redisHealthy ? getLiveSetting : null });
-  const rsiStrategy  = new RSIMeanReversionStrategy();  // exit helper only — NOT added to consensus
+  const rsiStrategy = new RSIMeanReversionStrategy();  // exit helper only — NOT added to consensus
   // (EMACrossoverStrategy is NOT instantiated — file retained but not used)
 
   /**
@@ -326,14 +326,14 @@ async function main() {
    */
   class BAVIAdapter {
     constructor(baviStrategy, tickBuffer) {
-      this.name       = 'BAVI';
+      this.name = 'BAVI';
       this.minCandles = baviStrategy.minCandles;
-      this._strategy  = baviStrategy;
-      this._tickBuf   = tickBuffer;
-      this._symbol    = null;
+      this._strategy = baviStrategy;
+      this._tickBuf = tickBuffer;
+      this._symbol = null;
     }
     setSymbol(symbol) { this._symbol = symbol; return this; }
-    analyze(candles, symbol = null)  { return this._strategy.analyze(candles, this._tickBuf, symbol || this._symbol); }
+    analyze(candles, symbol = null) { return this._strategy.analyze(candles, this._tickBuf, symbol || this._symbol); }
     async refreshParams() { return this._strategy.refreshParams(); }
   }
   const baviAdapter = new BAVIAdapter(baviStrategy, rollingTickBuf);
@@ -469,7 +469,13 @@ async function main() {
     engine.positionManager = positionManager;
     engine._fetchCandles = async (symbol, limit) => {
       if (!broker) return [];
-      const instrumentToken = instrumentManager?.getToken(symbol) ?? null;
+      const instrumentToken = instrumentManager?.getToken(symbol)
+        ?? watchlistTokens[symbol]
+        ?? null;
+
+      if (!instrumentToken) {
+        log.warn({ symbol }, 'No instrument token — broker candle fetch will be skipped, falling back to Yahoo Finance (intraday data may be limited)');
+      }
       return fetchRecentCandles({
         broker,
         instrumentToken,
@@ -678,7 +684,7 @@ async function main() {
           // (This matches the behavior of getWatchlist() used for trading)
           active = [...new Set([...active, ...dbPinned])];
 
-          const pinned  = active.filter(s => allPinned.includes(s));
+          const pinned = active.filter(s => allPinned.includes(s));
           const dynamic = active.filter(s => !allPinned.includes(s));
 
           let msg = `📋 <b>Active Watchlist (${active.length} symbols)</b>\n\n`;
@@ -837,7 +843,7 @@ async function main() {
           try {
             candles = await fetchRecentCandles({
               broker, instrumentToken, symbol,
-              interval: '5minute', count: 100,
+              interval: '5minute', count: 200,
             });
           } catch (candleErr) {
             log.warn({ symbol, err: candleErr.message }, 'Candle fetch failed — strategy will receive empty candles');
@@ -951,7 +957,7 @@ async function main() {
       const q = quote?.['NSE:NIFTY 50'];
       if (!q) return null;
       const high = q.ohlc?.high ?? q.high ?? null;
-      const low  = q.ohlc?.low  ?? q.low  ?? null;
+      const low = q.ohlc?.low ?? q.low ?? null;
       if (high == null || low == null) return null;
       return { high, low };
     } catch (err) {
@@ -1034,8 +1040,8 @@ async function main() {
 
     const roiLine = summary.totalCashRequired > 0
       ? `\n📈 Daily ROI: ${summary.dailyRoi >= 0 ? '+' : ''}${summary.dailyRoi?.toFixed(2)}%` +
-        ` on ₹${(summary.totalCashRequired || 0).toLocaleString('en-IN')} cash used` +
-        `\n🏔️  Peak deployed: ₹${(summary.peakDeployment || 0).toLocaleString('en-IN')}`
+      ` on ₹${(summary.totalCashRequired || 0).toLocaleString('en-IN')} cash used` +
+      `\n🏔️  Peak deployed: ₹${(summary.peakDeployment || 0).toLocaleString('en-IN')}`
       : '';
 
     const msg =
@@ -1188,6 +1194,12 @@ async function main() {
       tickFeed.subscribe(resolved.tokens, 'full');
       log.info({ tokens: resolved.tokens.length }, '✅ Tick feed subscribed to pinned watchlist');
     }
+    // ADD:
+    log.info({
+      connected: tickFeed.isConnected,
+      subscribedTokens: tickFeed.subscribedTokens.length,
+      apiKey: config.KITE_API_KEY ? 'set' : 'MISSING',
+    }, 'Tick feed status — BAVI requires this WebSocket to be connected');
 
     registerShutdown('tick-feed', async () => {
       tickFeed.stop();

@@ -45,10 +45,10 @@ const log = createLogger('signal-consensus');
 // ── Confidence floors ─────────────────────────────────────────────────────────
 
 const CONFIDENCE_FLOORS = {
-  ORB:              55,   // Opening Range Breakout — range-confirmed, reliable
-  BAVI:             50,   // Bid-Ask Volume Imbalance — tick-based, reliable early
-  VWAP_MOMENTUM:    45,
-  BREAKOUT_VOLUME:  45,
+  ORB: 55,   // Opening Range Breakout — range-confirmed, reliable
+  BAVI: 50,   // Bid-Ask Volume Imbalance — tick-based, reliable early
+  VWAP_MOMENTUM: 45,
+  BREAKOUT_VOLUME: 45,
 };
 const DEFAULT_FLOOR = 40;
 
@@ -124,7 +124,7 @@ export class SignalConsensus {
       this.superConvictionThreshold = await this._getLiveSetting('SUPER_CONVICTION_THRESHOLD', 80);
       // Fix BUG-17: also refresh minConfidence and minAgreement so /set commands take effect
       this.minConfidence = await this._getLiveSetting('MIN_CONFIDENCE', this.minConfidence);
-      this.minAgreement  = await this._getLiveSetting('MIN_AGREEMENT',  this.minAgreement);
+      this.minAgreement = await this._getLiveSetting('MIN_AGREEMENT', this.minAgreement);
     } catch (err) {
       log.warn({ err: err.message }, 'Failed to refresh SignalConsensus params');
     }
@@ -291,6 +291,7 @@ export class SignalConsensus {
     }
 
     log.info({
+      symbol,   // ← ADD THIS LINE
       signal: finalSignal,
       confidence: finalConfidence,
       votes,
@@ -307,9 +308,11 @@ export class SignalConsensus {
     if (finalSignal === SIGNAL.HOLD && votes.buy === 0 && votes.sell === 0) {
       for (const r of results) {
         log.info(
-          { strategy: r.strategy, signal: r.signal, confidence: r.confidence,
-            meetsFloor: r.meetsFloor, suppressedByTime: r.suppressedByTime },
-          `  ↳ [${r.strategy}] HOLD — ${r.reason}`
+          {
+            symbol, strategy: r.strategy, signal: r.signal, confidence: r.confidence,
+            meetsFloor: r.meetsFloor, suppressedByTime: r.suppressedByTime
+          },
+          `  ↳ [${symbol}/${r.strategy}] HOLD — ${r.reason}`
         );
       }
     }
