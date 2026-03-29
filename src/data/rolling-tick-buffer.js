@@ -206,4 +206,63 @@ export class RollingTickBuffer {
         }
         return { direction: 'FLAT', strength: 0 };
     }
+
+    // ── Snapshot / Restore (Redis persistence) ───────────────────────────────
+
+    /**
+     * Serialise the current buffer state to a plain object for Redis storage.
+     *
+     * The `date` field (YYYY-MM-DD in IST) is included so that `loadSnapshot()`
+     * can reject stale snapshots from a previous trading day.
+     *
+     * @returns {{ date: string, buffers: Object, history: Object }}
+     */
+    toSnapshot() {
+        const date = new Date().toLocaleString('en-CA', { timeZone: 'Asia/Kolkata' })
+            .split(',')[0].trim();
+
+        const buffers = {};
+        for (const [sym, ticks] of this._buffers) {
+            buffers[sym] = ticks;
+        }
+
+        const history = {};
+        for (const [sym, hist] of this._imbalanceHistory) {
+            history[sym] = hist;
+        }
+
+        return { date, buffers, history };
+    }
+
+    /**
+     * Restore buffer state from a previously saved snapshot.
+     *
+     * Returns the number of symbols restored, or 0 if the snapshot is null,
+     * malformed, or from a different trading day (stale cross-day data).
+     *
+     * @param {{ date: string, buffers: Object, history: Object } | null} snapshot
+     * @returns {number} Symbols restored
+     */
+    loadSnapshot(snapshot) {
+        if (!snapshot || typeof snapshot !== 'object') return 0;
+
+        // Guard: reject if snapshot is from a previous trading day
+        const today = new Date().toLocaleString('en-CA', { timeZone: 'Asia/Kolkata' })
+            .split(',')[0].trim();
+        if (snapshot.date !== today) return 0;
+
+        const { buffers = {}, history = {} } = snapshot;
+        let restored = 0;
+
+        for (const [sym, ticks] of Object.entries(buffers)) {
+            if (Array.isArray(ticks) && ticks.length > 0) {
+                // Trim to window size in case snapshot was taken with a different config
+                this._buffers.set(sym, ticks.slice(-this._windowSize));
+                this._imbalanceHistory.set(sym, Array.isArray(history[sym]) ? history[sym] : []);
+                restored++;
+            }
+        }
+
+        return restored;
+    }
 }

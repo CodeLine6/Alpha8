@@ -81,10 +81,13 @@ export async function fetchHistoricalData({
   const isDaily = interval === 'day';
   let candles;
 
-  // Prioritize broker if token is provided. 
+  // Prioritize broker if token is provided.
   //   • 'day' interval: Always try broker first (Static historical data)
+  //   • sim mode: Always use broker (the simulator) — Yahoo Finance would return
+  //     stale real market data, bypassing the simulator's candle generation entirely
   //   • intraday: Broker only during market hours (to avoid circuit breaker trips)
-  const canTryBroker = broker && instrumentToken && (isDaily || isMarketHoursIST());
+  const isSimMode = !!process.env.SIM_URL;
+  const canTryBroker = broker && instrumentToken && (isDaily || isSimMode || isMarketHoursIST());
 
   if (canTryBroker) {
     try {
@@ -202,7 +205,11 @@ export async function fetchYahooFinanceFallback(symbol, from, to, interval) {
   }
 
   const fromEpoch = Math.floor(new Date(from).getTime() / 1000);
-  const toEpoch = Math.floor(new Date(to).getTime() / 1000);
+  let toEpoch = Math.floor(new Date(to).getTime() / 1000);
+  // When from/to are date-only strings (e.g. "2026-03-27"), both resolve to
+  // midnight UTC → period1===period2 → Yahoo returns nothing. Bump toEpoch to
+  // cover the full day (end-of-day + buffer for IST offset).
+  if (toEpoch <= fromEpoch) toEpoch = fromEpoch + 24 * 60 * 60;
 
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}` +
     `?period1=${fromEpoch}&period2=${toEpoch}&interval=${yahooInterval}`;

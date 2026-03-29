@@ -4,6 +4,11 @@ import { isMarketOpen } from './market-hours.js';
 
 const log = createLogger('tick-feed');
 
+// Simulator mode: if SIM_URL is set, connect to the local simulator WS.
+// Normalise: strip any http:// the user may have typed — we add ws:// ourselves.
+const _simHostRaw = (process.env.SIM_URL || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
+const SIM_URL = _simHostRaw ? `ws://${_simHostRaw}/ws` : null;
+
 /**
  * Real-time market data tick feed via Kite WebSocket.
  *
@@ -119,6 +124,13 @@ export class TickFeed extends EventEmitter {
     this._shouldRun = true;
     log.info('Tick feed starting...');
 
+    // SIM mode: skip market-hours check — simulator runs any time
+    if (SIM_URL) {
+      log.info({ simWs: SIM_URL }, 'Tick feed in SIMULATOR mode — connecting immediately');
+      this._connect();
+      return;
+    }
+
     if (this.respectMarketHours && !isMarketOpen()) {
       log.info('Market is closed — tick feed will wait for market hours');
       return;
@@ -157,8 +169,14 @@ export class TickFeed extends EventEmitter {
       // Use dynamic import to handle ws module
       const { default: WebSocket } = await import('ws');
 
-      const wsUrl = `wss://ws.kite.trade?api_key=${this.apiKey}&access_token=${this.accessToken}`;
+      // SIM mode: connect to local simulator instead of real Kite
+      const wsUrl = SIM_URL
+        ? SIM_URL
+        : `wss://ws.kite.trade?api_key=${this.apiKey}&access_token=${this.accessToken}`;
 
+      if (SIM_URL) {
+        log.info({ wsUrl }, 'Connecting to SIMULATOR WebSocket');
+      }
       this.ws = new WebSocket(wsUrl);
 
       this.ws.on('open', () => {

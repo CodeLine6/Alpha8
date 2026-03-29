@@ -1,5 +1,6 @@
 @import "tailwindcss";
 
+
 /* Absolute minimum globals — everything else is Tailwind utilities */
 :root {
   --accent: #6366f1;

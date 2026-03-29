@@ -305,7 +305,7 @@ function MarketOverview({ data, loading, watchlist, dynamicWatchlist, onSummaryR
     const gainers = movers?.gainers || [];
     const losers = movers?.losers || [];
 
-    const TH = 'py-2 px-3 text-left text-[10px] font-semibold uppercase tracking-widest text-slate-500 border-b border-white/5';
+    const TH = 'py-2 px-3 text-left text-[10px] font-semibold uppercase tracking-widest text-slate-500 border-b border-white/5 sticky top-0 z-10 bg-slate-900';
     const TD = 'py-2 px-3 text-sm text-slate-300';
     
     return (
@@ -511,7 +511,7 @@ function PositionsTable({ data, loading }) {
 
 
 
-    const TH = 'py-3 px-4 text-left text-[10px] font-semibold uppercase tracking-widest text-slate-500 border-b border-white/[0.06] whitespace-nowrap';
+    const TH = 'py-3 px-4 text-left text-[10px] font-semibold uppercase tracking-widest text-slate-500 border-b border-white/[0.06] whitespace-nowrap sticky top-0 z-10 bg-slate-900';
     const TD = 'py-4 px-4 text-sm text-slate-300 whitespace-nowrap';
 
     return (

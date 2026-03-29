@@ -15,18 +15,18 @@ function Badge({ color, children }) {
 }
 
 const TYPE_CONFIG = {
-    LONG_ENTRY:  { label: 'L Entry',  color: 'green'  },
-    LONG_EXIT:   { label: 'L Exit',   color: 'yellow' },
-    SHORT_ENTRY: { label: 'S Entry',  color: 'red'    },
-    SHORT_COVER: { label: 'S Cover',  color: 'blue'   },
+    LONG_ENTRY: { label: 'L Entry', color: 'green' },
+    LONG_EXIT: { label: 'L Exit', color: 'yellow' },
+    SHORT_ENTRY: { label: 'S Entry', color: 'red' },
+    SHORT_COVER: { label: 'S Cover', color: 'blue' },
 };
 
 export default function HistoryPage() {
-    const [trades,      setTrades]      = useState([]);
-    const [loading,     setLoading]     = useState(true);
-    const [activeTab,   setActiveTab]   = useState('ALL');
+    const [trades, setTrades] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [activeTab, setActiveTab] = useState('ALL');
     const [chartSymbol, setChartSymbol] = useState(null);
-    const [filters,     setFilters]     = useState({ startDate: '', endDate: '', strategy: '', symbol: '', side: '', tradeType: '' });
+    const [filters, setFilters] = useState({ startDate: '', endDate: '', strategy: '', symbol: '', side: '', tradeType: '' });
 
     const fetchTrades = useCallback(async () => {
         setLoading(true);
@@ -44,20 +44,28 @@ export default function HistoryPage() {
 
     const exportCSV = () => {
         if (!trades.length) return;
-        const hdr = ['Date','Symbol','Type','Side','Qty','Price','P&L','Capital Deployed','ROI %','Strategy','Status'];
-        const rows = trades.map(t => [t.date, t.symbol, t.tradeType ?? '', t.side, t.quantity, t.price, t.pnl, t.capitalDeployed ?? '', t.tradeRoi != null ? t.tradeRoi.toFixed(4) : '', t.strategy, t.status]);
+        const hdr = ['Date', 'Time', 'Symbol', 'Type', 'Side', 'Qty', 'Price', 'P&L', 'Capital Deployed', 'ROI %', 'Strategy', 'Status'];
+        const rows = trades.map(t => [t.date, t.timestamp ? new Date(t.timestamp).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }) : '', t.symbol, t.tradeType ?? '', t.side, t.quantity, t.price, t.pnl, t.capitalDeployed ?? '', t.tradeRoi != null ? t.tradeRoi.toFixed(4) : '', t.strategy, t.status]);
         const csv = [hdr.join(','), ...rows.map(r => r.join(','))].join('\n');
         const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(new Blob([csv], { type: 'text/csv' })), download: `alpha8-trades-${new Date().toISOString().split('T')[0]}.csv` });
         a.click();
     };
 
-    const visible = trades.filter(t => {
-        const type = t.tradeType;
-        if (filters.tradeType && type !== filters.tradeType) return false;
-        if (activeTab === 'LONG'  && type !== 'LONG_ENTRY'  && type !== 'LONG_EXIT')   return false;
-        if (activeTab === 'SHORT' && type !== 'SHORT_ENTRY' && type !== 'SHORT_COVER') return false;
-        return true;
-    });
+    const visible = trades
+        .filter(t => {
+            const type = t.tradeType;
+            if (filters.tradeType && type !== filters.tradeType) return false;
+            if (activeTab === 'LONG' && type !== 'LONG_ENTRY' && type !== 'LONG_EXIT') return false;
+            if (activeTab === 'SHORT' && type !== 'SHORT_ENTRY' && type !== 'SHORT_COVER') return false;
+            return true;
+        })
+        .sort((a, b) => {
+            // Oldest first so entries always appear above their covers
+            const ta = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+            const tb = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+            return ta - tb;
+        })
+        .reverse();
 
     const INP = 'w-full rounded-xl border border-white/[0.08] bg-[#0d1117] px-3 py-2 text-sm text-slate-200 placeholder-slate-600 focus:border-indigo-500/50 focus:ring-1 focus:ring-indigo-500/20 outline-none transition';
     const TABS = ['ALL', 'LONG', 'SHORT'];
@@ -92,7 +100,7 @@ export default function HistoryPage() {
                 <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
                     {[
                         { label: 'Start Date', key: 'startDate', type: 'date' },
-                        { label: 'End Date',   key: 'endDate',   type: 'date' },
+                        { label: 'End Date', key: 'endDate', type: 'date' },
                     ].map(({ label, key, type }) => (
                         <div key={key}>
                             <label className="block text-[10px] font-semibold uppercase tracking-widest text-slate-500 mb-1.5">{label}</label>
@@ -103,7 +111,7 @@ export default function HistoryPage() {
                         <label className="block text-[10px] font-semibold uppercase tracking-widest text-slate-500 mb-1.5">Strategy</label>
                         <select className={INP} value={filters.strategy} onChange={e => setFilters(f => ({ ...f, strategy: e.target.value }))}>
                             <option value="">All</option>
-                            {['EMA_CROSSOVER','RSI_MEAN_REVERSION','VWAP_MOMENTUM','BREAKOUT_VOLUME','ORB','BAVI'].map(s => <option key={s} value={s}>{s}</option>)}
+                            {['EMA_CROSSOVER', 'RSI_MEAN_REVERSION', 'VWAP_MOMENTUM', 'BREAKOUT_VOLUME', 'ORB', 'BAVI'].map(s => <option key={s} value={s}>{s}</option>)}
                         </select>
                     </div>
                     <div>
@@ -134,7 +142,7 @@ export default function HistoryPage() {
                             <h2 className="text-xl font-bold text-white">{chartSymbol.symbol}</h2>
                             <button onClick={() => setChartSymbol(null)} className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-sm text-slate-400 hover:text-white transition">✕</button>
                         </div>
-                        <TradingChart symbol={chartSymbol.symbol} trades={chartSymbol.trades} endDate={chartSymbol.endDate} />
+                        <TradingChart symbol={chartSymbol.symbol} trades={chartSymbol.trades} endDate={chartSymbol.endDate} isLive={chartSymbol.isLive} />
                     </div>
                 </div>
             )}
@@ -143,14 +151,14 @@ export default function HistoryPage() {
             <ErrorBoundary>
                 <div className={`${CARD} overflow-hidden`}>
                     {loading ? (
-                        <div className="p-6 space-y-2">{[1,2,3,4,5].map(i => <div key={i} className="h-10 rounded-xl bg-white/[0.04] animate-pulse" />)}</div>
+                        <div className="p-6 space-y-2">{[1, 2, 3, 4, 5].map(i => <div key={i} className="h-10 rounded-xl bg-white/[0.04] animate-pulse" />)}</div>
                     ) : visible.length === 0 ? (
                         <div className="py-16 text-center"><p className="text-3xl mb-3">📭</p><p className="text-sm text-slate-500">No trades found</p></div>
                     ) : (
                         <div className="overflow-x-auto">
                             <table className="w-full border-collapse">
                                 <thead>
-                                    <tr>{['Date','Symbol','Type','Qty','Price','P&L','Deployed','ROI','Strategy','Status','Chart'].map(h => <th key={h} className={TH}>{h}</th>)}</tr>
+                                    <tr>{['Date', 'Symbol', 'Type', 'Qty', 'Price', 'P&L', 'Deployed', 'ROI', 'Strategy', 'Status', 'Chart'].map(h => <th key={h} className={TH}>{h}</th>)}</tr>
                                 </thead>
                                 <tbody>
                                     {visible.map((tr, i) => {
@@ -158,7 +166,10 @@ export default function HistoryPage() {
                                         const statusColor = { FILLED: 'green', REJECTED: 'red' }[tr.status] ?? 'yellow';
                                         return (
                                             <tr key={i} className="border-b border-white/[0.04] hover:bg-white/[0.025] transition-colors">
-                                                <td className={`${TD} tabular-nums`}>{tr.date}</td>
+                                                <td className={`${TD} tabular-nums`}>
+                                                    <div>{tr.date}</div>
+                                                    {tr.timestamp && <div className="text-[11px] text-slate-500 mt-0.5">{new Date(tr.timestamp).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })}</div>}
+                                                </td>
                                                 <td className={`${TD} font-semibold text-white`}>{tr.symbol}</td>
                                                 <td className={TD}><Badge color={tc.color}>{tc.label}</Badge></td>
                                                 <td className={`${TD} tabular-nums`}>{tr.quantity}</td>
@@ -172,9 +183,12 @@ export default function HistoryPage() {
                                                 <td className={TD}><Badge color={statusColor}>{tr.status}</Badge></td>
                                                 <td className={TD}>
                                                     <button onClick={() => {
-                                                        const t0 = tr.timestamp ? new Date(tr.timestamp).getTime() : new Date(tr.date.split('/').reverse().join('-')).getTime();
-                                                        const endD = new Date(t0 + 86400000).toISOString().split('T')[0];
-                                                        setChartSymbol({ symbol: tr.symbol, trades: trades.filter(t => t.symbol === tr.symbol && t.date === tr.date), endDate: endD });
+                                                        const tradeDate = tr.timestamp
+                                                            ? new Date(tr.timestamp).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })
+                                                            : undefined;
+                                                        const todayIST = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+                                                        const isToday = tradeDate === todayIST;
+                                                        setChartSymbol({ symbol: tr.symbol, trades: trades.filter(t => t.symbol === tr.symbol && t.date === tr.date), endDate: isToday ? undefined : tradeDate, isLive: isToday });
                                                     }} className="rounded-lg border border-blue-500/20 bg-blue-500/10 px-3 py-1 text-xs font-medium text-blue-400 hover:bg-blue-500/20 transition">
                                                         📈 Chart
                                                     </button>

@@ -16,7 +16,7 @@ const CATEGORY_META = {
     scout:     { label: 'Nightly Symbol Scout',      icon: '🔍' },
 };
 
-const TH = 'py-3 px-4 text-left text-[10px] font-semibold uppercase tracking-widest text-slate-500 border-b border-slate-700/40 whitespace-nowrap';
+const TH = 'py-3 px-4 text-left text-[10px] font-semibold uppercase tracking-widest text-slate-500 border-b border-slate-700/40 whitespace-nowrap sticky top-0 z-10 bg-slate-900';
 const TD = 'py-3 px-4 text-sm align-top';
 const INP_CLS = 'w-[110px] rounded-xl border border-slate-600/40 bg-slate-950 px-2.5 py-1.5 text-sm text-slate-200 outline-none focus:border-indigo-500/50 focus:ring-1 focus:ring-indigo-500/20 transition disabled:opacity-40';
 

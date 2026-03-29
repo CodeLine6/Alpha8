@@ -11,6 +11,16 @@ import { createLogger } from '../lib/logger.js';
 const log = createLogger('market-hours');
 
 /**
+ * Returns true when Alpha8 is running against the local simulator
+ * (SIM_URL env var is set). Used to bypass market-hours guards
+ * so strategies run freely on weekends.
+ * @returns {boolean}
+ */
+export function isSimMode() {
+  return !!process.env.SIM_URL;
+}
+
+/**
  * Market hours and holiday utility for NSE/BSE.
  *
  * All time checks are performed in IST (Asia/Kolkata) regardless of
@@ -97,6 +107,10 @@ export function isTradingDay(now = new Date()) {
  * @returns {boolean}
  */
 export function isMarketOpen(now = new Date()) {
+  // In SIM mode the clock is always "open" — the session timer in the
+  // simulator controls session start/end instead.
+  if (isSimMode()) return true;
+
   if (!isTradingDay(now)) return false;
 
   const { hours, minutes } = getISTTime(now);

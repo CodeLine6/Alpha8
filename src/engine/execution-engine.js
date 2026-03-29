@@ -86,6 +86,14 @@ export class ExecutionEngine {
      */
     this._recentlyExited = new Set();
 
+    /**
+     * Per-symbol last entry timestamp (ms). Prevents back-to-back entries
+     * within one candle interval (5 min) — ensures signals respect the
+     * 5-minute scan cadence and don't re-enter on the very next tick.
+     * @type {Map<string, number>}
+     */
+    this._lastEntryMs = new Map();
+
     this._initialized = false;
 
     log.info({
@@ -323,6 +331,16 @@ export class ExecutionEngine {
       return { action: 'HOLD', order: null, consensus: null };
     }
 
+    // Entry cooldown: prevent re-entry within 5 minutes of last entry order.
+    // Ensures signals cannot fire more frequently than the 5-minute candle interval.
+    const ENTRY_COOLDOWN_MS = 5 * 60 * 1000;
+    const lastEntry = this._lastEntryMs.get(symbol);
+    if (lastEntry && Date.now() - lastEntry < ENTRY_COOLDOWN_MS) {
+      const remainSec = Math.ceil((ENTRY_COOLDOWN_MS - (Date.now() - lastEntry)) / 1000);
+      log.debug({ symbol, remainSec }, 'Entry cooldown active — skipping signal');
+      return { action: 'HOLD', order: null, consensus: null };
+    }
+
     const consensusResult = this.consensus.evaluate(candles, symbol);
 
     const consensusSignalId = await this._persistSignals(symbol, consensusResult, currentPrice)
@@ -463,6 +481,14 @@ export class ExecutionEngine {
       const signalId = this._pendingSignalIds.get(symbol);
       await this._markSignalActedOn(signalId, symbol, finalSignal.signal);
       this._pendingSignalIds.delete(symbol);
+
+      // Record entry timestamp for cooldown. Only entry orders (BUY or short SELL)
+      // start the cooldown — plain exits (SELL to close a long) do not.
+      const isSellEntry = finalSignal.signal === 'SELL' && consensusResult.isShortEntry === true;
+      if (finalSignal.signal === 'BUY' || isSellEntry) {
+        this._lastEntryMs.set(symbol, Date.now());
+        log.debug({ symbol, signal: finalSignal.signal }, 'Entry cooldown started');
+      }
     }
 
     if (this.shadowRecorder) {

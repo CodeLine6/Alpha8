@@ -7,6 +7,41 @@ const { KiteConnect } = require('kiteconnect');
 
 const log = createLogger('kite-client');
 
+// ─── Simulator Mode ─────────────────────────────────────────────────────────
+// When SIM_URL is set the client routes ALL REST calls to the local simulator
+// server instead of the real Kite Connect API.
+// Normalise: strip any http:// prefix the user may have included in the env var
+// (code always adds http:// itself, so double-prefix causes all calls to fail).
+const _simRaw = (process.env.SIM_URL || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
+const SIM_URL = _simRaw ? `http://${_simRaw}` : null;
+
+/**
+ * Minimal HTTP adapter used in SIM mode to call the simulator REST endpoints.
+ * Returns data in the same shape as the real KiteConnect SDK.
+ * @private
+ */
+async function simGet(path, params = {}) {
+  const { default: axios } = await import('axios');
+  const qs = Object.keys(params).length
+    ? '?' + new URLSearchParams(params).toString()
+    : '';
+  const res = await axios.get(`${SIM_URL}${path}${qs}`, { timeout: 10000 });
+  // Simulator wraps responses in { status, data } — unwrap for callers
+  return res.data?.data ?? res.data;
+}
+
+async function simPost(path, body = {}) {
+  const { default: axios } = await import('axios');
+  const res = await axios.post(`${SIM_URL}${path}`, body, { timeout: 10000 });
+  return res.data?.data ?? res.data;
+}
+
+async function simDelete(path) {
+  const { default: axios } = await import('axios');
+  const res = await axios.delete(`${SIM_URL}${path}`, { timeout: 10000 });
+  return res.data?.data ?? res.data;
+}
+
 /**
  * Zerodha Kite Connect API client wrapper.
  *
@@ -33,16 +68,23 @@ export class KiteClient {
     this.apiSecret = apiSecret;
     this.name = 'kite';
 
-    this.kite = new KiteConnect({ api_key: apiKey });
-    this.kite.setAccessToken(accessToken);
-
-    this.breaker = new CircuitBreaker('kite-api', {
-      failureThreshold: 5,
-      cooldownMs: 30000,
-      timeoutMs: 15000,
-    });
-
-    log.info('Kite Connect client initialized');
+    if (SIM_URL) {
+      // Simulator mode — no real KiteConnect instance needed
+      this.kite = null;
+      this.breaker = new CircuitBreaker('kite-api-sim', {
+        failureThreshold: 99, cooldownMs: 1000, timeoutMs: 30000,
+      });
+      log.info({ simUrl: SIM_URL }, 'KiteClient in SIMULATOR mode — all calls routed to sim server');
+    } else {
+      this.kite = new KiteConnect({ api_key: apiKey });
+      this.kite.setAccessToken(accessToken);
+      this.breaker = new CircuitBreaker('kite-api', {
+        failureThreshold: 5,
+        cooldownMs: 30000,
+        timeoutMs: 15000,
+      });
+      log.info('Kite Connect client initialized');
+    }
   }
 
   // ─── Authentication ─────────────────────────────────────
@@ -74,7 +116,7 @@ export class KiteClient {
    * @param {string} accessToken
    */
   setAccessToken(accessToken) {
-    this.kite.setAccessToken(accessToken);
+    if (this.kite) this.kite.setAccessToken(accessToken);
     log.info('Kite access token updated');
   }
 
@@ -95,6 +137,11 @@ export class KiteClient {
    * @returns {Promise<Object>} Order response with order_id
    */
   async placeOrder(params) {
+    if (SIM_URL) {
+      log.info({ params }, '[SIM] Placing paper order');
+      const data = await simPost('/orders/regular', params);
+      return { order_id: data.order_id };
+    }
     return this.breaker.execute(async () => {
       log.info({ params }, 'Placing Kite order');
       const response = await this.kite.placeOrder('regular', {
@@ -118,6 +165,10 @@ export class KiteClient {
    * ONLY for use in stop-loss / force-exit paths.
    */
   async placeEmergencyOrder(params) {
+    if (SIM_URL) {
+      const data = await simPost('/orders/regular', params);
+      return { order_id: data.order_id };
+    }
     return this.breaker.execute(async () => {
       log.info({ params }, 'Placing emergency Kite order (circuit bypass)');
       const response = await this.kite.placeOrder('regular', {
@@ -155,6 +206,7 @@ export class KiteClient {
    * @returns {Promise<Object>}
    */
   async cancelOrder(orderId) {
+    if (SIM_URL) return simDelete(`/orders/regular/${orderId}`);
     return this.breaker.execute(async () => {
       log.info({ orderId }, 'Cancelling Kite order');
       return this.kite.cancelOrder('regular', orderId);
@@ -166,6 +218,7 @@ export class KiteClient {
    * @returns {Promise<Object[]>} Array of order objects
    */
   async getOrders() {
+    if (SIM_URL) return simGet('/orders');
     return this.breaker.execute(() => this.kite.getOrders());
   }
 
@@ -185,6 +238,7 @@ export class KiteClient {
    * @returns {Promise<{ day: Object[], net: Object[] }>}
    */
   async getPositions() {
+    if (SIM_URL) return simGet('/portfolio/positions');
     return this.breaker.execute(() => this.kite.getPositions());
   }
 
@@ -193,6 +247,7 @@ export class KiteClient {
    * @returns {Promise<Object[]>}
    */
   async getHoldings() {
+    if (SIM_URL) return simGet('/portfolio/holdings');
     return this.breaker.execute(() => this.kite.getHoldings());
   }
 
@@ -204,6 +259,16 @@ export class KiteClient {
    * @returns {Promise<Object>} Quotes keyed by instrument
    */
   async getQuote(instruments) {
+    if (SIM_URL) {
+      const qParams = [].concat(instruments).reduce((acc, inst, i) =>
+        ({ ...acc, [`i`]: inst }), {});
+      // Build as repeated query params
+      const { default: axios } = await import('axios');
+      const url = `${SIM_URL}/quote?` +
+        [].concat(instruments).map(i => `i=${encodeURIComponent(i)}`).join('&');
+      const res = await axios.get(url, { timeout: 10000 });
+      return res.data?.data ?? res.data;
+    }
     return this.breaker.execute(async () => {
       const raw = await Promise.resolve(this.kite.getQuote(instruments));
       // M2 FIX: KiteConnect v3 wraps response in { data: {...} }
@@ -225,6 +290,13 @@ export class KiteClient {
    * M2 FIX: normalise both shapes to always return the instrument-keyed object.
    */
   async getLTP(instruments) {
+    if (SIM_URL) {
+      const { default: axios } = await import('axios');
+      const url = `${SIM_URL}/ltp?` +
+        [].concat(instruments).map(i => `i=${encodeURIComponent(i)}`).join('&');
+      const res = await axios.get(url, { timeout: 10000 });
+      return res.data?.data ?? res.data;
+    }
     return this.breaker.execute(async () => {
       const raw = await Promise.resolve(this.kite.getLTP(instruments));
       // M2 FIX: KiteConnect v3 wraps response in { data: {...} }
@@ -257,6 +329,9 @@ export class KiteClient {
    * @returns {Promise<Object>} Historical OHLCV candles
    */
   async getHistoricalData(instrumentToken, interval, from, to, continuous = false) {
+    if (SIM_URL) {
+      return simGet(`/historical/${instrumentToken}`, { interval, from, to });
+    }
     return this.breaker.execute(() =>
       this.kite.getHistoricalData(instrumentToken, interval, from, to, continuous)
     );
@@ -270,6 +345,7 @@ export class KiteClient {
    * @returns {Promise<Object[]>}
    */
   async getInstruments(exchange) {
+    if (SIM_URL) return simGet('/instruments');
     return this.breaker.execute(() => this.kite.getInstruments(exchange));
   }
 
@@ -280,6 +356,7 @@ export class KiteClient {
    * @returns {Promise<Object>}
    */
   async getProfile() {
+    if (SIM_URL) return simGet('/user/profile');
     return this.breaker.execute(() => this.kite.getProfile());
   }
 
@@ -288,6 +365,7 @@ export class KiteClient {
    * @returns {Promise<Object>}
    */
   async getMargins() {
+    if (SIM_URL) return simGet('/user/margins');
     return this.breaker.execute(() => this.kite.getMargins());
   }
 

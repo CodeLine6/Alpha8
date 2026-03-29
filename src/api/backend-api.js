@@ -1512,23 +1512,58 @@ export function createApiHandler(deps) {
       if (endDateStr && !toDate.toISOString().includes('T23')) {
           toDate.setHours(23, 59, 59, 999);
       }
-      
-      const fromDate = new Date(toDate);
-      fromDate.setDate(toDate.getDate() - days);
 
-      const fmt = d => d.toISOString().split('T')[0];
+      // Never request candles beyond the current moment.
+      // This ensures history charts in sim mode only show elapsed session data,
+      // and the cache key reflects the current 5-minute bucket so stale
+      // full-session results don't persist in Redis.
+      const now = Date.now();
+      if (toDate.getTime() > now) {
+        // Round down to nearest 5-min bucket so cache is still useful
+        const bucket5m = Math.floor(now / 300_000) * 300_000;
+        toDate.setTime(bucket5m);
+      }
 
-      // Use broker if available to fetch intraday data securely
+      // startDate overrides the days-back calculation (used by live chart for today-only view)
+      let fromDate;
+      if (params.startDate) {
+        fromDate = new Date(params.startDate);
+      } else {
+        fromDate = new Date(toDate);
+        fromDate.setDate(toDate.getDate() - days);
+      }
+
+      const fmtDate = d => d.toISOString().split('T')[0];
+
+      // In sim mode, past-date history charts should prefer real market data
+      // (Yahoo Finance) over the simulator's shifted/GBM candles.
+      // If Yahoo has no data for the symbol, fall back to the sim broker.
       const instrumentToken = instrumentManager ? instrumentManager.getToken(symbol.toUpperCase()) : null;
+      const isSimBroker = SIMULATE_MODE || !!process.env.SIM_URL;
+      const istToday = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+      const requestIsToday = fmtDate(fromDate) >= istToday;
+      const preferYahoo = isSimBroker && !requestIsToday;
 
-      const candles = await fetchHistoricalData({
-        broker,
-        symbol: symbol.toUpperCase(),
-        instrumentToken, 
-        interval,
-        from: fmt(fromDate),
-        to: fmt(toDate),
-      });
+      let candles;
+      if (preferYahoo) {
+        // Try Yahoo Finance first (real market data) — no broker
+        candles = await fetchHistoricalData({
+          broker: null, symbol: symbol.toUpperCase(), instrumentToken: null,
+          interval, from: fmtDate(fromDate), to: fmtDate(toDate),
+        });
+        // Fall back to sim broker if Yahoo had nothing for this symbol
+        if (!candles || candles.length === 0) {
+          candles = await fetchHistoricalData({
+            broker, symbol: symbol.toUpperCase(), instrumentToken,
+            interval, from: fmtDate(fromDate), to: fmtDate(toDate),
+          });
+        }
+      } else {
+        candles = await fetchHistoricalData({
+          broker, symbol: symbol.toUpperCase(), instrumentToken,
+          interval, from: fmtDate(fromDate), to: fmtDate(toDate),
+        });
+      }
 
       if (!candles || candles.length === 0) {
         return json(res, { candles: [] });

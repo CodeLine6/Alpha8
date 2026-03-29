@@ -6,7 +6,7 @@ import ErrorBoundary from '@/components/ErrorBoundary';
 import { formatINR, pnlColor, formatPct, API_BASE } from '@/lib/utils';
 
 const CARD = 'rounded-2xl border border-slate-700/50 bg-slate-900';
-const TH = 'py-3 px-4 text-left text-[10px] font-semibold uppercase tracking-widest text-slate-500 border-b border-slate-700/40 whitespace-nowrap';
+const TH = 'py-3 px-4 text-left text-[10px] font-semibold uppercase tracking-widest text-slate-500 border-b border-slate-700/40 whitespace-nowrap sticky top-0 z-10 bg-slate-900';
 const TD = 'py-4 px-4 text-sm text-slate-300 whitespace-nowrap';
 
 function Badge({ color, children }) {

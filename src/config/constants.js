@@ -10,7 +10,7 @@ export const TIMEZONE = 'Asia/Kolkata';
 
 // ─── Market Hours ───────────────────────────────────────
 /** Market open time (HH:MM in IST) */
-export const MARKET_OPEN = '09:15';
+export const MARKET_OPEN = '00:15';
 
 /** Market close time (HH:MM in IST) */
 export const MARKET_CLOSE = '15:30';
@@ -54,7 +54,7 @@ export const STRATEGY = Object.freeze({
   RSI_MEAN_REVERSION: 'RSI_MEAN_REVERSION',
   VWAP_MOMENTUM: 'VWAP_MOMENTUM',
   BREAKOUT_VOLUME: 'BREAKOUT_VOLUME',
-  ORB:  'ORB',
+  ORB: 'ORB',
   BAVI: 'BAVI',
 });
 
@@ -117,22 +117,22 @@ export const REGIME_WARN_RATIO = 1.3;
 
 // ─── Opening Range Breakout (ORB) ────────────────────────
 /** Number of 5-minute candles in the opening range window (6 × 5min = 30min) */
-export const ORB_WINDOW_CANDLES    = 6;
+export const ORB_WINDOW_CANDLES = 6;
 /** Minimum OR range as % of midpoint price */
-export const ORB_MIN_RANGE_PCT     = 0.30;
+export const ORB_MIN_RANGE_PCT = 0.30;
 /** Maximum OR range as % of midpoint price */
-export const ORB_MAX_RANGE_PCT     = 3.00;
+export const ORB_MAX_RANGE_PCT = 3.00;
 /** Breakout candle volume must be this multiple of the prior 10-candle average */
 export const ORB_VOLUME_MULTIPLIER = 1.5;
 /** No ORB signals generated after this IST hour (14 = 2:00 PM) */
-export const ORB_LAST_SIGNAL_HOUR  = 14;
+export const ORB_LAST_SIGNAL_HOUR = 14;
 
 // ─── Bid-Ask Volume Imbalance (BAVI) ─────────────────────
 /** Rolling tick buffer size used by BAVI */
-export const BAVI_TICK_WINDOW          = 200;
+export const BAVI_TICK_WINDOW = 200;
 /** Net imbalance fraction required for a signal (|buyer_vol - seller_vol| / total_vol) */
-export const BAVI_IMBALANCE_THRESHOLD  = 0.35;
+export const BAVI_IMBALANCE_THRESHOLD = 0.35;
 /** Imbalance fraction considered 'strong' (confidence bonus) */
-export const BAVI_STRONG_IMBALANCE     = 0.50;
+export const BAVI_STRONG_IMBALANCE = 0.50;
 /** Minimum number of ticks in the buffer before BAVI considers its reading reliable */
-export const BAVI_MIN_TICK_COUNT       = 50;
+export const BAVI_MIN_TICK_COUNT = 50;

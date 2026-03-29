@@ -169,7 +169,8 @@ async function main() {
       accessToken = raw ? decryptToken(raw) : null;
     }
 
-    if (accessToken && config.KITE_API_KEY && config.KITE_API_KEY !== 'dev_placeholder') {
+    const simMode = !!process.env.SIM_URL;
+    if (simMode || (accessToken && config.KITE_API_KEY && config.KITE_API_KEY !== 'dev_placeholder')) {
       kiteClient = new KiteClient({
         apiKey: config.KITE_API_KEY,
         apiSecret: config.KITE_API_SECRET,
@@ -183,7 +184,11 @@ async function main() {
         const profile = await kiteClient.getProfile();
         log.info({ user: profile.user_name, userId: profile.user_id }, '✅ Broker token verified');
       } catch (err) {
-        log.warn({ err: err.message }, '⚠️  Broker token may be expired — run: npm run login');
+        if (simMode) {
+          log.warn({ err: err.message }, '⚠️  Simulator profile check failed — is the simulator running?');
+        } else {
+          log.warn({ err: err.message }, '⚠️  Broker token may be expired — run: npm run login');
+        }
         broker = null;
         kiteClient = null;
       }
@@ -223,7 +228,7 @@ async function main() {
 
   // ─── Initialize Tick Feed ──────────────────────────────
   let tickFeed = null;
-  if (broker && accessToken) {
+  if (broker && (accessToken || process.env.SIM_URL)) {
     try {
       tickFeed = new TickFeed({
         apiKey: config.KITE_API_KEY,
@@ -266,6 +271,50 @@ async function main() {
     });
     log.info('✅ Tick classifier + rolling buffer wired into tick feed');
   }
+
+  // ─── Tick Buffer Persistence (Redis snapshot) ───────────
+  // Restores tick history on mid-day restarts so BAVI doesn't
+  // start with 0 ticks. Snapshot is keyed by date — stale
+  // cross-day snapshots are automatically rejected by loadSnapshot().
+  const TICK_BUF_KEY = 'tick_buf_snapshot';
+  const TICK_BUF_TTL = 8 * 3600; // 8 hours — safely expires overnight
+
+  if (redisHealthy) {
+    // Restore from previous snapshot (if same trading day)
+    try {
+      const snapshot = await cacheGet(TICK_BUF_KEY);
+      const restoredCount = rollingTickBuf.loadSnapshot(snapshot);
+      if (restoredCount > 0) {
+        log.info({ symbols: restoredCount },
+          `✅ Tick buffer restored from Redis snapshot — BAVI ready immediately`);
+      } else {
+        log.info('ℹ️  No same-day tick buffer snapshot found — BAVI will warm up from live ticks');
+      }
+    } catch (err) {
+      log.warn({ err: err.message }, 'Tick buffer restore failed — starting fresh');
+    }
+
+    // Periodic save: every 60 s, non-blocking
+    const tickBufSnapshotInterval = setInterval(async () => {
+      try {
+        await cacheSet(TICK_BUF_KEY, rollingTickBuf.toSnapshot(), TICK_BUF_TTL);
+      } catch (err) {
+        log.warn({ err: err.message }, 'Tick buffer snapshot failed');
+      }
+    }, 60_000);
+    tickBufSnapshotInterval.unref(); // Don't block process exit
+
+    registerShutdown('tick-buf-snapshot', async () => {
+      clearInterval(tickBufSnapshotInterval);
+      try {
+        await cacheSet(TICK_BUF_KEY, rollingTickBuf.toSnapshot(), TICK_BUF_TTL);
+        log.info('Tick buffer snapshot saved on shutdown');
+      } catch (err) {
+        log.warn({ err: err.message }, 'Tick buffer snapshot on shutdown failed');
+      }
+    });
+  }
+
 
   // ─── Initialize Risk Manager ───────────────────────────
   const riskManager = new RiskManager({

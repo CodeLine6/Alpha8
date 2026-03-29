@@ -15,7 +15,9 @@
     "docker:up": "docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d",
     "docker:down": "docker compose -f docker-compose.yml -f docker-compose.dev.yml down",
     "db:init": "node scripts/setup-db.js",
-    "login": "node scripts/auto-login.js"
+    "login": "node scripts/auto-login.js",
+    "sim": "node simulator/server.js",
+    "dev:sim": "node --watch simulator/server.js"
   },
   "keywords": [
     "trading",
@@ -30,6 +32,7 @@
   "dependencies": {
     "axios": "^1.7.9",
     "dotenv": "^16.4.7",
+    "express": "^5.2.1",
     "ioredis": "^5.4.2",
     "kiteconnect": "^5.0.0",
     "node-cron": "^3.0.3",

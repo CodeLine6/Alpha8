@@ -48,7 +48,7 @@
 import cron from 'node-cron';
 import { createLogger } from '../lib/logger.js';
 import { TIMEZONE } from '../config/constants.js';
-import { isTradingDay, getMarketStatus } from '../data/market-hours.js';
+import { isTradingDay, getMarketStatus, isSimMode } from '../data/market-hours.js';
 import { executeSquareOff } from '../risk/square-off-job.js';
 
 const log = createLogger('scheduler');
@@ -194,9 +194,30 @@ export class MarketScheduler {
     log.info({ jobs: this._cronJobs.length, timezone: TIMEZONE }, 'MarketScheduler started');
 
     const status = getMarketStatus();
-    if (status.isOpen) {
-      log.info('App started mid-day during market hours — triggering market open routines');
+    if (status.isOpen || isSimMode()) {
+      // SIM mode: treat startup as market-open so scanning starts immediately.
+      // Real mode: handle mid-day restarts.
+      log.info(isSimMode()
+        ? 'SIM mode — triggering market-open routines and enabling scanning immediately'
+        : 'App started mid-day during market hours — triggering market open routines'
+      );
       this._runJob('market-open', () => this._marketOpen());
+    }
+
+    // SIM mode: The normal cron jobs are scoped to Mon–Fri (1-5) and won't fire
+    // on weekends at all. Run a dedicated setInterval to fire _strategyScan
+    // every 5 minutes for the duration of the simulator session.
+    if (isSimMode()) {
+      const SIM_SCAN_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
+      this._simScanInterval = setInterval(() => {
+        this._runJob('strategy-scan', () => this._strategyScan());
+      }, SIM_SCAN_INTERVAL_MS);
+      // Also fire first scan 30s after startup (let tick-feed connect first)
+      this._simFirstScanTimeout = setTimeout(() => {
+        log.info('[SIM] Running first strategy scan (30s after startup)');
+        this._runJob('strategy-scan', () => this._strategyScan());
+      }, 30_000);
+      log.info(`[SIM] Strategy scan interval started: every ${SIM_SCAN_INTERVAL_MS / 60000} min`);
     }
   }
 
@@ -204,6 +225,8 @@ export class MarketScheduler {
     for (const job of this._cronJobs) job.stop();
     this._cronJobs = [];
     this._scanning = false;
+    if (this._simScanInterval)     { clearInterval(this._simScanInterval); this._simScanInterval = null; }
+    if (this._simFirstScanTimeout) { clearTimeout(this._simFirstScanTimeout); this._simFirstScanTimeout = null; }
   }
 
   // ═══════════════════════════════════════════════════════
@@ -212,7 +235,8 @@ export class MarketScheduler {
 
   async _runJob(jobName, fn) {
     const nonTradingAllowed = ['weekly-maintenance', 'symbol-scout'];
-    if (!isTradingDay() && !nonTradingAllowed.includes(jobName)) {
+    // SIM mode: always allow jobs — simulator runs on weekends intentionally
+    if (!isSimMode() && !isTradingDay() && !nonTradingAllowed.includes(jobName)) {
       return { skipped: true, reason: 'not_trading_day' };
     }
 
@@ -558,20 +582,29 @@ export class MarketScheduler {
       // will be blocked from re-entry by processSignal()'s guard check.
       // clearRecentExits() for THIS cycle's entries happens at the TOP of the
       // NEXT scan cycle (Step 0 above).
-      const results = [];
-      for (const item of nonHeldItems) {
-        try {
-          const result = await this.engine.processSignal(
-            item.symbol, item.candles, item.price, item.quantity
-          );
-          results.push({ symbol: item.symbol, action: result.action });
-          if (result.action === 'EXECUTED') {
-            log.info({ symbol: item.symbol }, `🔔 Trade executed`);
+      //
+      // Run all symbols in parallel so the entire scan completes in the time of
+      // the slowest single symbol, keeping all signal timestamps within the same
+      // second. Sequential processing caused a 1-2 min spread across symbols,
+      // making the signal log look like consecutive-minute firing.
+      const settled = await Promise.allSettled(
+        nonHeldItems.map(item =>
+          this.engine.processSignal(item.symbol, item.candles, item.price, item.quantity)
+            .then(result => ({ symbol: item.symbol, action: result.action }))
+        )
+      );
+
+      const results = settled.map((s, i) => {
+        if (s.status === 'fulfilled') {
+          if (s.value.action === 'EXECUTED') {
+            log.info({ symbol: s.value.symbol }, '🔔 Trade executed');
           }
-        } catch (err) {
-          log.error({ symbol: item.symbol, err: err.message }, 'processSignal failed');
+          return s.value;
+        } else {
+          log.error({ symbol: nonHeldItems[i].symbol, err: s.reason?.message }, 'processSignal failed');
+          return { symbol: nonHeldItems[i].symbol, action: 'ERROR' };
         }
-      }
+      });
 
       return { scanned: watchlist.length, results };
 

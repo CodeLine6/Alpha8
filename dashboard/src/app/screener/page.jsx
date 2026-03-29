@@ -296,7 +296,7 @@ export default function ScreenerPage() {
                     ['ATR %',      'text-right px-3'],
                     ['',           'px-4'],
                   ].map(([label, cls]) => (
-                    <th key={label} className={`py-4 text-[10px] uppercase tracking-widest font-semibold text-gray-500 whitespace-nowrap ${cls}`}>
+                    <th key={label} className={`py-4 text-[10px] uppercase tracking-widest font-semibold text-gray-500 whitespace-nowrap sticky top-0 z-10 bg-slate-950 ${cls}`}>
                       {label}
                     </th>
                   ))}

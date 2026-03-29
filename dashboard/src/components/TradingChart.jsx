@@ -60,6 +60,7 @@ export default function TradingChart({
   const lastCandleRef = useRef(null);  // last full candle for live update
   const markerMetaRef = useRef([]);    // always-current marker metadata for tooltip
   const entryLineCreatedRef = useRef(false); // true when a trade marker created the entry price line
+  const candleTimesRef      = useRef([]);    // sorted unix-second candle times (for live re-snap)
 
   const [loading, setLoading]  = useState(true);
   const [error, setError]      = useState(null);
@@ -115,7 +116,7 @@ export default function TradingChart({
     let destroyed = false;
     priceLinesRef.current = {};
     lastCandleRef.current = null;
-    markerMetaRef.current = [];  // clear stale markers from previous symbol
+    markerMetaRef.current = [];   // clear stale markers from previous symbol
     entryLineCreatedRef.current = false;  // reset so refreshPriceLines can add fallback if needed
 
     async function init() {
@@ -123,7 +124,18 @@ export default function TradingChart({
         setLoading(true);
         setError(null);
 
-        const url = `${API_BASE}/api/candles?symbol=${symbol}&interval=${interval}&days=${days}${endDate ? `&endDate=${endDate}` : ''}`;
+        // Live chart: pin startDate to today so we only see the current session.
+        // History chart: use endDate prop so we see the session of the selected trade.
+        // Screener / other: no date pin — let `days` control the range.
+        const params = new URLSearchParams({ symbol, interval, days });
+        if (isLive) {
+          params.set('startDate', new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }));
+        } else if (endDate) {
+          // Pin both start and end to the trade's date → exactly that session's candles
+          params.set('startDate', endDate);
+          params.set('endDate', endDate);
+        }
+        const url = `${API_BASE}/api/candles?${params}`;
         const res  = await fetch(url);
         if (!res.ok) throw new Error('Failed to fetch chart data');
         const data = await res.json();
@@ -131,6 +143,17 @@ export default function TradingChart({
         if (!data.candles?.length) throw new Error('No candle data for ' + symbol);
 
         if (destroyed) return;
+
+        // IST = UTC + 5h 30m. Lightweight-charts stores timestamps as UTC seconds
+        // and always renders them as UTC. Shift by IST offset in formatters so the
+        // x-axis, crosshair, and date labels all show correct Indian Standard Time.
+        const IST_OFFSET_S = 5.5 * 3600; // 19800 seconds
+        const fmtIST = (utcSec) => {
+          const d = new Date((utcSec + IST_OFFSET_S) * 1000);
+          const hh = String(d.getUTCHours()).padStart(2, '0');
+          const mm = String(d.getUTCMinutes()).padStart(2, '0');
+          return `${hh}:${mm}`;
+        };
 
         const chart = createChart(containerRef.current, {
           layout:    { background: { color: 'transparent' }, textColor: '#9ca3af' },
@@ -140,7 +163,15 @@ export default function TradingChart({
             vertLine: { color: '#6b7280', width: 1, style: 1, labelBackgroundColor: '#374151' },
             horzLine: { color: '#6b7280', width: 1, style: 1, labelBackgroundColor: '#374151' },
           },
-          timeScale:       { timeVisible: true, secondsVisible: false, borderColor: 'rgba(55,65,81,0.6)' },
+          localization: {
+            timeFormatter: (utcSec) => fmtIST(utcSec),
+          },
+          timeScale: {
+            timeVisible: true,
+            secondsVisible: false,
+            borderColor: 'rgba(55,65,81,0.6)',
+            tickMarkFormatter: (utcSec) => fmtIST(utcSec),
+          },
           rightPriceScale: { borderColor: 'rgba(55,65,81,0.6)' },
         });
         chartRef.current  = chart;
@@ -166,14 +197,14 @@ export default function TradingChart({
 
         // Markers
         const markerMeta = [];
-        if (trades.length > 0) {
-          // Build a sorted list of candle times for snapping
-          const candleTimes = data.candles.map(c => c.time).sort((a, b) => a - b);
+        // Persist candle times so live-trade sync effect can snap new entries
+        const candleTimes = data.candles.map(c => c.time).sort((a, b) => a - b);
+        candleTimesRef.current = candleTimes;
 
+        if (trades.length > 0) {
           // Snap a raw unix-second timestamp to the nearest candle bar time
           const snapToCandle = (rawTime) => {
             if (!rawTime || candleTimes.length === 0) return candleTimes[candleTimes.length - 1] ?? rawTime;
-            // Find the candle bar that contains or immediately precedes rawTime
             let snapped = candleTimes[0];
             for (const ct of candleTimes) {
               if (ct <= rawTime) snapped = ct;
@@ -185,8 +216,9 @@ export default function TradingChart({
           const rawM = [];
           for (const t of trades) {
             const rawTime = parseTradeTime(t);
-            // Snap to the candle bar that was open at entry time
+            // Snap to the candle bar that was open at entry/exit time
             const time = rawTime > 0 ? snapToCandle(rawTime) : candleTimes[candleTimes.length - 1];
+            if (!time) continue;
 
             const cfg = TYPE_CFG[t.tradeType] ?? {
               text: t.side === 'BUY' ? 'Buy' : 'Sell',
@@ -196,37 +228,25 @@ export default function TradingChart({
 
             const lbl = t.strategy === 'PARTIAL_EXIT' ? 'P.' + cfg.text.split('.')[1] : cfg.text;
 
-            // ── Option B: Entry trades → price line at exact fill price ──────
-            // LONG_ENTRY / SHORT_ENTRY: a horizontal price line at the fill price
-            // gives pixel-perfect alignment on the axis. We still push a small
-            // directional arrow at the candle time so the time is visible.
             const isEntryTrade = t.tradeType === 'LONG_ENTRY' || t.tradeType === 'SHORT_ENTRY';
-            const fillPrice = t.entryPrice ?? t.price ?? 0;
+            const fillPrice = t.price ?? 0; // always use fill price, not entryPrice (which may be live position average)
 
             if (isEntryTrade && fillPrice > 0) {
-              // Price line at exact fill price, styled like the other level lines
+              // Price line at exact fill price — axis label shows precise entry level
               candleSeries.createPriceLine({
                 price: fillPrice,
                 color: cfg.color,
                 lineWidth: 1,
                 lineStyle: LineStyle.Solid,
                 axisLabelVisible: true,
-                title: `  ${lbl}`,   // e.g. "  L.Entry" / "  S.Entry"
+                title: `  ${lbl}`,
               });
-              entryLineCreatedRef.current = true; // suppress generic 'Entry' fallback
-              // Small arrow at the candle time — gives temporal reference without
-              // the visual price mismatch of belowBar/aboveBar circle markers
-              if (time > 0) rawM.push({
-                time,
-                trade: t,
-                color: cfg.color,
-                position: cfg.position,
-                text: '',          // no label — the price line carries the label
-                shape: t.tradeType === 'LONG_ENTRY' ? 'arrowUp' : 'arrowDown',
-              });
-            } else {
-              if (time > 0) rawM.push({ time, trade: t, ...cfg, text: lbl, shape: 'circle' });
+              entryLineCreatedRef.current = true;
             }
+
+            // All trades (entry AND exit) use the same built-in marker:
+            // circle dot at the candle + text label + crosshair infocard.
+            rawM.push({ time, trade: t, ...cfg, text: lbl, shape: 'circle' });
           }
 
           rawM.sort((a, b) => a.time - b.time);
@@ -301,7 +321,11 @@ export default function TradingChart({
 
     init();
 
-    const onResize = () => { if (chartRef.current && containerRef.current) chartRef.current.applyOptions({ width: containerRef.current.clientWidth }); };
+    const onResize = () => {
+      if (chartRef.current && containerRef.current) {
+        chartRef.current.applyOptions({ width: containerRef.current.clientWidth });
+      }
+    };
     window.addEventListener('resize', onResize);
     return () => {
       destroyed = true;
@@ -311,7 +335,7 @@ export default function TradingChart({
       candleRef.current = null;
       volRef.current = null;
     };
-  }, [symbol, interval, days, endDate]); // eslint-disable-line
+  }, [symbol, interval, days, endDate, isLive]); // eslint-disable-line
 
   // ── 3. Keep markerMeta trade data live — runs every time trades polls ──────
   // The chart useEffect only runs on symbol/interval changes (no re-init flash).
@@ -333,12 +357,62 @@ export default function TradingChart({
     }
   }, [trades]);
 
-  // ── 4. Update price lines when liveData prop changes (from parent polling) ──
+  // ── 4. Live entry marker sync — add entry markers when trades arrive via polling ─
+  // Chart init runs once on symbol change, before first poll returns data.
+  // This effect fires on every poll so entry markers appear without a chart reinit.
   useEffect(() => {
-    if (isLive && candleRef.current) refreshPriceLines(liveData);
+    if (!isLive || !trades?.length || !candleRef.current) return;
+    const times = candleTimesRef.current;
+    if (!times.length) return;
+
+    const snapToCandle = (rawTime) => {
+      if (!rawTime) return times[times.length - 1];
+      let snapped = times[0];
+      for (const ct of times) { if (ct <= rawTime) snapped = ct; else break; }
+      return snapped;
+    };
+
+    // Rebuild full marker list from all current trade objects
+    const newRaw = [];
+    for (const t of trades) {
+      const rawTime = parseTradeTime(t);
+      const time = rawTime > 0 ? snapToCandle(rawTime) : times[times.length - 1];
+      if (!time) continue;
+      const cfg = TYPE_CFG[t.tradeType] ?? {
+        text: t.side === 'BUY' ? 'Buy' : 'Sell',
+        color: t.side === 'BUY' ? '#10b981' : '#ef4444',
+        position: t.side === 'BUY' ? 'belowBar' : 'aboveBar',
+      };
+      const lbl = cfg.text;
+      const isEntry = t.tradeType === 'LONG_ENTRY' || t.tradeType === 'SHORT_ENTRY';
+      const fillPrice = t.price ?? 0;
+      if (isEntry && fillPrice > 0 && !entryLineCreatedRef.current) {
+        try {
+          candleRef.current.createPriceLine({
+            price: fillPrice, color: cfg.color, lineWidth: 1,
+            lineStyle: LineStyle.Solid, axisLabelVisible: true, title: `  ${lbl}`,
+          });
+          entryLineCreatedRef.current = true;
+        } catch { /**/ }
+      }
+      newRaw.push({ time, trade: t, ...cfg, text: lbl, shape: 'circle' });
+    }
+
+    newRaw.sort((a, b) => a.time - b.time);
+    let lastT = 0;
+    for (const m of newRaw) { if (m.time <= lastT) m.time = lastT + 1; lastT = m.time; }
+
+    candleRef.current.setMarkers(newRaw.map(({ trade: _, ...rest }) => rest));
+    markerMetaRef.current = newRaw.map(m => ({ time: m.time, trade: m.trade, color: m.color, position: m.position }));
+  }, [trades, isLive]);
+
+  // ── 5. Update price lines when liveData prop changes (from parent polling) ──
+  useEffect(() => {
+    if (!isLive || !candleRef.current) return;
+    refreshPriceLines(liveData);
   }, [isLive, liveData, refreshPriceLines]);
 
-  // ── 4. Real-time last-candle update via /api/live-price polling ────────────
+  // ── 6. Real-time last-candle update via /api/live-price polling ────────────
   useEffect(() => {
     if (!isLive || !symbol) return;
 
