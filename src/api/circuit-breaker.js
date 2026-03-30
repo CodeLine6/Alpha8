@@ -88,7 +88,16 @@ export class CircuitBreaker {
       this._onSuccess();
       return result;
     } catch (err) {
-      this._onFailure(err);
+      const msg = (err.message || '').toLowerCase();
+      const isTokenErr = msg.includes('token') || msg.includes('session') ||
+        msg.includes('unauthorized') ||
+        (err.response && (err.response.status === 403 || err.response.status === 401));
+      
+      // Token errors are client config issues, not API availability issues.
+      // Do not trip the circuit breaker for them.
+      if (!isTokenErr) {
+        this._onFailure(err);
+      }
       throw err;
     }
   }

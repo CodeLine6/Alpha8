@@ -323,7 +323,11 @@ export class BrokerManager {
    */
   async isTokenValid() {
     try {
-      const profile = await this.primary.getProfile();
+      const profile = await this._executeWithFallback(
+        'isTokenValid',
+        (primary) => primary.getProfile(),
+        null
+      );
       return !!(profile?.user_id || profile?.user_name);
     } catch (err) {
       const msg = (err.message || '').toLowerCase();
