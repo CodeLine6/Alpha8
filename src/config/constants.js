@@ -10,7 +10,7 @@ export const TIMEZONE = 'Asia/Kolkata';
 
 // ─── Market Hours ───────────────────────────────────────
 /** Market open time (HH:MM in IST) */
-export const MARKET_OPEN = '00:15';
+export const MARKET_OPEN = '09:15';
 
 /** Market close time (HH:MM in IST) */
 export const MARKET_CLOSE = '15:30';
