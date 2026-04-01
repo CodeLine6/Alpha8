@@ -266,10 +266,89 @@ async function main() {
         engine.positionManager.evaluateTick(symbol, tick);
       }
 
+      // ══════════════════════════════════════════════════════════════════════
+      // UNCONDITIONAL PEAK PnL TRACKING — directly in tick handler
+      // No guards, no branching, no position manager dependency.
+      // If this symbol has an open position, compute peak and write Redis.
+      // ══════════════════════════════════════════════════════════════════════
+      if (engine && engine._filledPositions) {
+        const posCtx = engine._filledPositions.get(symbol);
+        if (posCtx) {
+          const ltp = tick.ltp || tick.lastPrice || 0;
+          if (ltp > 0) {
+            const isShort = posCtx.isShort ?? posCtx.direction === 'SELL';
+            const entry = posCtx.entryPrice ?? posCtx.price;
+            if (entry && posCtx.quantity) {
+              const pnl = isShort
+                ? (entry - ltp) * posCtx.quantity
+                : (ltp - entry) * posCtx.quantity;
+              const peak = posCtx.peakUnrealizedPnl ?? 0;
+              if (pnl > peak) {
+                posCtx.peakUnrealizedPnl = pnl;
+                posCtx.peakPnlAt = Date.now();
+                // Write to Redis immediately — fire and forget
+                getRedis().hset(`trail:${symbol}`,
+                  'peakUnrealizedPnl', String(pnl),
+                  'pnlTrailStop', String(posCtx.pnlTrailStop ?? -Infinity)
+                ).catch(() => {});
+              }
+            }
+          }
+        }
+      }
+
       const classified = tickClassifier.classify(symbol, tick);
       rollingTickBuf.push(symbol, classified);
     });
     log.info('✅ Tick classifier + rolling buffer wired into tick feed');
+
+    // ── DIAGNOSTIC + SECONDARY PEAK SYNC (every 30s) ──────────────────────
+    // If tick handler doesn't match position symbols, this catches it.
+    // Also logs diagnostic info to debug symbol mismatches.
+    setInterval(() => {
+      if (!engine?._filledPositions || engine._filledPositions.size === 0) return;
+      if (!tickFeed?.latestTicks || !tickFeed?.symbolMap) return;
+
+      // Build inverted map: symbol → token
+      const inv = {};
+      for (const [tok, sym] of Object.entries(tickFeed.symbolMap)) inv[sym] = tok;
+
+      for (const [symbol, posCtx] of engine._filledPositions) {
+        const tokenStr = inv[symbol];
+        const tick = tokenStr
+          ? (tickFeed.latestTicks.get(Number(tokenStr)) || tickFeed.latestTicks.get(tokenStr))
+          : null;
+        const ltp = tick?.ltp || 0;
+
+        if (ltp <= 0) {
+          log.warn({ symbol, inSymbolMap: !!tokenStr, token: tokenStr || 'MISSING',
+            positionKeys: Array.from(engine._filledPositions.keys()),
+            symbolMapSample: Object.values(tickFeed.symbolMap).slice(0, 5) },
+            '⚠️ PEAK-DIAG: no tick price for open position — symbol mismatch?');
+          continue;
+        }
+
+        const isShort = posCtx.isShort ?? posCtx.direction === 'SELL';
+        const entry = posCtx.entryPrice ?? posCtx.price;
+        if (!entry || !posCtx.quantity) continue;
+
+        const pnl = isShort
+          ? (entry - ltp) * posCtx.quantity
+          : (ltp - entry) * posCtx.quantity;
+        const peak = posCtx.peakUnrealizedPnl ?? 0;
+
+        if (pnl > peak) {
+          log.info({ symbol, pnl: +pnl.toFixed(2), oldPeak: +peak.toFixed(2), ltp, entry },
+            '📈 PEAK-SYNC: advancing peak from secondary sync');
+          posCtx.peakUnrealizedPnl = pnl;
+          posCtx.peakPnlAt = Date.now();
+          getRedis().hset(`trail:${symbol}`,
+            'peakUnrealizedPnl', String(pnl),
+            'pnlTrailStop', String(posCtx.pnlTrailStop ?? -Infinity)
+          ).catch((e) => log.error({ symbol, err: e.message }, 'PEAK-SYNC Redis write failed'));
+        }
+      }
+    }, 30_000).unref();
   }
 
   // ─── Tick Buffer Persistence (Redis snapshot) ───────────

@@ -514,45 +514,58 @@ export function evaluateExits({
             };
         }
     }
-
-    const holdMinutes = (Date.now() - posCtx.timestamp) / 60000;
-    const pnlPct = +pct(entry, currentPrice, isShort).toFixed(2);
+    // ── Time-based exit ────────────────────────────────────────────────────
+    // Guard against stale timestamps from hydration or server restarts.
+    // If posCtx.timestamp is missing/invalid, skip time exit entirely rather
+    // than generating a false TIME_EXIT on a position that was just opened.
+    const entryTimestamp = posCtx.timestamp;
     const maxHold = config.maxHoldMinutes ?? 90;
+    const pnlPct = +pct(entry, currentPrice, isShort).toFixed(2);
 
-    if (holdMinutes >= maxHold && pnlPct < 0.3) {
-        return {
-            exit: true, partial: false,
-            reason: 'TIME_EXIT',
-            qty,
-            meta: {
-                holdMinutes: +holdMinutes.toFixed(1),
-                maxHold,
-                pnlPct,
-                currentPnl: +unrealizedPnl.toFixed(2),
-                tier: 'soft',
-                isShort,
-            },
-        };
-    }
+    if (entryTimestamp && entryTimestamp > 0) {
+        const holdMinutes = (Date.now() - entryTimestamp) / 60000;
 
-    const trailInProfitZone = isShort
-        ? posCtx.trailStopPrice <= entry
-        : posCtx.trailStopPrice >= entry;
+        // Safety: if holdMinutes > 480 (8 hours), timestamp is stale from a previous
+        // session or hydration bug. NSE market is only open ~6.25h. Skip time exit.
+        if (holdMinutes > 480) {
+            log.warn({ symbol, holdMinutes: +holdMinutes.toFixed(1), entryTimestamp,
+                maxHold, pnlPct },
+                'TIME_EXIT: stale timestamp detected (>8h) — skipping time exit');
+        } else if (holdMinutes >= maxHold && pnlPct < 0.3) {
+            return {
+                exit: true, partial: false,
+                reason: 'TIME_EXIT',
+                qty,
+                meta: {
+                    holdMinutes: +holdMinutes.toFixed(1),
+                    maxHold,
+                    pnlPct,
+                    currentPnl: +unrealizedPnl.toFixed(2),
+                    tier: 'soft',
+                    isShort,
+                },
+            };
+        }
 
-    if (holdMinutes >= maxHold * 2 && !trailInProfitZone) {
-        return {
-            exit: true, partial: false,
-            reason: 'TIME_EXIT',
-            qty,
-            meta: {
-                holdMinutes: +holdMinutes.toFixed(1),
-                maxHold,
-                pnlPct,
-                currentPnl: +unrealizedPnl.toFixed(2),
-                tier: 'hard',
-                isShort,
-            },
-        };
+        const trailInProfitZone = isShort
+            ? posCtx.trailStopPrice <= entry
+            : posCtx.trailStopPrice >= entry;
+
+        if (holdMinutes >= maxHold * 2 && holdMinutes <= 480 && !trailInProfitZone) {
+            return {
+                exit: true, partial: false,
+                reason: 'TIME_EXIT',
+                qty,
+                meta: {
+                    holdMinutes: +holdMinutes.toFixed(1),
+                    maxHold,
+                    pnlPct,
+                    currentPnl: +unrealizedPnl.toFixed(2),
+                    tier: 'hard',
+                    isShort,
+                },
+            };
+        }
     }
 
     return noExit;
