@@ -517,6 +517,7 @@ async function main() {
       `   Max hold:       ${config.MAX_HOLD_MINUTES} minutes (flat/losing positions only)`
     );
     engine.positionManager = positionManager;
+    positionManager.tickFeed = tickFeed || null;  // for _syncPeakPnl fallback
     engine._fetchCandles = async (symbol, limit) => {
       if (!broker) return [];
       const instrumentToken = instrumentManager?.getToken(symbol)

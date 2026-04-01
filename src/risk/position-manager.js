@@ -56,6 +56,14 @@ export class PositionManager {
 
         this._checkAllInProgress = false; // M1 FIX: concurrency guard
 
+        // ── Periodic peak PnL sync (bombproof fallback) ──────────────────
+        // Runs every 10s independent of tick feed. Directly reads the latest
+        // tick from position context and computes peak PnL. This catches ANY
+        // case where evaluateTick doesn't fire (symbol mismatch, tick feed
+        // disconnected, isExiting stuck, etc.)
+        this._peakSyncInterval = setInterval(() => this._syncPeakPnl(), 10_000);
+        this._peakSyncInterval.unref(); // Don't block process exit
+
         log.info({ enabled: this.enabled, ...this._active }, 'PositionManager initialized');
     }
 
@@ -243,6 +251,81 @@ export class PositionManager {
         }
     }
 
+    // ═══════════════════════════════════════════════════════
+    // PERIODIC PEAK SYNC (bombproof fallback)
+    // ═══════════════════════════════════════════════════════
+
+    /**
+     * Scan all open positions and compute/persist peak PnL from current
+     * market prices. Runs every 10s via setInterval. Does NOT depend on
+     * evaluateTick or tick events — reads the latest price directly from
+     * posCtx._lastPrice (set by evaluateTick) or falls back to the
+     * broker's last known price.
+     *
+     * This catches:
+     *  - evaluateTick never called (symbol mismatch, tick feed issue)
+     *  - evaluateTick blocked by isExiting guard
+     *  - evaluateExits throwing before peak code runs
+     */
+    _syncPeakPnl() {
+        if (!this.enabled) return;
+        const positions = this.engine._filledPositions;
+        if (!positions || positions.size === 0) return;
+
+        // Build inverted symbolMap: symbol → token (same as backend-api.js)
+        let invertedMap = null;
+        if (this.tickFeed?.symbolMap) {
+            invertedMap = {};
+            for (const [tok, sym] of Object.entries(this.tickFeed.symbolMap)) {
+                invertedMap[sym] = tok;
+            }
+        }
+
+        for (const [symbol, posCtx] of positions) {
+            try {
+                // Get current price: tick feed first, then fallbacks
+                let currentPrice = posCtx._lastTickPrice || 0;
+
+                if (currentPrice <= 0 && invertedMap && this.tickFeed?.latestTicks) {
+                    const tokenStr = invertedMap[symbol];
+                    if (tokenStr) {
+                        const tick = this.tickFeed.latestTicks.get(Number(tokenStr))
+                            || this.tickFeed.latestTicks.get(tokenStr);
+                        if (tick?.ltp > 0) currentPrice = tick.ltp;
+                    }
+                }
+
+                if (currentPrice <= 0) continue;
+
+                const isShort = posCtx.isShort ?? posCtx.direction === 'SELL';
+                const entry   = posCtx.entryPrice ?? posCtx.price;
+                if (!entry || !posCtx.quantity) continue;
+
+                const unrealizedPnl = isShort
+                    ? (entry - currentPrice) * posCtx.quantity
+                    : (currentPrice - entry) * posCtx.quantity;
+                const currentPeak = posCtx.peakUnrealizedPnl ?? 0;
+
+                if (unrealizedPnl > currentPeak) {
+                    log.info({ symbol, unrealizedPnl: +unrealizedPnl.toFixed(2),
+                        oldPeak: +currentPeak.toFixed(2), currentPrice, entry,
+                        isShort, qty: posCtx.quantity },
+                        '📈 _syncPeakPnl: advancing peak');
+                    posCtx.peakUnrealizedPnl = unrealizedPnl;
+                    posCtx.peakPnlAt = Date.now();
+
+                    // Persist to Redis
+                    getRedis().hset(`trail:${symbol}`,
+                        'peakUnrealizedPnl', String(unrealizedPnl),
+                        'pnlTrailStop', String(posCtx.pnlTrailStop ?? -Infinity)
+                    ).catch(() => { });
+                }
+            } catch (err) {
+                log.debug({ symbol, err: err.message }, '_syncPeakPnl error');
+            }
+        }
+    }
+
     /**
      * Instantly evaluate trailing stops, hard stops, and profit targets on every incoming tick.
      * Bypasses the 5-minute schedule to prevent catastrophic slippage.
@@ -255,6 +338,9 @@ export class PositionManager {
 
         const currentPrice = tick.ltp || tick.lastPrice || tick.close || 0;
         if (currentPrice <= 0) return;
+
+        // Store for _syncPeakPnl fallback (runs even if evaluateTick returns early)
+        posCtx._lastTickPrice = currentPrice;
 
         // Concurrency guard — auto-reset after 30s to prevent permanent freeze.
         // CRITICAL: if _isExitingSetAt is undefined (set before this fix was deployed),
