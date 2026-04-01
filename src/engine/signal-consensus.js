@@ -450,22 +450,60 @@ export class SignalConsensus {
         const isShortEntry = best.signal === SIGNAL.SELL &&
           !SHORT_INELIGIBLE_STRATEGIES.has(best.strategy);
 
-        log.info({
-          symbol,                                      // which stock fired Super Conviction
-          signal: best.signal,                         // BUY / SELL
-          strategy: best.strategy,
-          confidence: best.confidence,
-          threshold: this.superConvictionThreshold,
-          isShortEntry,
-        }, `⏩ Super Conviction BYPASS: ${best.strategy} (${best.confidence}%) → ${best.signal}`);
+        // ── HARDENED SHORT CONVICTION ──────────────────────────────────
+        // For SELL (short), super conviction requires:
+        //   1. Higher threshold (superConvictionThreshold + 10, e.g. 90%)
+        //   2. At least 1 OTHER strategy also voting SELL (no single-strategy shorts)
+        // A single strategy at 80% misfiring should NOT open a short.
+        if (isShortEntry) {
+          const shortConvictionThreshold = this.superConvictionThreshold + 10;
+          const otherSellVoters = results.filter(
+            r => r.signal === SIGNAL.SELL &&
+              r.meetsFloor &&
+              !r.suppressedByTime &&
+              r.strategy !== best.strategy &&
+              !SHORT_INELIGIBLE_STRATEGIES.has(r.strategy)
+          );
 
-        return {
-          signal: best.signal,
-          confidence: best.confidence,
-          convictionStrategy: best.strategy,   // Fix A: clean strategy name
-          isShortEntry,
-          reason: `SUPER CONVICTION BYPASS: ${best.strategy} reached ${best.confidence}% confidence. Cross-group consensus skipped.`,
-        };
+          if (best.confidence < shortConvictionThreshold || otherSellVoters.length === 0) {
+            log.info({
+              symbol, strategy: best.strategy, confidence: best.confidence,
+              threshold: shortConvictionThreshold, otherSellVoters: otherSellVoters.length,
+            }, '🚫 Super Conviction SHORT blocked — need ≥' + shortConvictionThreshold +
+               '% AND ≥1 other SELL voter');
+            // Fall through to HOLD instead of opening a bad short
+          } else {
+            log.info({
+              symbol, signal: best.signal, strategy: best.strategy,
+              confidence: best.confidence, threshold: shortConvictionThreshold,
+              supporters: otherSellVoters.map(r => r.strategy),
+              isShortEntry,
+            }, `⏩ Super Conviction SHORT: ${best.strategy} (${best.confidence}%) + ${otherSellVoters.length} supporter(s)`);
+
+            return {
+              signal: best.signal,
+              confidence: best.confidence,
+              convictionStrategy: best.strategy,
+              isShortEntry,
+              reason: `SUPER CONVICTION SHORT: ${best.strategy} ${best.confidence}% + ${otherSellVoters.map(r => r.strategy).join(', ')} supporting.`,
+            };
+          }
+        } else {
+          // BUY super conviction — unchanged, single strategy at ≥80% can open a long
+          log.info({
+            symbol, signal: best.signal, strategy: best.strategy,
+            confidence: best.confidence, threshold: this.superConvictionThreshold,
+            isShortEntry,
+          }, `⏩ Super Conviction BYPASS: ${best.strategy} (${best.confidence}%) → ${best.signal}`);
+
+          return {
+            signal: best.signal,
+            confidence: best.confidence,
+            convictionStrategy: best.strategy,
+            isShortEntry,
+            reason: `SUPER CONVICTION BYPASS: ${best.strategy} reached ${best.confidence}% confidence. Cross-group consensus skipped.`,
+          };
+        }
       }
     }
 

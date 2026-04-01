@@ -62,6 +62,7 @@ export class ExecutionEngine {
     this.telegram = deps.telegram || null;
     this.redis = deps.redis || null;
     this._config = deps.config || null;
+    this._getLiveSetting = deps.getLiveSetting || null;
     this.paperMode = deps.paperMode ?? true;
     this.maxRetries = deps.maxRetries ?? MAX_ORDER_RETRIES;
     this.retryDelayMs = deps.retryDelayMs ?? RETRY_DELAY_MS;
@@ -447,6 +448,54 @@ export class ExecutionEngine {
         (consensusResult.convictionStrategy &&
           !SHORT_INELIGIBLE_STRATEGIES.has(consensusResult.convictionStrategy) &&
           consensusResult.isShortEntry !== false);
+
+      // ── SHORT QUALITY GATES ──────────────────────────────────────────────
+      // Shorts are allowed but require higher conviction than longs.
+      // All gates read from live settings (Redis) first, then .env fallback.
+
+      // Gate 1: Global kill switch (live-toggleable from dashboard)
+      let shortsEnabled = this._config?.SHORTS_ENABLED ?? true;
+      if (isShortEntry && this._getLiveSetting) {
+        try {
+          shortsEnabled = await this._getLiveSetting('SHORTS_ENABLED', shortsEnabled);
+          // getLiveSetting returns string from Redis — normalize
+          if (typeof shortsEnabled === 'string') shortsEnabled = shortsEnabled !== 'false';
+        } catch { /* use .env fallback */ }
+      }
+      if (isShortEntry && !shortsEnabled) {
+        log.info({ symbol }, '🚫 Short blocked — SHORTS_ENABLED=false');
+        return { action: 'BLOCKED:SHORTS_DISABLED', order: null, consensus: consensusResult };
+      }
+
+      // Gate 2: Minimum confidence for shorts (default 70%, live-adjustable)
+      let shortMinConf = this._config?.SHORT_MIN_CONFIDENCE ?? 70;
+      if (isShortEntry && this._getLiveSetting) {
+        try { shortMinConf = await this._getLiveSetting('SHORT_MIN_CONFIDENCE', shortMinConf); } catch {}
+      }
+      const shortConfidence = consensusResult.confidence ?? 0;
+      if (isShortEntry && shortConfidence < shortMinConf) {
+        log.info({ symbol, confidence: shortConfidence, minRequired: shortMinConf },
+          '🚫 Short blocked — confidence too low');
+        return { action: 'BLOCKED:SHORT_LOW_CONFIDENCE', order: null, consensus: consensusResult };
+      }
+
+      // Gate 3: Don't short in a BULLISH regime — swimming against the current
+      if (isShortEntry && regime === 'BULLISH') {
+        log.info({ symbol, regime }, '🚫 Short blocked — BULLISH regime');
+        return { action: 'BLOCKED:SHORT_BULLISH_REGIME', order: null, consensus: consensusResult };
+      }
+
+      // Gate 4: No new shorts in last 30 min of session (square-off pressure)
+      if (isShortEntry) {
+        const now = new Date();
+        const h = Number(now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata', hour: 'numeric', hour12: false }));
+        const m = Number(now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata', minute: 'numeric' }));
+        if (h >= 15 || (h === 14 && m >= 30)) {
+          log.info({ symbol, time: `${h}:${String(m).padStart(2, '0')}` },
+            '🚫 Short blocked — late session');
+          return { action: 'BLOCKED:SHORT_LATE_SESSION', order: null, consensus: consensusResult };
+        }
+      }
 
       if (isShortEntry && !this._filledPositions.has(symbol)) {
         // Opening a new short position — track strategies same as longs

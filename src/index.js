@@ -528,6 +528,7 @@ async function main() {
     telegram: telegramRef,  // Feature 9: conflict detection alerts
     redis: redisHealthy ? getRedis() : null,  // Feature 9: conflict rate limit
     config,           // Position manager: STOP_LOSS_PCT, TRAILING_STOP_PCT
+    getLiveSetting: redisHealthy ? getLiveSetting : null,  // Live-toggle SHORTS_ENABLED etc.
   });
 
   if (telegramRef?.enabled && redisHealthy) {

@@ -73,6 +73,12 @@ const envSchema = z.object({
     .string()
     .transform((v) => v !== 'false')
     .default('true'),
+  SHORTS_ENABLED: z
+    .string()
+    .transform((v) => v !== 'false')
+    .default('true'),
+  // Minimum confidence (0-100) required for short entries. Higher = fewer but better shorts.
+  SHORT_MIN_CONFIDENCE: z.coerce.number().min(0).max(100).default(70),
 
   // ─── Exit Strategies (BUG #19 — previously missing) ──
   PROFIT_TARGET_PCT: z.coerce.number().positive().max(20).default(1.8),
