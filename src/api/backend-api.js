@@ -197,6 +197,21 @@ export function createApiHandler(deps) {
       default: config.MAX_HOLD_MINUTES ?? 90,
       category: 'exits',
     },
+    // ── Short Selling ─────────────────────────────────────────────────────────
+    SHORTS_ENABLED: {
+      label: 'Short Selling',
+      description: 'Allow opening new short positions. When OFF, only long entries are placed. Existing shorts are unaffected.',
+      type: 'boolean',
+      default: config.SHORTS_ENABLED ?? true,
+      category: 'risk',
+    },
+    SHORT_MIN_CONFIDENCE: {
+      label: 'Short Min Confidence %',
+      description: 'Minimum consensus confidence required for short entries (higher = fewer but better shorts)',
+      type: 'number', min: 40, max: 100, step: 5,
+      default: config.SHORT_MIN_CONFIDENCE ?? 70,
+      category: 'risk',
+    },
     // ── EMA Crossover ────────────────────────────────────────────────────────
     EMA_FAST_PERIOD: {
       label: 'EMA Fast Period',

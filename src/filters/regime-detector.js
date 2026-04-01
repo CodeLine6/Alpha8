@@ -133,7 +133,17 @@ export function calculateADX(candles, period = ADX_PERIOD) {
 
     let adx = dx.slice(0, period).reduce((a, b) => a + b, 0) / period;
     for (let i = period; i < dx.length; i++) adx = (adx * (period - 1) + dx[i]) / period;
-    return Math.round(adx * 100) / 100;
+
+    // Return directional indicators alongside ADX
+    // +DI > -DI = bullish trend, -DI > +DI = bearish trend
+    const lastPlusDI = Math.round(pDI[pDI.length - 1] * 100) / 100;
+    const lastMinusDI = Math.round(mDI[mDI.length - 1] * 100) / 100;
+
+    return {
+        adx: Math.round(adx * 100) / 100,
+        plusDI: lastPlusDI,
+        minusDI: lastMinusDI,
+    };
 }
 
 /**
@@ -198,9 +208,11 @@ export function classifyRegime({ atr, atrAvg30, adx, currentPrice }) {
 function defaultRegime(reason = 'No data — defaulting to TRENDING (fail-open)') {
     return {
         regime: 'TRENDING',
+        trendDirection: 'NEUTRAL',  // unknown direction on fail-open
         positionSizeMultiplier: 1.0,
         reason,
         atr: null, adx: null, atrPct: null,
+        plusDI: null, minusDI: null, niftyChangePct: null,
         volatilityRatio: null, rangeRatio: null,
         updatedAt: new Date().toISOString(),
     };
@@ -283,9 +295,12 @@ export class RegimeDetector {
      */
     async updateIntraday(niftyIntradayCandles, todayOHLC) {
         try {
-            // ── Layer 2: ADX on 5-minute candles ──────────────────────────────
+            // ── Layer 2: ADX + directional indicators on 5-minute candles ─────
             const candles = niftyIntradayCandles || [];
-            const adx     = calculateADX(candles);
+            const adxResult = calculateADX(candles);
+            const adx = adxResult?.adx ?? null;
+            const plusDI = adxResult?.plusDI ?? null;
+            const minusDI = adxResult?.minusDI ?? null;
 
             // ── Layer 1: today's range vs 20-day baseline ─────────────────────
             let rangeRatio = null;
@@ -299,8 +314,19 @@ export class RegimeDetector {
                 }
             }
 
+            // ── Nifty intraday change % ───────────────────────────────────────
+            // Simple directional signal: current Nifty price vs today's open
+            let niftyChangePct = null;
+            if (candles.length > 0) {
+                const openPrice = candles[0]?.open;
+                const currentPrice = candles[candles.length - 1]?.close;
+                if (openPrice > 0 && currentPrice > 0) {
+                    niftyChangePct = Math.round(((currentPrice - openPrice) / openPrice) * 10000) / 100;
+                }
+            }
+
             // ── Combined classification (Layer 1 overrides Layer 2) ───────────
-            const regime = this._classify(rangeRatio, adx);
+            const regime = this._classify(rangeRatio, adx, plusDI, minusDI, niftyChangePct);
 
             // ── Cache + alert ─────────────────────────────────────────────────
             try {
@@ -310,8 +336,10 @@ export class RegimeDetector {
             }
 
             this.logger(
-                `[RegimeDetector] Intraday: ${regime.regime} | ` +
-                `rangeRatio=${rangeRatio ?? 'n/a'} ADX=${adx ?? 'n/a'} — ${regime.reason}`
+                `[RegimeDetector] Intraday: ${regime.regime} (${regime.trendDirection}) | ` +
+                `rangeRatio=${rangeRatio ?? 'n/a'} ADX=${adx ?? 'n/a'} ` +
+                `+DI=${plusDI ?? 'n/a'} -DI=${minusDI ?? 'n/a'} ` +
+                `Nifty=${niftyChangePct != null ? niftyChangePct + '%' : 'n/a'} — ${regime.reason}`
             );
 
             // Fire Telegram alert on regime change
@@ -376,16 +404,42 @@ export class RegimeDetector {
      * Layer 1 (range_ratio) takes absolute priority.
      * @private
      */
-    _classify(rangeRatio, adx) {
+    _classify(rangeRatio, adx, plusDI = null, minusDI = null, niftyChangePct = null) {
         const ts = new Date().toISOString();
+
+        // ── Layer 3: Trend Direction ──────────────────────────────────────
+        // Combine +DI/-DI spread with Nifty intraday change% for direction.
+        //   BULLISH:  +DI > -DI by ≥3 AND Nifty ≥ +0.3%
+        //   BEARISH:  -DI > +DI by ≥3 AND Nifty ≤ -0.3%
+        //   NEUTRAL:  conflicting signals or insufficient data
+        let trendDirection = 'NEUTRAL';
+        const diSpread = (plusDI !== null && minusDI !== null) ? plusDI - minusDI : 0;
+
+        if (diSpread >= 3 && niftyChangePct !== null && niftyChangePct >= 0.3) {
+            trendDirection = 'BULLISH';
+        } else if (diSpread <= -3 && niftyChangePct !== null && niftyChangePct <= -0.3) {
+            trendDirection = 'BEARISH';
+        } else if (niftyChangePct !== null && niftyChangePct >= 0.8) {
+            // Strong Nifty move overrides weak DI signals
+            trendDirection = 'BULLISH';
+        } else if (niftyChangePct !== null && niftyChangePct <= -0.8) {
+            trendDirection = 'BEARISH';
+        }
+
+        const dirLabel = trendDirection === 'BULLISH' ? '📈' :
+                         trendDirection === 'BEARISH' ? '📉' : '➡️';
+        const dirNote = ` | ${dirLabel} Direction: ${trendDirection}` +
+                        (niftyChangePct != null ? ` (Nifty ${niftyChangePct > 0 ? '+' : ''}${niftyChangePct}%)` : '');
 
         // Layer 1 — VOLATILE gate
         if (rangeRatio !== null && rangeRatio >= REGIME_VOLATILE_RATIO) {
             return {
                 regime: 'VOLATILE',
+                trendDirection,
                 positionSizeMultiplier: 0.0,
-                reason: `Intraday range ${rangeRatio.toFixed(2)}× the 20-day avg — extreme volatility. All trading paused.`,
+                reason: `Intraday range ${rangeRatio.toFixed(2)}× the 20-day avg — extreme volatility. All trading paused.${dirNote}`,
                 atr: null, atrPct: null, adx: adx !== null ? Math.round(adx * 100) / 100 : null,
+                plusDI, minusDI, niftyChangePct,
                 volatilityRatio: null, rangeRatio,
                 updatedAt: ts,
             };
@@ -394,15 +448,15 @@ export class RegimeDetector {
         // Layer 1 elevation warning (no regime change, just logged)
         const elevated = rangeRatio !== null && rangeRatio >= REGIME_WARN_RATIO;
 
-        // Layer 2 — ADX trend direction
+        // Layer 2 — ADX trend strength
         if (adx === null) {
-            // Not enough 5-min candles yet (pre-market or first scan)
-            // Fall-through to TRENDING (fail-open)
             return {
                 regime: 'TRENDING',
+                trendDirection,
                 positionSizeMultiplier: 1.0,
-                reason: `Insufficient 5-min candles for ADX — defaulting to TRENDING (fail-open)${elevated ? '; range elevated' : ''}`,
+                reason: `Insufficient 5-min candles for ADX — defaulting to TRENDING (fail-open)${elevated ? '; range elevated' : ''}${dirNote}`,
                 atr: null, atrPct: null, adx: null,
+                plusDI, minusDI, niftyChangePct,
                 volatilityRatio: null, rangeRatio: rangeRatio ?? null,
                 updatedAt: ts,
             };
@@ -414,9 +468,11 @@ export class RegimeDetector {
         if (adx >= ADX_TRENDING_THRESHOLD) {
             return {
                 regime: 'TRENDING',
+                trendDirection,
                 positionSizeMultiplier: 1.0,
-                reason: `ADX ${adxRounded} ≥ ${ADX_TRENDING_THRESHOLD} — strong intraday trend. Full position size.${elevatedNote}`,
+                reason: `ADX ${adxRounded} ≥ ${ADX_TRENDING_THRESHOLD} — strong intraday trend. Full position size.${elevatedNote}${dirNote}`,
                 atr: null, atrPct: null, adx: adxRounded,
+                plusDI, minusDI, niftyChangePct,
                 volatilityRatio: null, rangeRatio: rangeRatio ?? null,
                 updatedAt: ts,
             };
@@ -425,9 +481,11 @@ export class RegimeDetector {
         if (adx >= ADX_NEUTRAL_THRESHOLD) {
             return {
                 regime: 'NEUTRAL',
+                trendDirection,
                 positionSizeMultiplier: 1.0,
-                reason: `ADX ${adxRounded} (15–25) — directionless, normal size with tighter threshold.${elevatedNote}`,
+                reason: `ADX ${adxRounded} (15–25) — directionless, normal size with tighter threshold.${elevatedNote}${dirNote}`,
                 atr: null, atrPct: null, adx: adxRounded,
+                plusDI, minusDI, niftyChangePct,
                 volatilityRatio: null, rangeRatio: rangeRatio ?? null,
                 updatedAt: ts,
             };
@@ -435,9 +493,11 @@ export class RegimeDetector {
 
         return {
             regime: 'SIDEWAYS',
+            trendDirection,
             positionSizeMultiplier: 0.5,
-            reason: `ADX ${adxRounded} < ${ADX_NEUTRAL_THRESHOLD} — no directional conviction. Position size halved.${elevatedNote}`,
+            reason: `ADX ${adxRounded} < ${ADX_NEUTRAL_THRESHOLD} — no directional conviction. Position size halved.${elevatedNote}${dirNote}`,
             atr: null, atrPct: null, adx: adxRounded,
+            plusDI, minusDI, niftyChangePct,
             volatilityRatio: null, rangeRatio: rangeRatio ?? null,
             updatedAt: ts,
         };

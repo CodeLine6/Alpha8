@@ -356,10 +356,12 @@ export class ExecutionEngine {
 
     // N3 FIX: fetch regime BEFORE the HOLD check so shadow signals always have regime metadata.
     let regime = null;
+    let trendDirection = 'NEUTRAL';
     if (this.pipeline?.regimeDetector) {
       try {
         const regimeState = await this.pipeline.regimeDetector.getRegime();
         regime = regimeState?.regime ?? null;
+        trendDirection = regimeState?.trendDirection ?? 'NEUTRAL';
       } catch (err) {
         log.warn({ symbol, err: err.message }, 'Could not fetch regime — using default threshold');
       }
@@ -480,9 +482,9 @@ export class ExecutionEngine {
       }
 
       // Gate 3: Don't short in a BULLISH regime — swimming against the current
-      if (isShortEntry && regime === 'BULLISH') {
-        log.info({ symbol, regime }, '🚫 Short blocked — BULLISH regime');
-        return { action: 'BLOCKED:SHORT_BULLISH_REGIME', order: null, consensus: consensusResult };
+      if (isShortEntry && trendDirection === 'BULLISH') {
+        log.info({ symbol, regime, trendDirection }, '🚫 Short blocked — BULLISH trend direction');
+        return { action: 'BLOCKED:SHORT_BULLISH_TREND', order: null, consensus: consensusResult };
       }
 
       // Gate 4: No new shorts in last 30 min of session (square-off pressure)

@@ -107,12 +107,14 @@ describe('Pure functions — trueRange / calculateATR / calculateADX', () => {
         expect(calculateADX(candles, 14)).toBeNull();
     });
 
-    test('calculateADX returns a number in [0,100] for sufficient candles', () => {
+    test('calculateADX returns an object with adx in [0,100] for sufficient candles', () => {
         const candles = makeIntradayCandles(60, { trending: true });
-        const adx = calculateADX(candles, 14);
-        expect(adx).not.toBeNull();
-        expect(adx).toBeGreaterThanOrEqual(0);
-        expect(adx).toBeLessThanOrEqual(100);
+        const result = calculateADX(candles, 14);
+        expect(result).not.toBeNull();
+        expect(result.adx).toBeGreaterThanOrEqual(0);
+        expect(result.adx).toBeLessThanOrEqual(100);
+        expect(result).toHaveProperty('plusDI');
+        expect(result).toHaveProperty('minusDI');
     });
 
     test('classifyRegime (deprecated) still returns a valid shape', () => {
@@ -243,7 +245,7 @@ describe('RegimeDetector.updateIntraday() — Layer 2 ADX classification', () =>
         expect(result.rangeRatio).toBeNull();
     });
 
-    test('result always has rangeRatio and adx fields', async () => {
+    test('result always has necessary fields including trendDirection', async () => {
         const store = {};
         const rd = new RegimeDetector({ redis: makeMockRedis(store), logger: () => {} });
 
@@ -251,7 +253,11 @@ describe('RegimeDetector.updateIntraday() — Layer 2 ADX classification', () =>
 
         expect(result).toHaveProperty('rangeRatio');
         expect(result).toHaveProperty('adx');
+        expect(result).toHaveProperty('plusDI');
+        expect(result).toHaveProperty('minusDI');
+        expect(result).toHaveProperty('niftyChangePct');
         expect(result).toHaveProperty('regime');
+        expect(result).toHaveProperty('trendDirection');
         expect(result).toHaveProperty('positionSizeMultiplier');
         expect(result).toHaveProperty('reason');
         expect(result).toHaveProperty('updatedAt');
