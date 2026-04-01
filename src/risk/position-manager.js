@@ -256,19 +256,19 @@ export class PositionManager {
         const currentPrice = tick.ltp || tick.lastPrice || tick.close || 0;
         if (currentPrice <= 0) return;
 
-        // Concurrency guard to prevent tick avalanches while an API exit is mid-flight.
-        // Auto-reset after 30s to prevent stuck isExiting from permanently freezing peak tracking.
+        // Concurrency guard — auto-reset after 30s to prevent permanent freeze.
+        // CRITICAL: if _isExitingSetAt is undefined (set before this fix was deployed),
+        // treat as stuck immediately since we have no idea when it was set.
         if (posCtx.isExiting) {
             const now = Date.now();
-            const stuckMs = now - (posCtx._isExitingSetAt || now);
+            const setAt = posCtx._isExitingSetAt;
+            const stuckMs = setAt ? (now - setAt) : Infinity;  // undefined → treat as stuck
             if (stuckMs > 30_000) {
-                log.warn({ symbol, stuckMs }, 'evaluateTick: isExiting stuck for >30s — auto-resetting');
+                log.warn({ symbol, stuckMs: stuckMs === Infinity ? 'unknown' : stuckMs },
+                    'evaluateTick: isExiting stuck — auto-resetting');
                 posCtx.isExiting = false;
+                // fall through to normal evaluation
             } else {
-                if (!posCtx._isExitingWarnAt || now - posCtx._isExitingWarnAt > 30_000) {
-                    log.warn({ symbol, currentPrice }, 'evaluateTick: posCtx.isExiting=true — skipping tick (possible stuck exit)');
-                    posCtx._isExitingWarnAt = now;
-                }
                 return;
             }
         }
@@ -282,71 +282,62 @@ export class PositionManager {
                 recentHighs: [],
                 recentLows: [],
                 regime: null,
-                latestSignals: {}, // Ignore reversal signals here (they wait for candle close)
+                latestSignals: {},
                 config: this._active,
             });
 
+            // ══════════════════════════════════════════════════════════════════
+            // PEAK PnL TRACKING — runs UNCONDITIONALLY on every tick, BEFORE
+            // any exit branching. The peak is a monotonic maximum — it can
+            // never decrease, so computing it even on exit ticks is safe.
+            // ══════════════════════════════════════════════════════════════════
+            const isShort = posCtx.isShort ?? posCtx.direction === 'SELL';
+            const entry   = posCtx.entryPrice ?? posCtx.price;
+            const unrealizedPnl = isShort
+                ? (entry - currentPrice) * posCtx.quantity
+                : (currentPrice - entry)  * posCtx.quantity;
+            const currentPeak = posCtx.peakUnrealizedPnl ?? 0;
+
+            if (unrealizedPnl > currentPeak) {
+                if (currentPeak <= 0 && unrealizedPnl > 0) {
+                    log.warn({ symbol, unrealizedPnl, peak: currentPeak,
+                        trailMode: posCtx.trailMode, currentPrice, entry, qty: posCtx.quantity },
+                        'evaluateTick: SELF-HEAL — peak was stuck, forcing update');
+                }
+                posCtx.peakUnrealizedPnl = unrealizedPnl;
+                posCtx.peakPnlAt = Date.now();
+            }
+
+            // Persist peak to Redis if it advanced (unconditional — not gated by exit)
+            if (posCtx.peakUnrealizedPnl !== undefined && posCtx.peakUnrealizedPnl !== posCtx._lastSavedPeak) {
+                posCtx._lastSavedPeak = posCtx.peakUnrealizedPnl;
+                getRedis().hset(`trail:${symbol}`,
+                    'peakUnrealizedPnl', String(posCtx.peakUnrealizedPnl),
+                    'pnlTrailStop', String(posCtx.pnlTrailStop ?? -Infinity)
+                ).catch(() => { });
+            }
+
+            // ══════════════════════════════════════════════════════════════════
+            // EXIT BRANCHING — only after peak is already tracked above
+            // ══════════════════════════════════════════════════════════════════
             if (result.partial) {
                 posCtx.isExiting = true;
                 posCtx._isExitingSetAt = Date.now();
                 this._executePartialExit(symbol, posCtx, currentPrice, result)
                     .finally(() => { posCtx.isExiting = false; });
             } else if (result.exit) {
-                // Sim protection: if a minimum hold window is set, suppress exits until it expires.
-                // Peak tracking still runs above — only forceExit is blocked.
                 if (posCtx._simProtectedUntil && Date.now() < posCtx._simProtectedUntil) {
                     const secsLeft = Math.ceil((posCtx._simProtectedUntil - Date.now()) / 1000);
                     log.debug({ symbol, reason: result.reason, secsLeft }, '[SIM] Exit suppressed during protected hold window');
                 } else {
                     posCtx.isExiting = true;
                     posCtx._isExitingSetAt = Date.now();
-                    posCtx._exitReason = result.reason; // captured for /api/sim/tick response
+                    posCtx._exitReason = result.reason;
                     log.info({ symbol, currentPrice, reason: result.reason }, '🚨 Real-time TICK breached trailing/stop-loss floor! Force exiting immediately!');
                     this.engine.forceExit(symbol, currentPrice, result.reason)
                         .then(exitResult => this._notifyExit(symbol, posCtx, currentPrice, result.reason, result.meta, exitResult))
                         .catch(err => log.error({ symbol, err: err.message }, 'Real-time tick exit failed'))
                         .finally(() => { posCtx.isExiting = false; });
-                }
-            }
-
-            // ── CRITICAL FIX: Persist peak to Redis UNCONDITIONALLY after evaluateExits ──
-            // Previously this was inside the `else` branch only, meaning any exit trigger
-            // (even if suppressed by sim protection or async failure) would skip the
-            // Redis write, leaving peakUnrealizedPnl stuck at 0 forever.
-            // evaluateExits() already ran Object.assign(posCtx, updatedLevels) so
-            // posCtx.peakUnrealizedPnl is the freshly-ratcheted value.
-            if (!result.exit) {
-                // ── Self-healing safeguard ──
-                // If evaluateExits/updateTrailStop didn't advance the peak (e.g. trailMode
-                // mismatch, stale posCtx, or any other edge case), directly compute and
-                // apply it here. This ensures peak PnL is ALWAYS tracked regardless of
-                // trail mode configuration issues.
-                const isShort = posCtx.isShort ?? posCtx.direction === 'SELL';
-                const entry   = posCtx.entryPrice ?? posCtx.price;
-                const unrealizedPnl = isShort
-                    ? (entry - currentPrice) * posCtx.quantity
-                    : (currentPrice - entry)  * posCtx.quantity;
-                const currentPeak = posCtx.peakUnrealizedPnl ?? 0;
-
-                if (unrealizedPnl > currentPeak) {
-                    // updateTrailStop should have caught this, but it didn't — fix it directly
-                    if (currentPeak <= 0 && unrealizedPnl > 0) {
-                        log.warn({ symbol, unrealizedPnl, peak: currentPeak,
-                            trailMode: posCtx.trailMode, currentPrice, entry, qty: posCtx.quantity },
-                            'evaluateTick: SELF-HEAL — peak was stuck, forcing update');
-                    }
-                    posCtx.peakUnrealizedPnl = unrealizedPnl;
-                    posCtx.peakPnlAt = Date.now();
-                }
-
-                // Persist peak to Redis if it advanced
-                if (posCtx.peakUnrealizedPnl !== undefined && posCtx.peakUnrealizedPnl !== posCtx._lastSavedPeak) {
-                    log.debug({ symbol, peak: posCtx.peakUnrealizedPnl }, 'Peak PnL advanced — saving to Redis');
-                    posCtx._lastSavedPeak = posCtx.peakUnrealizedPnl;
-                    getRedis().hset(`trail:${symbol}`,
-                        'peakUnrealizedPnl', String(posCtx.peakUnrealizedPnl),
-                        'pnlTrailStop', String(posCtx.pnlTrailStop)
-                    ).catch(() => { });
                 }
             }
         } catch (err) {
