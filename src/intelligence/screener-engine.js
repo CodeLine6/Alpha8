@@ -19,7 +19,7 @@ const log = createLogger('screener-engine');
 const CACHE_KEY        = 'screener:results';
 const CACHE_TTL_LIVE   = 15 * 60;   // 15 minutes during market hours
 const CACHE_TTL_CLOSED = 12 * 60 * 60; // 12 hours overnight
-const SCAN_DAYS        = 70;         // daily candles to fetch per symbol
+const SCAN_DAYS        = 120;        // must be > 80 to yield > 55 trading days
 const BATCH_SIZE       = 8;          // symbols per batch
 const BATCH_DELAY_MS   = 600;        // ms between batches
 
