@@ -61,7 +61,7 @@ export class PositionManager {
         // tick from position context and computes peak PnL. This catches ANY
         // case where evaluateTick doesn't fire (symbol mismatch, tick feed
         // disconnected, isExiting stuck, etc.)
-        this._peakSyncInterval = setInterval(() => this._syncPeakPnl(), 10_000);
+        this._peakSyncInterval = setInterval(() => this._syncPeakPnl(), 5_000);
         this._peakSyncInterval.unref(); // Don't block process exit
 
         log.info({ enabled: this.enabled, ...this._active }, 'PositionManager initialized');
