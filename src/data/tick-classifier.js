@@ -66,12 +66,11 @@ export class TickClassifier {
      * @returns {ClassifiedTick}
      */
     classify(symbol, tick) {
-        const {
-            last_price: price,
-            last_quantity: quantity = 1,
-            best_bid_price: bid,
-            best_ask_price: ask,
-        } = tick;
+        // Accept both raw Kite field names AND normalized tick-feed format
+        const price    = tick.last_price ?? tick.ltp ?? tick.lastPrice ?? 0;
+        const quantity = tick.last_quantity ?? tick.lastQuantity ?? 1;
+        const bid      = tick.best_bid_price ?? tick.depth?.buy?.[0]?.price ?? 0;
+        const ask      = tick.best_ask_price ?? tick.depth?.sell?.[0]?.price ?? 0;
 
         const timestamp = tick.timestamp || Date.now();
         const prev = this._lastTick.get(symbol);

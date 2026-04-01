@@ -797,7 +797,8 @@ async function main() {
     if (!tickFeed || !instrumentManager) return;
     try {
       const resolved = instrumentManager.resolveSymbols(symbols);
-      tickFeed.symbolMap = resolved.symbolMap;
+      // Merge (not replace) to preserve any symbols already mapped (e.g. held positions)
+      tickFeed.symbolMap = { ...(tickFeed.symbolMap || {}), ...resolved.symbolMap };
       if (resolved.tokens.length > 0) {
         tickFeed.subscribe(resolved.tokens, 'full');
         log.info({ tokens: resolved.tokens.length }, 'Tick feed resubscribed');
@@ -842,12 +843,17 @@ async function main() {
 
     // Dynamic TickFeed Subscription Sync
     // Ensure that any new dynamic symbols not yet in the tick feed are subscribed.
+    // CRITICAL: Always merge symbolMap even when no new tokens — the map may have
+    // been replaced (not merged) at startup with pinned-only symbols, causing
+    // dynamic symbols' ticks to be dropped as TOKEN:xxx → 0 ticks in BAVI buffer.
     if (tickFeed && instrumentManager) {
       const resolved = instrumentManager.resolveSymbols(activeSymbols);
+      // Always merge — ensures all active symbols are mapped
+      tickFeed.symbolMap = { ...(tickFeed.symbolMap || {}), ...resolved.symbolMap };
+
       const currentSubscribed = new Set(tickFeed.subscribedTokens || []);
       const newTokens = resolved.tokens.filter(t => !currentSubscribed.has(t));
       if (newTokens.length > 0) {
-        tickFeed.symbolMap = { ...(tickFeed.symbolMap || {}), ...resolved.symbolMap };
         tickFeed.subscribe(newTokens, 'full');
         log.info({ count: newTokens.length }, 'Dynamically subscribed new watchlist symbols to tick feed');
       }
