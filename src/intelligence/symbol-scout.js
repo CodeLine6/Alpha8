@@ -163,13 +163,17 @@ export function scoreVolatility(candles) {
 
     const atrPct = (atr / price) * 100;
 
-    // Perfect range: 0.8% - 2.5%
-    if (atrPct >= 0.8 && atrPct <= 2.5) return { score: 20, atrPct };
-    // Good range: 0.5% - 3%
-    if (atrPct >= 0.5 && atrPct <= 3.0) return { score: 15, atrPct };
-    // Acceptable: 0.3% - 4%
-    if (atrPct >= 0.3 && atrPct <= 4.0) return { score: 8, atrPct };
-    // Too flat or too wild
+    // Hard fail: ATR% below 0.5% means the stock barely moves intraday.
+    // On a ₹20K position, 0.25% = ₹50 — doesn't cover brokerage.
+    if (atrPct < 0.5) return { score: 0, atrPct, hardFail: true };
+
+    // Perfect range: 1.0% - 2.5% (enough range for meaningful intraday moves)
+    if (atrPct >= 1.0 && atrPct <= 2.5) return { score: 20, atrPct };
+    // Good range: 0.7% - 3%
+    if (atrPct >= 0.7 && atrPct <= 3.0) return { score: 15, atrPct };
+    // Acceptable: 0.5% - 4%
+    if (atrPct >= 0.5 && atrPct <= 4.0) return { score: 8, atrPct };
+    // Too wild
     return { score: 2, atrPct };
 }
 
