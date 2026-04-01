@@ -11,9 +11,10 @@
  *   the bigger picture — not fighting a downtrend.
  *
  * RULES:
- *   BUY allowed  → price > SMA20 > SMA50 (all three stacked bullishly)
- *   BUY blocked  → price < SMA20 < SMA50 (bearish stack)
- *   BUY blocked  → any neutral/choppy arrangement (SMA20 ≈ SMA50)
+ *   BUY allowed  → price > SMA20 > SMA50 (all three stacked bullishly)  [BULLISH]
+ *   BUY allowed  → price > SMA20, SMA20 < SMA50 (recovering momentum)  [RECOVERING]
+ *   BUY blocked  → price < SMA20 < SMA50 (bearish stack)               [BEARISH]
+ *   BUY blocked  → any other choppy arrangement                        [NEUTRAL]
  *   SELL          → always allowed (we always want to be able to exit)
  *
  * DATA: 70 days of daily candles fetched at 9:00 AM, cached 6 hours.
@@ -42,7 +43,8 @@ const HISTORY_DAYS = 100; // fetch 70 days → enough for 50-day SMA with buffer
  * @property {number|null}  currentPrice
  * @property {boolean}      bullish
  * @property {boolean}      bearish
- * @property {'BULLISH'|'BEARISH'|'NEUTRAL'} regime
+ * @property {boolean}      recovering
+ * @property {'BULLISH'|'BEARISH'|'NEUTRAL'|'RECOVERING'} regime
  * @property {string}       updatedAt
  */
 
@@ -67,7 +69,7 @@ export function analyseTrend(dailyCandles) {
     if (!dailyCandles || dailyCandles.length === 0) {
         return {
             sma20: null, sma50: null, currentPrice: null,
-            bullish: false, bearish: false, regime: 'NEUTRAL',
+            bullish: false, bearish: false, recovering: false, regime: 'NEUTRAL',
             updatedAt: new Date().toISOString(),
         };
     }
@@ -82,13 +84,18 @@ export function analyseTrend(dailyCandles) {
     const bearish = sma20 !== null && sma50 !== null &&
         currentPrice < sma20 && currentPrice < sma50 && sma20 < sma50;
 
-    const regime = bullish ? 'BULLISH' : bearish ? 'BEARISH' : 'NEUTRAL';
+    // RECOVERING: price has bounced above SMA20 but the golden cross hasn't formed yet.
+    // For intraday, short-term momentum (price > SMA20) is what matters.
+    const recovering = !bullish && !bearish && sma20 !== null && sma50 !== null &&
+        currentPrice > sma20 && sma20 < sma50;
+
+    const regime = bullish ? 'BULLISH' : recovering ? 'RECOVERING' : bearish ? 'BEARISH' : 'NEUTRAL';
 
     return {
         sma20: sma20 ? Math.round(sma20 * 100) / 100 : null,
         sma50: sma50 ? Math.round(sma50 * 100) / 100 : null,
         currentPrice: Math.round(currentPrice * 100) / 100,
-        bullish, bearish, regime,
+        bullish, bearish, recovering, regime,
         updatedAt: new Date().toISOString(),
     };
 }
@@ -156,6 +163,14 @@ export class TrendFilter {
             };
         }
 
+        if (trend.recovering) {
+            return {
+                allowed: true,
+                reason: `${symbol} RECOVERING — price ${trend.currentPrice} > SMA20 ${trend.sma20} (SMA50 ${trend.sma50} still above, but intraday momentum is bullish)`,
+                trend,
+            };
+        }
+
         const reason = trend.bearish
             ? `${symbol} BEARISH (price ${trend.currentPrice} < SMA20 ${trend.sma20} < SMA50 ${trend.sma50}) — BUY blocked`
             : `${symbol} trend NEUTRAL (sideways) — BUY blocked`;
@@ -193,7 +208,7 @@ export class TrendFilter {
             return trend;
         } catch (err) {
             this.logger(`[TrendFilter] Failed to refresh ${symbol}: ${err.message}`);
-            return { regime: 'NEUTRAL', bullish: false, bearish: false, sma20: null, sma50: null, currentPrice: null, updatedAt: new Date().toISOString() };
+            return { regime: 'NEUTRAL', bullish: false, bearish: false, recovering: false, sma20: null, sma50: null, currentPrice: null, updatedAt: new Date().toISOString() };
         }
     }
 
@@ -208,7 +223,7 @@ export class TrendFilter {
         try {
             return await this._refresh(symbol);
         } catch {
-            return { regime: 'NEUTRAL', bullish: false, bearish: false, sma20: null, sma50: null, currentPrice: null, updatedAt: null };
+            return { regime: 'NEUTRAL', bullish: false, bearish: false, recovering: false, sma20: null, sma50: null, currentPrice: null, updatedAt: null };
         }
     }
 }
