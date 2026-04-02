@@ -48,13 +48,6 @@ export function createApiHandler(deps) {
   } = deps;
 
   const API_KEY = process.env.API_SECRET_KEY || '';
-  const SIMULATE_MODE = process.env.SIMULATE_MODE === 'true';
-
-  // ── Simulation candle store ─────────────────────────────────────────────────
-  // Maps symbol → Candle[] uploaded by Alpha8Sim.
-  // Consulted by engine._fetchCandles and /api/candles when SIMULATE_MODE=true.
-  const simCandleStore = new Map();
-  deps.simCandleStore = simCandleStore; // expose so index.js can wire _fetchCandles
 
   // ═══════════════════════════════════════════════════════
   // LIVE SETTINGS SCHEMA
@@ -1554,7 +1547,7 @@ export function createApiHandler(deps) {
       // (Yahoo Finance) over the simulator's shifted/GBM candles.
       // If Yahoo has no data for the symbol, fall back to the sim broker.
       const instrumentToken = instrumentManager ? instrumentManager.getToken(symbol.toUpperCase()) : null;
-      const isSimBroker = SIMULATE_MODE || !!process.env.SIM_URL;
+      const isSimBroker = !!process.env.SIM_URL;
       const istToday = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
       const requestIsToday = fmtDate(fromDate) >= istToday;
       const preferYahoo = isSimBroker && !requestIsToday;
@@ -1614,137 +1607,7 @@ export function createApiHandler(deps) {
     }
   }
 
-  // ═══════════════════════════════════════════════════════
-  // SIMULATION ENDPOINTS (SIMULATE_MODE=true only)
-  // ═══════════════════════════════════════════════════════
 
-  /** POST /api/sim/seed — inject a fake filled position into the engine */
-  async function handleSimSeed(req, res) {
-    if (!SIMULATE_MODE) return json(res, { error: 'SIMULATE_MODE is not enabled' }, 403);
-
-    const body = await parseBody(req);
-    const { symbol, direction, entryPrice, quantity, token, pnlTrailFloor, pnlTrailPct, minHoldMs } = body;
-    if (!symbol || !direction || !entryPrice || !quantity) {
-      return json(res, { error: 'Required: symbol, direction, entryPrice, quantity' }, 400);
-    }
-
-    const isShort = direction === 'SELL';
-    const now = Date.now();
-    const minHold = parseInt(minHoldMs ?? 10 * 60 * 1000, 10); // default: 10 minutes
-
-    // Build a posCtx that matches what ExecutionEngine creates after a real fill
-    const posCtx = {
-      symbol,
-      direction,
-      isShort,
-      entryPrice: parseFloat(entryPrice),
-      price: parseFloat(entryPrice),
-      quantity: parseInt(quantity, 10),
-      entryTimestamp: now,
-      openedAt: new Date().toISOString(),
-      openingStrategy: 'SIMULATOR',
-      strategies: ['SIMULATOR'],
-      trailMode: 'PNL_TRAIL',
-      peakUnrealizedPnl: 0,
-      pnlTrailStop: null,
-      partialExitDone: false,
-      isExiting: false,
-      _simulated: true,
-      _simProtectedUntil: now + minHold, // block exits until minimum hold duration passes
-    };
-
-    // Register symbol → token in tickFeed so evaluate loop finds it
-    if (tickFeed && token) {
-      tickFeed.symbolMap = { ...(tickFeed.symbolMap || {}), [token]: symbol };
-    }
-
-    engine._filledPositions.set(symbol, posCtx);
-
-    // Let positionManager set stop/trail levels
-    if (engine.positionManager) {
-      try { await engine.positionManager.initPosition(symbol, posCtx); } catch { /* non-fatal */ }
-
-      // Apply sim-specific trail overrides AFTER initPosition so they win over defaults.
-      // This prevents the trail from triggering on the very first profitable tick
-      // (which happens when liveSettings has pnlTrailFloor=0).
-      if (body.pnlTrailFloor !== undefined) {
-        engine.positionManager._active.pnlTrailFloor = parseFloat(body.pnlTrailFloor);
-        log.info({ symbol, pnlTrailFloor: engine.positionManager._active.pnlTrailFloor }, '[SIM] Trail floor override applied');
-      }
-      if (body.pnlTrailPct !== undefined) {
-        engine.positionManager._active.pnlTrailPct = parseFloat(body.pnlTrailPct);
-      }
-    }
-
-    log.info({ symbol, direction, entryPrice, quantity }, '[SIM] Fake position seeded');
-    json(res, { ok: true, symbol, direction, entryPrice, quantity });
-  }
-
-  /** POST /api/sim/tick — push one price tick through the real TickFeed pipeline */
-  async function handleSimTick(req, res) {
-    if (!SIMULATE_MODE) return json(res, { error: 'SIMULATE_MODE is not enabled' }, 403);
-
-    const body = await parseBody(req);
-    const { symbol, token, ltp, timestamp } = body;
-    if (!symbol || !ltp) return json(res, { error: 'Required: symbol, ltp' }, 400);
-
-    const simToken = token || 999999;
-    const tick = {
-      instrumentToken: simToken,
-      symbol,
-      ltp: parseFloat(ltp),
-      lastPrice: parseFloat(ltp),
-      open: parseFloat(ltp),
-      high: parseFloat(ltp),
-      low: parseFloat(ltp),
-      close: parseFloat(ltp),
-      volume: 0,
-      timestamp: timestamp || new Date().toISOString(),
-    };
-
-    // Update latestTicks so /api/positions fast-path returns the sim price
-    const prevPosCtx = engine._filledPositions.get(symbol); // save ref before possible exit
-    if (tickFeed) {
-      tickFeed.latestTicks.set(simToken, tick);
-      tickFeed.emit('tick', tick);
-    } else {
-      // No tickFeed (no broker) — call evaluateTick directly
-      if (engine?.positionManager) {
-        engine.positionManager.evaluateTick(symbol, tick);
-      }
-    }
-
-    // Check if the position was exited by the tick
-    const stillOpen = engine._filledPositions.has(symbol);
-    const posCtx = engine._filledPositions.get(symbol);
-    // _exitReason is stored on posCtx by evaluateTick before async forceExit removes it
-    const exitReason = !stillOpen ? (prevPosCtx?._exitReason ?? 'STOP_TRIGGERED') : null;
-
-    json(res, {
-      ok: true,
-      ltp,
-      positionOpen: stillOpen,
-      exitTriggered: !stillOpen,
-      exitReason,
-      peakUnrealizedPnl: posCtx?.peakUnrealizedPnl ?? prevPosCtx?.peakUnrealizedPnl ?? null,
-      pnlTrailStop: posCtx?.pnlTrailStop ?? prevPosCtx?.pnlTrailStop ?? null,
-    });
-  }
-
-  /** POST /api/sim/candles — store synthetic candles, overrides real candle fetching */
-  async function handleSimCandles(req, res) {
-    if (!SIMULATE_MODE) return json(res, { error: 'SIMULATE_MODE is not enabled' }, 403);
-
-    const body = await parseBody(req);
-    const { symbol, candles } = body;
-    if (!symbol || !Array.isArray(candles)) {
-      return json(res, { error: 'Required: symbol, candles (array)' }, 400);
-    }
-
-    simCandleStore.set(symbol, candles);
-    log.debug({ symbol, count: candles.length }, '[SIM] Candle store updated');
-    json(res, { ok: true, symbol, count: candles.length });
-  }
 
   // ═══════════════════════════════════════════════════════
   // MAIN ROUTER
@@ -1792,10 +1655,7 @@ export function createApiHandler(deps) {
           case '/api/settings/mode': return handleSettingsMode(req, res);
           case '/api/settings/watchlist': return handleSettingsWatchlist(req, res);
           case '/api/live-settings': return handleLiveSettingsSet(req, res);
-          // Simulation endpoints
-          case '/api/sim/seed':    return handleSimSeed(req, res);
-          case '/api/sim/tick':    return handleSimTick(req, res);
-          case '/api/sim/candles': return handleSimCandles(req, res);
+
         }
       }
 

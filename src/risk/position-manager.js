@@ -360,6 +360,49 @@ export class PositionManager {
         }
 
         try {
+            // ══════════════════════════════════════════════════════════════════
+            // 1. INSTANT PEAK PnL TRACKING & TRAIL RATCHET
+            // ══════════════════════════════════════════════════════════════════
+            // We do this immediately here to guarantee Redis/memory consistency
+            // without waiting for evaluateExits to process and assign objects.
+            const isShort = posCtx.isShort ?? posCtx.direction === 'SELL';
+            const entry   = posCtx.entryPrice ?? posCtx.price;
+            const qty     = posCtx.quantity;
+            const unrealizedPnl = isShort
+                ? (entry - currentPrice) * qty
+                : (currentPrice - entry) * qty;
+            
+            const currentPeak = posCtx.peakUnrealizedPnl ?? 0;
+
+            if (unrealizedPnl > currentPeak) {
+                // Peak advanced! Apply instantly to memory.
+                posCtx.peakUnrealizedPnl = unrealizedPnl;
+                posCtx.peakPnlAt = Date.now();
+
+                // Instantly ratchet the trailing stop floor if we've crossed the threshold
+                const trailMode = posCtx.trailMode ?? 'PNL_TRAIL';
+                if (trailMode === 'PNL_TRAIL' || trailMode === 'HYBRID') {
+                    const pnlFloor = posCtx.pnlTrailFloor ?? (entry * qty * 0.005);
+                    if (unrealizedPnl >= pnlFloor && unrealizedPnl > 0) {
+                        const newFloor = unrealizedPnl * (1 - (posCtx.pnlTrailPct ?? 25) / 100);
+                        if (newFloor > (posCtx.pnlTrailStop ?? -Infinity)) {
+                            posCtx.pnlTrailStop = newFloor;
+                            posCtx.pnlTrailActivated = true;
+                        }
+                    }
+                }
+
+                // Instantly persist the new peak and floor to Redis
+                posCtx._lastSavedPeak = posCtx.peakUnrealizedPnl;
+                getRedis().hset(`trail:${symbol}`,
+                    'peakUnrealizedPnl', String(posCtx.peakUnrealizedPnl),
+                    'pnlTrailStop', String(posCtx.pnlTrailStop ?? -Infinity)
+                ).catch(() => { });
+            }
+
+            // ══════════════════════════════════════════════════════════════════
+            // 2. EXIT EVALUATION
+            // ══════════════════════════════════════════════════════════════════
             const result = evaluateExits({
                 symbol,
                 posCtx,
@@ -373,38 +416,7 @@ export class PositionManager {
             });
 
             // ══════════════════════════════════════════════════════════════════
-            // PEAK PnL TRACKING — runs UNCONDITIONALLY on every tick, BEFORE
-            // any exit branching. The peak is a monotonic maximum — it can
-            // never decrease, so computing it even on exit ticks is safe.
-            // ══════════════════════════════════════════════════════════════════
-            const isShort = posCtx.isShort ?? posCtx.direction === 'SELL';
-            const entry   = posCtx.entryPrice ?? posCtx.price;
-            const unrealizedPnl = isShort
-                ? (entry - currentPrice) * posCtx.quantity
-                : (currentPrice - entry)  * posCtx.quantity;
-            const currentPeak = posCtx.peakUnrealizedPnl ?? 0;
-
-            if (unrealizedPnl > currentPeak) {
-                if (currentPeak <= 0 && unrealizedPnl > 0) {
-                    log.warn({ symbol, unrealizedPnl, peak: currentPeak,
-                        trailMode: posCtx.trailMode, currentPrice, entry, qty: posCtx.quantity },
-                        'evaluateTick: SELF-HEAL — peak was stuck, forcing update');
-                }
-                posCtx.peakUnrealizedPnl = unrealizedPnl;
-                posCtx.peakPnlAt = Date.now();
-            }
-
-            // Persist peak to Redis if it advanced (unconditional — not gated by exit)
-            if (posCtx.peakUnrealizedPnl !== undefined && posCtx.peakUnrealizedPnl !== posCtx._lastSavedPeak) {
-                posCtx._lastSavedPeak = posCtx.peakUnrealizedPnl;
-                getRedis().hset(`trail:${symbol}`,
-                    'peakUnrealizedPnl', String(posCtx.peakUnrealizedPnl),
-                    'pnlTrailStop', String(posCtx.pnlTrailStop ?? -Infinity)
-                ).catch(() => { });
-            }
-
-            // ══════════════════════════════════════════════════════════════════
-            // EXIT BRANCHING — only after peak is already tracked above
+            // 3. EXIT BRANCHING
             // ══════════════════════════════════════════════════════════════════
             if (result.partial) {
                 posCtx.isExiting = true;
