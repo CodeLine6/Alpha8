@@ -40,6 +40,7 @@
 import { createLogger } from '../lib/logger.js';
 import { ORDER_STATE, MAX_ORDER_RETRIES, RETRY_DELAY_MS } from '../config/constants.js';
 import { createOrder, transitionOrder, isTerminal } from './order-state-machine.js';
+import { SHORT_INELIGIBLE_STRATEGIES } from './signal-consensus.js';
 import { query, getPool } from '../lib/db.js';
 import { getRedis } from '../lib/redis.js';
 import { calcNetPnl, calcTradeCost } from '../lib/brokerage.js';
