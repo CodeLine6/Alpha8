@@ -77,6 +77,10 @@ const DEFAULTS = {
     BAVI_STRONG_IMBALANCE: null,
     BAVI_MIN_TICK_COUNT: null,
 
+    // ── Short Selling ────────────────────────────────────────────────────────────
+    SHORTS_ENABLED: null,
+    SHORT_MIN_CONFIDENCE: null,
+
     // ── Signal Consensus ────────────────────────────────────────────────────────
     MIN_CONFIDENCE: null,
     MIN_AGREEMENT: null,

@@ -61,7 +61,7 @@ export class PositionManager {
         // tick from position context and computes peak PnL. This catches ANY
         // case where evaluateTick doesn't fire (symbol mismatch, tick feed
         // disconnected, isExiting stuck, etc.)
-        this._peakSyncInterval = setInterval(() => this._syncPeakPnl(), 5_000);
+        this._peakSyncInterval = setInterval(() => this._syncPeakPnl(), 3_000);
         this._peakSyncInterval.unref(); // Don't block process exit
 
         log.info({ enabled: this.enabled, ...this._active }, 'PositionManager initialized');
@@ -252,77 +252,172 @@ export class PositionManager {
     }
 
     // ═══════════════════════════════════════════════════════
-    // PERIODIC PEAK SYNC (bombproof fallback)
+    // PERIODIC SAFETY NET (bombproof fallback)
     // ═══════════════════════════════════════════════════════
 
     /**
-     * Scan all open positions and compute/persist peak PnL from current
-     * market prices. Runs every 10s via setInterval. Does NOT depend on
-     * evaluateTick or tick events — reads the latest price directly from
-     * posCtx._lastPrice (set by evaluateTick) or falls back to the
-     * broker's last known price.
+     * Comprehensive safety net that runs every 3 seconds.
+     * Fetches prices from the BROKER (not tick feed), so it works even when
+     * evaluateTick never fires for a symbol (symbol mapping mismatch, tick
+     * feed disconnected, etc.).
      *
-     * This catches:
-     *  - evaluateTick never called (symbol mismatch, tick feed issue)
-     *  - evaluateTick blocked by isExiting guard
-     *  - evaluateExits throwing before peak code runs
+     * On every cycle it:
+     *  1. Gets LTP from broker for all open positions
+     *  2. Updates peak PnL in memory
+     *  3. Ratchets trail stop in memory
+     *  4. ALWAYS writes peak + trail to Redis (not just when peak advances)
+     *  5. Triggers exits if trail stop or hard stop is breached
      */
-    _syncPeakPnl() {
+    async _syncPeakPnl() {
         if (!this.enabled) return;
-        const positions = this.engine._filledPositions;
-        if (!positions || positions.size === 0) return;
+        if (this._syncInProgress) return;  // concurrency guard
+        this._syncInProgress = true;
 
-        // Build inverted symbolMap: symbol → token (same as backend-api.js)
-        let invertedMap = null;
-        if (this.tickFeed?.symbolMap) {
-            invertedMap = {};
-            for (const [tok, sym] of Object.entries(this.tickFeed.symbolMap)) {
-                invertedMap[sym] = tok;
+        try {
+            const positions = this.engine._filledPositions;
+            if (!positions || positions.size === 0) return;
+
+            const symbols = Array.from(positions.keys());
+
+            // ── 1. Get prices: broker LTP first (guaranteed), tick cache fallback ──
+            const prices = {};
+
+            // Broker LTP — single API call for all symbols
+            if (this.broker) {
+                try {
+                    const keys = symbols.map(s => `NSE:${s}`);
+                    const ltp = await Promise.race([
+                        this.broker.getLTP(keys),
+                        new Promise((_, rej) => setTimeout(() => rej(new Error('LTP timeout')), 5000)),
+                    ]);
+                    for (const sym of symbols) {
+                        const p = ltp?.[`NSE:${sym}`]?.last_price;
+                        if (p && p > 0) prices[sym] = p;
+                    }
+                } catch (err) {
+                    log.debug({ err: err.message }, '_syncPeakPnl: broker LTP failed, using tick cache');
+                }
             }
-        }
 
-        for (const [symbol, posCtx] of positions) {
-            try {
-                // Get current price: tick feed first, then fallbacks
-                let currentPrice = posCtx._lastTickPrice || 0;
-
-                if (currentPrice <= 0 && invertedMap && this.tickFeed?.latestTicks) {
-                    const tokenStr = invertedMap[symbol];
-                    if (tokenStr) {
-                        const tick = this.tickFeed.latestTicks.get(Number(tokenStr))
-                            || this.tickFeed.latestTicks.get(tokenStr);
-                        if (tick?.ltp > 0) currentPrice = tick.ltp;
+            // Tick cache fallback for symbols broker missed
+            for (const sym of symbols) {
+                if (prices[sym]) continue;
+                const posCtx = positions.get(sym);
+                if (posCtx?._lastTickPrice > 0) {
+                    prices[sym] = posCtx._lastTickPrice;
+                    continue;
+                }
+                // Try tick feed latestTicks
+                if (this.tickFeed?.latestTicks && this.tickFeed?.symbolMap) {
+                    for (const [tok, mappedSym] of Object.entries(this.tickFeed.symbolMap)) {
+                        if (mappedSym === sym) {
+                            const tick = this.tickFeed.latestTicks.get(Number(tok))
+                                || this.tickFeed.latestTicks.get(tok);
+                            if (tick?.ltp > 0) { prices[sym] = tick.ltp; break; }
+                        }
                     }
                 }
+            }
 
-                if (currentPrice <= 0) continue;
+            // ── 2. Process each position ──────────────────────────────────────────
+            for (const [symbol, posCtx] of positions) {
+                try {
+                    const currentPrice = prices[symbol];
+                    if (!currentPrice || currentPrice <= 0) continue;
 
-                const isShort = posCtx.isShort ?? posCtx.direction === 'SELL';
-                const entry   = posCtx.entryPrice ?? posCtx.price;
-                if (!entry || !posCtx.quantity) continue;
+                    // Store for evaluateTick fallback
+                    posCtx._lastTickPrice = posCtx._lastTickPrice || currentPrice;
 
-                const unrealizedPnl = isShort
-                    ? (entry - currentPrice) * posCtx.quantity
-                    : (currentPrice - entry) * posCtx.quantity;
-                const currentPeak = posCtx.peakUnrealizedPnl ?? 0;
+                    const isShort = posCtx.isShort ?? posCtx.direction === 'SELL';
+                    const entry   = posCtx.entryPrice ?? posCtx.price;
+                    const qty     = posCtx.quantity;
+                    if (!entry || !qty) continue;
 
-                if (unrealizedPnl > currentPeak) {
-                    log.info({ symbol, unrealizedPnl: +unrealizedPnl.toFixed(2),
-                        oldPeak: +currentPeak.toFixed(2), currentPrice, entry,
-                        isShort, qty: posCtx.quantity },
-                        '📈 _syncPeakPnl: advancing peak');
-                    posCtx.peakUnrealizedPnl = unrealizedPnl;
-                    posCtx.peakPnlAt = Date.now();
+                    const unrealizedPnl = isShort
+                        ? (entry - currentPrice) * qty
+                        : (currentPrice - entry) * qty;
 
-                    // Persist to Redis
+                    // ── 2a. Advance peak ──────────────────────────────────────────
+                    const currentPeak = posCtx.peakUnrealizedPnl ?? 0;
+                    if (unrealizedPnl > currentPeak) {
+                        posCtx.peakUnrealizedPnl = unrealizedPnl;
+                        posCtx.peakPnlAt = Date.now();
+                        log.info({ symbol, pnl: +unrealizedPnl.toFixed(2),
+                            oldPeak: +currentPeak.toFixed(2), price: currentPrice },
+                            '📈 _syncPeakPnl: peak advanced');
+                    }
+
+                    // ── 2b. Ratchet trail stop ────────────────────────────────────
+                    const trailMode = posCtx.trailMode ?? 'PNL_TRAIL';
+                    if (trailMode === 'PNL_TRAIL' || trailMode === 'HYBRID') {
+                        const pnlFloor = posCtx.pnlTrailFloor ?? (entry * qty * 0.005);
+                        const effectivePeak = posCtx.peakUnrealizedPnl ?? 0;
+                        const pnlTrailPct = posCtx.pnlTrailPct ?? 25;
+
+                        if (effectivePeak >= pnlFloor && effectivePeak > 0) {
+                            const newTrailStop = effectivePeak * (1 - pnlTrailPct / 100);
+                            if (newTrailStop > (posCtx.pnlTrailStop ?? -Infinity)) {
+                                posCtx.pnlTrailStop = newTrailStop;
+                                posCtx.pnlTrailActivated = true;
+                            }
+                        }
+                    }
+
+                    // ── 2c. ALWAYS persist to Redis (every cycle) ─────────────────
                     getRedis().hset(`trail:${symbol}`,
-                        'peakUnrealizedPnl', String(unrealizedPnl),
+                        'peakUnrealizedPnl', String(posCtx.peakUnrealizedPnl ?? 0),
                         'pnlTrailStop', String(posCtx.pnlTrailStop ?? -Infinity)
                     ).catch(() => { });
+
+                    // ── 2d. Check exits — skip if already exiting ─────────────────
+                    if (posCtx.isExiting) continue;
+
+                    // Trail stop breach
+                    const trailActive = posCtx.pnlTrailActivated || (posCtx.pnlTrailStop ?? -Infinity) > -Infinity;
+                    if (trailActive && unrealizedPnl < (posCtx.pnlTrailStop ?? -Infinity)
+                        && (posCtx.peakUnrealizedPnl ?? 0) > 0) {
+                        posCtx.isExiting = true;
+                        posCtx._isExitingSetAt = Date.now();
+                        log.info({ symbol, pnl: +unrealizedPnl.toFixed(2),
+                            peak: +(posCtx.peakUnrealizedPnl).toFixed(2),
+                            trailStop: +(posCtx.pnlTrailStop).toFixed(2), currentPrice },
+                            '🚨 _syncPeakPnl: PnL trail BREACHED — forcing exit!');
+                        this.engine.forceExit(symbol, currentPrice, 'TRAILING_STOP')
+                            .then(res => this._notifyExit(symbol, posCtx, currentPrice, 'TRAILING_STOP', {
+                                trailType: 'PNL_TRAIL',
+                                currentPnl: +unrealizedPnl.toFixed(2),
+                                peakPnl: +(posCtx.peakUnrealizedPnl).toFixed(2),
+                                pnlFloor: +(posCtx.pnlTrailStop).toFixed(2),
+                            }, res))
+                            .catch(err => log.error({ symbol, err: err.message }, '_syncPeakPnl trail exit failed'))
+                            .finally(() => { posCtx.isExiting = false; });
+                        continue; // don't also check stop loss
+                    }
+
+                    // Hard stop loss breach
+                    const stopHit = isShort
+                        ? currentPrice >= posCtx.stopPrice
+                        : currentPrice <= posCtx.stopPrice;
+                    if (stopHit && posCtx.stopPrice > 0) {
+                        posCtx.isExiting = true;
+                        posCtx._isExitingSetAt = Date.now();
+                        log.info({ symbol, currentPrice, stopPrice: posCtx.stopPrice },
+                            '🚨 _syncPeakPnl: STOP LOSS hit — forcing exit!');
+                        this.engine.forceExit(symbol, currentPrice, 'STOP_LOSS')
+                            .then(res => this._notifyExit(symbol, posCtx, currentPrice, 'STOP_LOSS', {
+                                trigger: posCtx.stopPrice, current: currentPrice,
+                            }, res))
+                            .catch(err => log.error({ symbol, err: err.message }, '_syncPeakPnl stop exit failed'))
+                            .finally(() => { posCtx.isExiting = false; });
+                    }
+                } catch (err) {
+                    log.debug({ symbol, err: err.message }, '_syncPeakPnl position error');
                 }
-            } catch (err) {
-                log.debug({ symbol, err: err.message }, '_syncPeakPnl error');
             }
+        } catch (err) {
+            log.warn({ err: err.message }, '_syncPeakPnl cycle failed');
+        } finally {
+            this._syncInProgress = false;
         }
     }
 
