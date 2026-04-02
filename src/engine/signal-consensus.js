@@ -403,36 +403,10 @@ export class SignalConsensus {
       };
     }
 
-    // ── RSI-only SELL: valid long exit, NOT a short entry ─────────────────
-    // If the only SELL voters are SHORT_INELIGIBLE (e.g. RSI alone),
-    // surface the SELL so a held long position can be closed, but flag
-    // isShortEntry:false so the engine does NOT open a new short.
-    if (groupVotes.reversal.sell >= 1 || groupVotes.momentum.sell >= 1) {
-      const hasShortEligibleSell = shortEligibleResults.some(
-        r => r.signal === SIGNAL.SELL && r.meetsFloor && !r.suppressedByTime
-      );
-      if (!hasShortEligibleSell) {
-        const sellResults = results.filter(
-          r => r.signal === SIGNAL.SELL &&
-            r.confidence >= this.minConfidence &&
-            r.meetsFloor &&
-            !r.suppressedByTime
-        );
-        if (sellResults.length > 0) {
-          const confidence = Math.round(
-            sellResults.reduce((sum, r) => sum + r.confidence, 0) / sellResults.length
-          );
-          return {
-            signal: SIGNAL.SELL,
-            confidence,
-            isShortEntry: false,   // ← exit long only, do NOT open short
-            reason: 'SELL signal (EXIT LONG ONLY — RSI overbought, not eligible to open short)',
-          };
-        }
-      }
-    }
-
     // ── Super Conviction Bypass ───────────────────────────────────────────
+    // Checked BEFORE the "RSI-only SELL" path so that a single strategy at
+    // ≥superConvictionThreshold confidence can open a genuine short entry
+    // rather than being demoted to an exit-only SELL by the fallback path.
     if (this.superConvictionEnabled) {
       const extremeResults = results.filter(
         r => r.confidence >= this.superConvictionThreshold &&
@@ -502,6 +476,37 @@ export class SignalConsensus {
             convictionStrategy: best.strategy,
             isShortEntry,
             reason: `SUPER CONVICTION BYPASS: ${best.strategy} reached ${best.confidence}% confidence. Cross-group consensus skipped.`,
+          };
+        }
+      }
+    }
+
+    // ── RSI-only SELL: valid long exit, NOT a short entry ─────────────────
+    // If the only SELL voters are SHORT_INELIGIBLE (e.g. RSI alone),
+    // surface the SELL so a held long position can be closed, but flag
+    // isShortEntry:false so the engine does NOT open a new short.
+    // This is checked AFTER Super Conviction so a high-confidence eligible
+    // strategy doesn't get demoted to an exit-only SELL by this fallback.
+    if (groupVotes.reversal.sell >= 1 || groupVotes.momentum.sell >= 1) {
+      const hasShortEligibleSell = shortEligibleResults.some(
+        r => r.signal === SIGNAL.SELL && r.meetsFloor && !r.suppressedByTime
+      );
+      if (!hasShortEligibleSell) {
+        const sellResults = results.filter(
+          r => r.signal === SIGNAL.SELL &&
+            r.confidence >= this.minConfidence &&
+            r.meetsFloor &&
+            !r.suppressedByTime
+        );
+        if (sellResults.length > 0) {
+          const confidence = Math.round(
+            sellResults.reduce((sum, r) => sum + r.confidence, 0) / sellResults.length
+          );
+          return {
+            signal: SIGNAL.SELL,
+            confidence,
+            isShortEntry: false,   // ← exit long only, do NOT open short
+            reason: 'SELL signal (EXIT LONG ONLY — not eligible to open short)',
           };
         }
       }

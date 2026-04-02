@@ -681,6 +681,14 @@ async function main() {
           if (positionManager) positionManager.broker = broker;
           if (instrumentManager) instrumentManager.broker = broker;
 
+          // Update tick feed token so the next WebSocket reconnect uses the new token.
+          // TickFeed reads this.accessToken in _connect() — mutating it here means
+          // the next disconnect/reconnect cycle picks up the fresh token automatically.
+          if (tickFeed) {
+            tickFeed.accessToken = accessToken;
+            log.info('Tick feed access token updated');
+          }
+
           log.info('Broker and dependent components updated with new access token');
         } else if (!result.success) {
           // runAutoLogin already sends a failure alert via Telegram
@@ -913,24 +921,25 @@ async function main() {
       }
     } catch { /* DB unavailable — continue with existing list */ }
 
-    // Ensure all currently open positions are forcefully added to the watchlist.
-    // If a dynamically scanned symbol was bought yesterday and dropped today,
-    // we MUST still subscribe to its ticks and evaluate it for exit signals.
+    // S4 FIX: Cap watchlist size BEFORE injecting open positions so that held
+    // symbols always survive the cap. Open positions must be evaluated for
+    // both Phase 1 signal collection (reversal exits) and Phase 3 entry scans.
+    const MAX_WATCHLIST_SIZE = 50;
+    if (activeSymbols.length > MAX_WATCHLIST_SIZE) {
+      log.warn({ count: activeSymbols.length, cap: MAX_WATCHLIST_SIZE },
+        'Watchlist size exceeds limit — capping to maintain scan performance');
+      activeSymbols = activeSymbols.slice(0, MAX_WATCHLIST_SIZE);
+    }
+
+    // Forcefully append all currently open positions AFTER the cap so they are
+    // never evicted. Without this, a position that dropped off the scout list
+    // after entry would lose Phase 1 signal-reversal evaluation.
     if (engine && engine._filledPositions) {
       for (const posSymbol of engine._filledPositions.keys()) {
         if (!activeSymbols.includes(posSymbol)) {
           activeSymbols.push(posSymbol);
         }
       }
-    }
-
-    // S4 FIX: Cap watchlist size to maintain scan performance.
-    // 50 symbols take ~5-7 seconds to scan. 200+ would block the event loop too long.
-    const MAX_WATCHLIST_SIZE = 50;
-    if (activeSymbols.length > MAX_WATCHLIST_SIZE) {
-      log.warn({ count: activeSymbols.length, cap: MAX_WATCHLIST_SIZE },
-        'Watchlist size exceeds limit — capping to mantain scan performance');
-      activeSymbols = activeSymbols.slice(0, MAX_WATCHLIST_SIZE);
     }
 
     // Dynamic TickFeed Subscription Sync
@@ -951,97 +960,98 @@ async function main() {
       }
     }
 
-    const items = [];
-
-    // Bug Fix 6: Batch query for all position stats outside the loop 
+    // Bug Fix 6: Batch query for all position stats outside the loop
     // to avoid N sequential queries and heavily reduce DB latency on scans
     const statsMap = positionStats ? await positionStats.getStatsBatch(activeSymbols) : null;
 
-    for (const symbol of activeSymbols) {
-      try {
-        const instrumentToken = instrumentManager?.getToken(symbol)
-          ?? watchlistTokens[symbol]
-          ?? null;
+    // Fetch prices and candles for all symbols in parallel rather than serially.
+    // Serial fetches for 50 symbols at 200-400ms each = 10-20s per scan cycle,
+    // risking scan overlap. Promise.allSettled ensures one slow symbol can't
+    // block the rest; rejected items are filtered out below.
+    const itemResults = await Promise.allSettled(activeSymbols.map(async (symbol) => {
+      const instrumentToken = instrumentManager?.getToken(symbol)
+        ?? watchlistTokens[symbol]
+        ?? null;
 
-        let currentPrice = 0;
-        if (tickFeed && instrumentToken) {
-          const tick = tickFeed.getLatestTick(instrumentToken);
-          if (tick) currentPrice = tick.lastPrice || tick.close || 0;
-        }
-
-        if (!currentPrice && broker) {
-          try {
-            const ltp = await broker.getLTP([`NSE:${symbol}`]);
-            currentPrice = ltp?.[`NSE:${symbol}`]?.last_price ?? 0;
-          } catch (ltpErr) {
-            log.warn({ symbol, err: ltpErr.message }, 'LTP fetch failed — price unresolvable this cycle');
-          }
-        }
-
-        // Task 4: Skip symbol if price cannot be determined.
-        // A zero price would create orders with price=0 in the DB, which is misleading
-        // and causes incorrect P&L calculations. Skip and retry next scan cycle.
-        if (!currentPrice || currentPrice <= 0) {
-          log.warn({ symbol }, 'Skipping symbol — could not resolve current price');
-          continue;
-        }
-
-        let candles = [];
-        if (broker && instrumentToken) {
-          try {
-            candles = await fetchRecentCandles({
-              broker, instrumentToken, symbol,
-              interval: '5minute', count: 200,
-            });
-          } catch (candleErr) {
-            log.warn({ symbol, err: candleErr.message }, 'Candle fetch failed — strategy will receive empty candles');
-          }
-        }
-
-        // Feature 4: Use real historical win-rate / avg P&L from signal_outcomes
-        // instead of fixed defaults. Falls back to defaults if sample size < 10.
-        const stats = statsMap?.get(symbol) ?? { winRate: 0.5, avgWin: 1000, avgLoss: 500 };
-
-        const sizing = calculatePositionSize({
-          capital: riskManager.capital,
-          winRate: stats.winRate,
-          avgWin: stats.avgWin,
-          avgLoss: stats.avgLoss,
-          entryPrice: currentPrice || 100,
-          symbol,
-          maxRiskPct: riskManager.perTradeStopLossPct,
-          maxPositionPct: riskManager.maxPositionPct,
-        });
-
-        log.debug({
-          symbol,
-          winRate: stats.winRate,
-          avgWin: stats.avgWin,
-          avgLoss: stats.avgLoss,
-          usingDefaults: stats.usingDefaults,
-          sampleSize: stats.sampleSize,
-          quantity: sizing.quantity,
-        }, 'Position sizing (Kelly inputs)');
-
-        // L2 FIX: respect Kelly's "no trade" signal.
-        if (sizing.kellyNegative) {
-          log.debug({ symbol, kellyPct: sizing.kellyPct },
-            'Skipping symbol — Kelly indicates negative edge');
-          continue;
-        }
-
-        // S1 FIX: guard against NaN quantity.
-        if (!Number.isFinite(sizing.quantity) || sizing.quantity <= 0) {
-          log.debug({ symbol, quantity: sizing.quantity }, 'Skipping symbol — quantity is zero or invalid');
-          continue;
-        }
-
-        const finalQuantity = sizing.quantity;
-
-        items.push({ symbol, instrumentToken, candles, price: currentPrice, quantity: finalQuantity });
-      } catch (err) {
-        log.warn({ symbol, err: err.message }, 'Failed to build watchlist item');
+      let currentPrice = 0;
+      if (tickFeed && instrumentToken) {
+        const tick = tickFeed.getLatestTick(instrumentToken);
+        if (tick) currentPrice = tick.lastPrice || tick.close || 0;
       }
+
+      if (!currentPrice && broker) {
+        try {
+          const ltp = await broker.getLTP([`NSE:${symbol}`]);
+          currentPrice = ltp?.[`NSE:${symbol}`]?.last_price ?? 0;
+        } catch (ltpErr) {
+          log.warn({ symbol, err: ltpErr.message }, 'LTP fetch failed — price unresolvable this cycle');
+        }
+      }
+
+      // Task 4: Skip symbol if price cannot be determined.
+      if (!currentPrice || currentPrice <= 0) {
+        log.warn({ symbol }, 'Skipping symbol — could not resolve current price');
+        return null;
+      }
+
+      let candles = [];
+      if (broker && instrumentToken) {
+        try {
+          candles = await fetchRecentCandles({
+            broker, instrumentToken, symbol,
+            interval: '5minute', count: 200,
+          });
+        } catch (candleErr) {
+          log.warn({ symbol, err: candleErr.message }, 'Candle fetch failed — strategy will receive empty candles');
+        }
+      }
+
+      // Feature 4: Use real historical win-rate / avg P&L from signal_outcomes
+      const stats = statsMap?.get(symbol) ?? { winRate: 0.5, avgWin: 1000, avgLoss: 500 };
+
+      const sizing = calculatePositionSize({
+        capital: riskManager.capital,
+        winRate: stats.winRate,
+        avgWin: stats.avgWin,
+        avgLoss: stats.avgLoss,
+        entryPrice: currentPrice || 100,
+        symbol,
+        maxRiskPct: riskManager.perTradeStopLossPct,
+        maxPositionPct: riskManager.maxPositionPct,
+      });
+
+      log.debug({
+        symbol,
+        winRate: stats.winRate,
+        avgWin: stats.avgWin,
+        avgLoss: stats.avgLoss,
+        usingDefaults: stats.usingDefaults,
+        sampleSize: stats.sampleSize,
+        quantity: sizing.quantity,
+      }, 'Position sizing (Kelly inputs)');
+
+      // L2 FIX: respect Kelly's "no trade" signal.
+      if (sizing.kellyNegative) {
+        log.debug({ symbol, kellyPct: sizing.kellyPct }, 'Skipping symbol — Kelly indicates negative edge');
+        return null;
+      }
+
+      // S1 FIX: guard against NaN quantity.
+      if (!Number.isFinite(sizing.quantity) || sizing.quantity <= 0) {
+        log.debug({ symbol, quantity: sizing.quantity }, 'Skipping symbol — quantity is zero or invalid');
+        return null;
+      }
+
+      return { symbol, instrumentToken, candles, price: currentPrice, quantity: sizing.quantity };
+    }));
+
+    const items = itemResults
+      .filter(r => r.status === 'fulfilled' && r.value !== null)
+      .map(r => r.value);
+
+    const rejected = itemResults.filter(r => r.status === 'rejected');
+    if (rejected.length > 0) {
+      log.warn({ count: rejected.length }, 'Some watchlist items failed to build');
     }
 
     return items;
@@ -1382,6 +1392,11 @@ async function main() {
           const newToken = loginResult.accessToken;
           if (broker) {
             broker.primary.setAccessToken(newToken);
+            // Also update dependent components that cache the token reference
+            if (engine) engine.broker = broker;
+            if (holdingsManager) holdingsManager.broker = broker;
+            if (positionManager) positionManager.broker = broker;
+            if (instrumentManager) instrumentManager.broker = broker;
             log.info('✅ Broker access token refreshed');
           } else {
             try {
@@ -1394,11 +1409,20 @@ async function main() {
               engine.broker = broker;
               engine.paperMode = !config.LIVE_TRADING;
               scheduler.broker = broker;
-              if (scout) scout.broker = broker;   // ← give scout live broker too
+              if (scout) scout.broker = broker;
+              if (holdingsManager) holdingsManager.broker = broker;
+              if (positionManager) positionManager.broker = broker;
+              if (instrumentManager) instrumentManager.broker = broker;
               log.info('✅ Broker initialized from scheduled auto-login');
             } catch (initErr) {
               log.error({ err: initErr.message }, 'Failed to init broker after login');
             }
+          }
+
+          // Update tick feed token so the next WebSocket reconnect uses the new token
+          if (tickFeed) {
+            tickFeed.accessToken = newToken;
+            log.info('✅ Tick feed access token updated from scheduled login');
           }
         } else {
           throw new Error(loginResult.error || 'Token not returned');

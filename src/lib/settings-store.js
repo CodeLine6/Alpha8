@@ -5,6 +5,14 @@
  * Parameters set here take effect on the next scan cycle.
  *
  * Storage: Redis hash at key `live:settings` (prefixed to `alpha8:live:settings`)
+ *
+ * Validation added to setLiveSetting:
+ *   - Numeric keys reject non-numeric values and enforce positive-only constraints.
+ *   - Boolean keys reject anything other than 'true' or 'false'.
+ *   - Enum keys (TRAIL_MODE) reject unrecognised values.
+ *   - Cross-field constraints from the startup Zod schema are re-checked:
+ *       KILL_SWITCH_DRAWDOWN_PCT >= MAX_DAILY_LOSS_PCT
+ *       STOP_LOSS_PCT < TRAILING_STOP_PCT  (if both are set)
  */
 
 import { getRedis } from './redis.js';
@@ -90,6 +98,127 @@ const DEFAULTS = {
     SCOUT_MAX_DYNAMIC: null,
 };
 
+// ── Per-key type metadata ─────────────────────────────────────────────────────
+
+const BOOLEAN_KEYS = new Set([
+    'PARTIAL_EXIT_ENABLED', 'SIGNAL_REVERSAL_ENABLED', 'USE_ATR_TRAIL', 'SHORTS_ENABLED',
+]);
+
+const ENUM_KEYS = {
+    TRAIL_MODE: ['PNL_TRAIL', 'PRICE_TRAIL', 'HYBRID'],
+};
+
+// Keys that must be > 0
+const POSITIVE_KEYS = new Set([
+    'MAX_DAILY_LOSS_PCT', 'PER_TRADE_STOP_LOSS_PCT', 'KILL_SWITCH_DRAWDOWN_PCT',
+    'TRADING_CAPITAL', 'MAX_CAPITAL_EXPOSURE_PCT', 'MAX_POSITION_VALUE_PCT',
+    'STOP_LOSS_PCT', 'TRAILING_STOP_PCT', 'PROFIT_TARGET_PCT', 'RISK_REWARD_RATIO',
+    'PARTIAL_EXIT_PCT', 'PNL_TRAIL_PCT',
+    'MAX_POSITION_COUNT', 'MAX_HOLD_MINUTES',
+    'EMA_FAST_PERIOD', 'EMA_SLOW_PERIOD',
+    'RSI_PERIOD', 'VWAP_VOLUME_AVG_PERIOD',
+    'BREAKOUT_LOOKBACK', 'BAVI_MIN_TICK_COUNT',
+    'SHORT_MIN_CONFIDENCE', 'MIN_CONFIDENCE', 'MIN_AGREEMENT', 'SUPER_CONVICTION_THRESHOLD',
+    'SCOUT_MAX_DYNAMIC',
+]);
+
+// All numeric keys (positive + non-negative)
+const NUMERIC_KEYS = new Set([
+    ...POSITIVE_KEYS,
+    'PNL_TRAIL_FLOOR',           // 0 is valid (no floor)
+    'VWAP_PRICE_BAND_PCT',
+    'ORB_MIN_RANGE_PCT', 'ORB_MAX_RANGE_PCT', 'ORB_VOLUME_MULTIPLIER',
+    'VWAP_VOLUME_MULTIPLIER',
+    'BREAKOUT_VOLUME_MULTIPLIER', 'BREAKOUT_BB_PERIOD', 'BREAKOUT_BB_STDDEV',
+    'BAVI_IMBALANCE_THRESHOLD', 'BAVI_STRONG_IMBALANCE',
+    'RSI_OVERSOLD', 'RSI_OVERBOUGHT', 'RSI_EXTREME_OVERSOLD', 'RSI_EXTREME_OVERBOUGHT',
+]);
+
+/**
+ * Validate a key+value pair before writing to Redis.
+ * Mirrors the cross-field constraints enforced by the startup Zod schema.
+ * @throws {Error} on any violation
+ * @private
+ */
+async function validateSetting(key, value) {
+    // ── Boolean keys ──────────────────────────────────────────────────────────
+    if (BOOLEAN_KEYS.has(key)) {
+        if (value !== 'true' && value !== 'false') {
+            throw new Error(`${key} must be 'true' or 'false', got: "${value}"`);
+        }
+        return;
+    }
+
+    // ── Enum keys ─────────────────────────────────────────────────────────────
+    if (ENUM_KEYS[key]) {
+        if (!ENUM_KEYS[key].includes(value)) {
+            throw new Error(`${key} must be one of [${ENUM_KEYS[key].join(', ')}], got: "${value}"`);
+        }
+        return;
+    }
+
+    // ── Numeric keys ─────────────────────────────────────────────────────────
+    if (NUMERIC_KEYS.has(key)) {
+        const num = Number(value);
+        if (isNaN(num) || !isFinite(num)) {
+            throw new Error(`${key} must be a number, got: "${value}"`);
+        }
+        if (POSITIVE_KEYS.has(key) && num <= 0) {
+            throw new Error(`${key} must be > 0, got: ${num}`);
+        }
+        if (!POSITIVE_KEYS.has(key) && num < 0) {
+            throw new Error(`${key} must be >= 0, got: ${num}`);
+        }
+
+        // ── Cross-field constraints ───────────────────────────────────────────
+        // Re-check the startup Zod refine() constraints so /set cannot produce
+        // a configuration the startup validator would have rejected.
+        const redis = getRedis();
+
+        if (key === 'MAX_DAILY_LOSS_PCT') {
+            const ksRaw = await redis.hget(REDIS_KEY, 'KILL_SWITCH_DRAWDOWN_PCT');
+            const ksPct = ksRaw !== null ? Number(ksRaw) : null;
+            if (ksPct !== null && num > ksPct) {
+                throw new Error(
+                    `MAX_DAILY_LOSS_PCT (${num}) cannot exceed KILL_SWITCH_DRAWDOWN_PCT (${ksPct}). ` +
+                    `Lower KILL_SWITCH_DRAWDOWN_PCT first or raise it simultaneously.`
+                );
+            }
+        }
+
+        if (key === 'KILL_SWITCH_DRAWDOWN_PCT') {
+            const dlRaw = await redis.hget(REDIS_KEY, 'MAX_DAILY_LOSS_PCT');
+            const dlPct = dlRaw !== null ? Number(dlRaw) : null;
+            if (dlPct !== null && num < dlPct) {
+                throw new Error(
+                    `KILL_SWITCH_DRAWDOWN_PCT (${num}) must be >= MAX_DAILY_LOSS_PCT (${dlPct}).`
+                );
+            }
+        }
+
+        if (key === 'STOP_LOSS_PCT') {
+            const trailRaw = await redis.hget(REDIS_KEY, 'TRAILING_STOP_PCT');
+            const trailPct = trailRaw !== null ? Number(trailRaw) : null;
+            if (trailPct !== null && num >= trailPct) {
+                throw new Error(
+                    `STOP_LOSS_PCT (${num}) must be < TRAILING_STOP_PCT (${trailPct}). ` +
+                    `The hard stop must be tighter than the trail activation level.`
+                );
+            }
+        }
+
+        if (key === 'TRAILING_STOP_PCT') {
+            const stopRaw = await redis.hget(REDIS_KEY, 'STOP_LOSS_PCT');
+            const stopPct = stopRaw !== null ? Number(stopRaw) : null;
+            if (stopPct !== null && num <= stopPct) {
+                throw new Error(
+                    `TRAILING_STOP_PCT (${num}) must be > STOP_LOSS_PCT (${stopPct}).`
+                );
+            }
+        }
+    }
+}
+
 export async function getLiveSetting(key, configFallback) {
     try {
         const raw = await getRedis().hget(REDIS_KEY, key);
@@ -109,7 +238,9 @@ export async function setLiveSetting(key, value) {
             `Valid keys: ${Object.keys(DEFAULTS).join(', ')}`
         );
     }
-    await getRedis().hset(REDIS_KEY, key, String(value));
+    const strValue = String(value).trim();
+    await validateSetting(key, strValue);
+    await getRedis().hset(REDIS_KEY, key, strValue);
 }
 
 export async function getAllLiveSettings() {

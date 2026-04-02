@@ -21,6 +21,7 @@
 
 import { createLogger } from '../lib/logger.js';
 import { getRedis } from '../lib/redis.js';
+import { isMarketOpen, isSimMode } from '../data/market-hours.js';
 import {
     computeExitLevels,
     evaluateExits,
@@ -127,14 +128,16 @@ export class PositionManager {
                     : entry + (entry - newStop) * rrRatio;
             }
 
-            // Static bounds sync natively on global change
-
+            // Always sync stopPrice to current live settings for ALL open positions.
+            // Previously this only updated hydratedFromDB positions, so positions
+            // entered during the current session never had their stop price updated
+            // when STOP_LOSS_PCT was changed via /set.
+            posCtx.stopPrice = newStop;
             posCtx.profitTargetPrice = newTarget;
             posCtx.profitTargetMode = targetMode;
 
             if (posCtx.hydratedFromDB) {
-                posCtx.stopPrice = newStop;
-                posCtx.hydratedFromDB = false; // Synced!
+                posCtx.hydratedFromDB = false; // Mark as synced after first live-settings pass
             }
         }
     }
@@ -271,6 +274,11 @@ export class PositionManager {
     async _syncPeakPnl() {
         if (!this.enabled) return;
         if (this._syncInProgress) return;  // concurrency guard
+
+        // Skip broker LTP calls outside market hours (saves API quota and prevents
+        // spurious exits from stale prices). SIM mode bypasses this guard.
+        if (!isMarketOpen() && !isSimMode()) return;
+
         this._syncInProgress = true;
 
         try {

@@ -200,10 +200,23 @@ export class ExecutionEngine {
         entry.netQty += qty;
         if (!entry.entryTime) entry.entryTime = row.created_at;
       } else if (row.side === 'SELL') {
-        if (entry.netQty >= 0) {
-          // Closing long or starting fresh short — reset weighted average
-          entry.weightedPriceSum = price * qty;
+        if (entry.netQty > 0 && qty < entry.netQty) {
+          // Partial close of long: preserve VWAP by scaling down weightedPriceSum proportionally.
+          // FIX: previous code reset to exitPrice * exitQty, making the hydrated entryPrice
+          // equal to the exit price instead of the original entry price.
+          entry.weightedPriceSum = (entry.weightedPriceSum / entry.netQty) * (entry.netQty - qty);
+        } else if (entry.netQty > 0) {
+          // Full long close or long→short flip
+          const shortQty = qty - entry.netQty; // > 0 only when flipping into a short
+          entry.weightedPriceSum = shortQty > 0 ? price * shortQty : 0;
           if (!entry.entryTime || entry.netQty === 0) entry.entryTime = row.created_at;
+        } else if (entry.netQty === 0) {
+          // Starting a fresh short from flat
+          entry.weightedPriceSum = price * qty;
+          if (!entry.entryTime) entry.entryTime = row.created_at;
+        } else {
+          // Adding to an existing short — accumulate weighted sum (same logic as BUY adds to long)
+          entry.weightedPriceSum += price * qty;
         }
         entry.netQty -= qty;
       }
@@ -395,17 +408,27 @@ export class ExecutionEngine {
     let acted = false;
     let order = null;
 
-    // src/engine/execution-engine.js — processSignal()
-    // Only run the pipeline for BUY signals:
-
     let finalSignal = consensusResult;
     let adjustedQty = quantity;
     let pipelineLog = null;
 
-    if (this.pipeline && consensusResult.signal === 'BUY') {  // ← ADD signal check
+    // Determine short entry early so pipeline routing can use it.
+    // A SELL is a short entry when consensus explicitly flags it, or when
+    // a Super Conviction strategy fires and is short-eligible.
+    const isShortEntrySignal = consensusResult.signal === 'SELL' && (
+      consensusResult.isShortEntry === true ||
+      (consensusResult.convictionStrategy &&
+        !SHORT_INELIGIBLE_STRATEGIES.has(consensusResult.convictionStrategy) &&
+        consensusResult.isShortEntry !== false)
+    );
+
+    // Run the pipeline for BUY signals AND for new short entries.
+    // Plain long-exit SELLs bypass the pipeline — exits must always be allowed.
+    // Gate 2 (TrendFilter) passes SELL unconditionally.
+    // Gate 4 (NewsSentiment) passes SELL unconditionally and boosts confidence on negative news.
+    // Gate 3 (RegimeDetector) is direction-agnostic and correctly gates all new positions.
+    if (this.pipeline && (consensusResult.signal === 'BUY' || isShortEntrySignal)) {
       const isConviction = !!consensusResult.convictionStrategy;
-      // Pass the live-setting threshold so the pipeline's bypass check uses
-      // the same value that signal-consensus used to grant convictionStrategy.
       const convictionThreshold = this.consensus.superConvictionThreshold ?? 80;
       const pipelineResult = await this.pipeline.process(
         symbol, consensusResult.details || [], regime, isConviction, convictionThreshold
@@ -413,7 +436,8 @@ export class ExecutionEngine {
       pipelineLog = pipelineResult.log;
 
       if (!pipelineResult.allowed) {
-        log.info({ symbol, blockedBy: pipelineResult.blockedBy }, 'BUY blocked by pipeline');
+        log.info({ symbol, blockedBy: pipelineResult.blockedBy, signal: consensusResult.signal },
+          `${consensusResult.signal} blocked by pipeline`);
         if (this.shadowRecorder) {
           this.shadowRecorder.recordSignals(
             symbol, consensusResult.details || [], consensusResult,
@@ -435,8 +459,8 @@ export class ExecutionEngine {
         finalSignal = { ...consensusResult, ...pipelineResult.signal };
       }
     } else if (this.pipeline && consensusResult.signal === 'SELL') {
-      // SELL signals bypass pipeline gates — exits must always be allowed
-      log.debug({ symbol }, 'SELL signal bypasses pipeline gates');
+      // Plain long-exit SELL — bypass pipeline gates (exits must always be allowed)
+      log.debug({ symbol }, 'SELL long-exit signal bypasses pipeline gates');
     }
 
     if (finalSignal.signal === 'BUY') {
@@ -456,11 +480,8 @@ export class ExecutionEngine {
     } else if (finalSignal.signal === 'SELL') {
       // A SELL signal can mean:
       //   (a) Exit an existing long  — handled by executeOrder's SELL path
-      //   (b) Open a new short       — only if isShortEntry===true in consensus
-      const isShortEntry = consensusResult.isShortEntry === true ||
-        (consensusResult.convictionStrategy &&
-          !SHORT_INELIGIBLE_STRATEGIES.has(consensusResult.convictionStrategy) &&
-          consensusResult.isShortEntry !== false);
+      //   (b) Open a new short       — only if isShortEntrySignal is true (computed above)
+      const isShortEntry = isShortEntrySignal;
 
       // ── SHORT QUALITY GATES ──────────────────────────────────────────────
       // Shorts are allowed but require higher conviction than longs.
@@ -532,7 +553,7 @@ export class ExecutionEngine {
       quantity:     adjustedQty,
       price:        currentPrice,
       strategy:     finalSignal.reason || consensusResult.reason,
-      isShortEntry: consensusResult.isShortEntry ?? false,   // Fix BUG-01: was missing, causing all short entries to be rejected
+      isShortEntry: isShortEntrySignal,   // use the early-computed value (consistent with pipeline routing)
     });
 
     acted = (order.state === (this.paperMode ? 'FILLED' : 'PLACED') || order.state === 'FILLED');
@@ -577,7 +598,7 @@ export class ExecutionEngine {
   // POSITION OUTCOME RECORDING
   // ═══════════════════════════════════════════════════════
 
-  async recordPositionOutcome(symbol, pnl, forceStrategies = null) {
+  async recordPositionOutcome(symbol, pnl, forceStrategies = null, direction = 'BUY') {
     if (!this.pipeline) {
       log.warn({ symbol }, 'recordPositionOutcome: pipeline not available');
       return;
@@ -591,21 +612,21 @@ export class ExecutionEngine {
     }
 
     if (strategies.length === 0) {
-      log.warn({ symbol }, 'recordPositionOutcome: no BUY strategies on record for symbol');
+      log.warn({ symbol }, 'recordPositionOutcome: no strategies on record for symbol');
       return;
     }
 
     const outcome = pnl >= 0 ? 'WIN' : 'LOSS';
-    log.info({ symbol, pnl, outcome, strategies }, 'Recording position outcome for adaptive weights');
+    log.info({ symbol, pnl, outcome, strategies, direction }, 'Recording position outcome for adaptive weights');
 
     for (const strategy of strategies) {
-      // Call pipeline.recordTradeOutcome for each strategy (adaptive perf tracking)
+      // Use the actual signal direction so short outcomes don't corrupt long weight training
       if (this.pipeline.recordTradeOutcome) {
-        await this.pipeline.recordTradeOutcome(strategy, 'BUY', symbol, pnl);
+        await this.pipeline.recordTradeOutcome(strategy, direction, symbol, pnl);
       }
       if (this.pipeline.adaptiveWeights) {
         await this.pipeline.adaptiveWeights.recordOutcome({
-          strategy, signal: 'BUY', symbol, outcome, pnl,
+          strategy, signal: direction, symbol, outcome, pnl,
           paperMode: this.paperMode,
         });
       }
@@ -718,9 +739,10 @@ export class ExecutionEngine {
       order.costPaid = totalCost;
 
       if (isFullExit) {
-        // Fix for post-restart credit: pass strategies explicitly before deleting from _filledPositions
+        // Fix for post-restart credit: pass strategies and direction explicitly before deleting from _filledPositions
         const strategies = posCtx.strategies || [];
-        this.recordPositionOutcome(symbol, pnl, strategies).catch(err =>
+        const exitDirection = isShortPos ? 'SELL' : 'BUY';
+        this.recordPositionOutcome(symbol, pnl, strategies, exitDirection).catch(err =>
           log.warn({ symbol, err: err.message }, 'Outcome recording failed after force exit')
         );
 
@@ -964,9 +986,9 @@ export class ExecutionEngine {
             order.openEntryOrderId = existingPos.openOrderId ?? null;
 
             await this.riskManager.recordTradePnL(pnl, order.symbol);
-            // Fix Bug 14: pass existingPos.strategies explicitly so the correct
-            // strategies that opened the short get credited for the outcome.
-            this.recordPositionOutcome(order.symbol, pnl, existingPos.strategies).catch(() => {});
+            // Fix Bug 14: pass existingPos.strategies and direction explicitly so the correct
+            // strategies that opened the short get credited — with direction='SELL' (short entry).
+            this.recordPositionOutcome(order.symbol, pnl, existingPos.strategies, 'SELL').catch(() => {});
             this._filledPositions.delete(order.symbol);
             this._clearOpenPosition(order.symbol).catch(() => {});
             this.riskManager.removePosition();
@@ -1099,7 +1121,7 @@ export class ExecutionEngine {
             await this.riskManager.recordTradePnL(pnl, order.symbol);
             // Pass grossPnl to strategy outcome tracking so paper/live results are comparable
             // (netPnl varies by brokerage; grossPnl reflects the actual trade performance)
-            this.recordPositionOutcome(order.symbol, grossPnl).catch((err) =>
+            this.recordPositionOutcome(order.symbol, grossPnl, null, 'BUY').catch((err) =>
               log.warn({ symbol: order.symbol, err: err.message }, 'Position outcome recording failed')
             );
             this._filledPositions.delete(order.symbol);
