@@ -167,16 +167,16 @@ export class NewsSentimentFilter {
      * @returns {Promise<{ allowed: boolean, confidenceBoost: number, reason: string }>}
      */
     async check(symbol, signal) {
-        if (signal !== 'BUY') {
-            return { allowed: true, confidenceBoost: 0, reason: `${signal} passes news filter` };
+        if (signal === 'HOLD') {
+            return { allowed: true, confidenceBoost: 0, reason: `HOLD passes news filter` };
         }
 
         if (!this.enabled) {
             return { allowed: true, confidenceBoost: 0, reason: 'News filter disabled (no API key)' };
         }
 
-        // Check for active block first (fast path)
-        if (await this._isBlocked(symbol)) {
+        // Check for active block first (fast path for BUYs)
+        if (signal === 'BUY' && await this._isBlocked(symbol)) {
             return {
                 allowed: false,
                 confidenceBoost: 0,
@@ -186,25 +186,46 @@ export class NewsSentimentFilter {
 
         const result = await this._getOrFetch(symbol);
 
-        if (result.sentiment === 'NEGATIVE' && result.score <= -20) {
-            const blockHours = result.score <= -60 ? 8 : result.score <= -40 ? 6 : 4;
-            await this._blockSymbol(symbol, result.summary, blockHours * 3600);
-            return {
-                allowed: false,
-                confidenceBoost: 0,
-                reason: `${symbol} BUY blocked — negative news: ${result.summary}`,
-            };
+        if (signal === 'BUY') {
+            if (result.sentiment === 'NEGATIVE' && result.score <= -20) {
+                const blockHours = result.score <= -60 ? 8 : result.score <= -40 ? 6 : 4;
+                await this._blockSymbol(symbol, result.summary, blockHours * 3600);
+                return {
+                    allowed: false,
+                    confidenceBoost: 0,
+                    reason: `${symbol} BUY blocked — negative news: ${result.summary}`,
+                };
+            }
+
+            const confidenceBoost = (result.sentiment === 'POSITIVE' && result.score >= 30)
+                ? Math.min(15, Math.floor(result.score / 5))
+                : 0;
+
+            const reason = confidenceBoost > 0
+                ? `${symbol} news POSITIVE (+${confidenceBoost} confidence): ${result.summary}`
+                : `${symbol} news NEUTRAL — no adjustment`;
+
+            return { allowed: true, confidenceBoost, reason };
         }
 
-        const confidenceBoost = (result.sentiment === 'POSITIVE' && result.score >= 30)
-            ? Math.min(15, Math.floor(result.score / 5))
-            : 0;
+        if (signal === 'SELL') {
+            if (result.sentiment === 'NEGATIVE' && result.score <= -20) {
+                // Boost short confidence significantly on negative news
+                // E.g., score -80 --> +40 boost. Max +40.
+                const confidenceBoost = Math.min(40, Math.floor(Math.abs(result.score) / 2));
+                return {
+                    allowed: true,
+                    confidenceBoost,
+                    reason: `🔥🚨 ${symbol} news HIGHLY NEGATIVE (+${confidenceBoost} short confidence): ${result.summary}`,
+                };
+            }
 
-        const reason = confidenceBoost > 0
-            ? `${symbol} news POSITIVE (+${confidenceBoost} confidence): ${result.summary}`
-            : `${symbol} news NEUTRAL — no adjustment`;
+            if (result.sentiment === 'POSITIVE' && result.score >= 30) {
+                return { allowed: true, confidenceBoost: 0, reason: `⚠️ ${symbol} news POSITIVE — no short boost` };
+            }
 
-        return { allowed: true, confidenceBoost, reason };
+            return { allowed: true, confidenceBoost: 0, reason: `${symbol} news NEUTRAL — no adjustment` };
+        }
     }
 
     /** Manually unblock a symbol (e.g. from dashboard). */
