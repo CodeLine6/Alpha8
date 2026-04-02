@@ -913,6 +913,17 @@ async function main() {
       }
     } catch { /* DB unavailable — continue with existing list */ }
 
+    // Ensure all currently open positions are forcefully added to the watchlist.
+    // If a dynamically scanned symbol was bought yesterday and dropped today,
+    // we MUST still subscribe to its ticks and evaluate it for exit signals.
+    if (engine && engine._filledPositions) {
+      for (const posSymbol of engine._filledPositions.keys()) {
+        if (!activeSymbols.includes(posSymbol)) {
+          activeSymbols.push(posSymbol);
+        }
+      }
+    }
+
     // S4 FIX: Cap watchlist size to maintain scan performance.
     // 50 symbols take ~5-7 seconds to scan. 200+ would block the event loop too long.
     const MAX_WATCHLIST_SIZE = 50;
