@@ -230,7 +230,7 @@ export class PositionManager {
                             getRedis().hset(`trail:${symbol}`,
                                 'peakUnrealizedPnl', String(posCtx.peakUnrealizedPnl),
                                 'pnlTrailStop', String(posCtx.pnlTrailStop)
-                            ).catch(e => log.debug({ err: e.message }, 'Failed to save trail to Redis'));
+                            ).catch(e => log.warn({ err: e.message }, 'checkAll: Failed to save trail to Redis'));
                         }
                     }
                 } catch (err) {
@@ -325,8 +325,8 @@ export class PositionManager {
                     const currentPrice = prices[symbol];
                     if (!currentPrice || currentPrice <= 0) continue;
 
-                    // Store for evaluateTick fallback
-                    posCtx._lastTickPrice = posCtx._lastTickPrice || currentPrice;
+                    // Always update with fresh broker price so tick cache stays current
+                    posCtx._lastTickPrice = currentPrice;
 
                     const isShort = posCtx.isShort ?? posCtx.direction === 'SELL';
                     const entry   = posCtx.entryPrice ?? posCtx.price;
@@ -350,7 +350,7 @@ export class PositionManager {
                     // ── 2b. Ratchet trail stop ────────────────────────────────────
                     const trailMode = posCtx.trailMode ?? 'PNL_TRAIL';
                     if (trailMode === 'PNL_TRAIL' || trailMode === 'HYBRID') {
-                        const pnlFloor = posCtx.pnlTrailFloor ?? (entry * qty * 0.005);
+                        const pnlFloor = posCtx.pnlTrailFloor ?? this._active?.pnlTrailFloor ?? 0;
                         const effectivePeak = posCtx.peakUnrealizedPnl ?? 0;
                         const pnlTrailPct = posCtx.pnlTrailPct ?? 25;
 
@@ -367,7 +367,7 @@ export class PositionManager {
                     getRedis().hset(`trail:${symbol}`,
                         'peakUnrealizedPnl', String(posCtx.peakUnrealizedPnl ?? 0),
                         'pnlTrailStop', String(posCtx.pnlTrailStop ?? -Infinity)
-                    ).catch(() => { });
+                    ).catch(e => log.warn({ symbol, err: e.message }, '_syncPeakPnl: Redis trail write FAILED'));
 
                     // ── 2d. Check exits — skip if already exiting ─────────────────
                     if (posCtx.isExiting) continue;
@@ -432,10 +432,8 @@ export class PositionManager {
         if (!posCtx) return;
 
         const currentPrice = tick.ltp || tick.lastPrice || tick.close || 0;
+        if (currentPrice > 0) posCtx._lastTickPrice = currentPrice;
         if (currentPrice <= 0) return;
-
-        // Store for _syncPeakPnl fallback (runs even if evaluateTick returns early)
-        posCtx._lastTickPrice = currentPrice;
 
         // Concurrency guard — auto-reset after 30s to prevent permanent freeze.
         // CRITICAL: if _isExitingSetAt is undefined (set before this fix was deployed),
@@ -477,7 +475,7 @@ export class PositionManager {
                 // Instantly ratchet the trailing stop floor if we've crossed the threshold
                 const trailMode = posCtx.trailMode ?? 'PNL_TRAIL';
                 if (trailMode === 'PNL_TRAIL' || trailMode === 'HYBRID') {
-                    const pnlFloor = posCtx.pnlTrailFloor ?? (entry * qty * 0.005);
+                    const pnlFloor = posCtx.pnlTrailFloor ?? this._active?.pnlTrailFloor ?? 0;
                     if (unrealizedPnl >= pnlFloor && unrealizedPnl > 0) {
                         const newFloor = unrealizedPnl * (1 - (posCtx.pnlTrailPct ?? 25) / 100);
                         if (newFloor > (posCtx.pnlTrailStop ?? -Infinity)) {
@@ -492,7 +490,7 @@ export class PositionManager {
                 getRedis().hset(`trail:${symbol}`,
                     'peakUnrealizedPnl', String(posCtx.peakUnrealizedPnl),
                     'pnlTrailStop', String(posCtx.pnlTrailStop ?? -Infinity)
-                ).catch(() => { });
+                ).catch(e => log.warn({ symbol, err: e.message }, 'evaluateTick: Redis trail write FAILED'));
             }
 
             // ══════════════════════════════════════════════════════════════════

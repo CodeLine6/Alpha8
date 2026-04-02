@@ -290,7 +290,7 @@ async function main() {
                 getRedis().hset(`trail:${symbol}`,
                   'peakUnrealizedPnl', String(pnl),
                   'pnlTrailStop', String(posCtx.pnlTrailStop ?? -Infinity)
-                ).catch(() => {});
+                ).catch(e => log.warn({ symbol, err: e.message }, 'index.js: Redis trail write FAILED'));
               }
             }
           }
@@ -345,7 +345,7 @@ async function main() {
           getRedis().hset(`trail:${symbol}`,
             'peakUnrealizedPnl', String(pnl),
             'pnlTrailStop', String(posCtx.pnlTrailStop ?? -Infinity)
-          ).catch((e) => log.error({ symbol, err: e.message }, 'PEAK-SYNC Redis write failed'));
+          ).catch((e) => log.warn({ symbol, err: e.message }, 'PEAK-SYNC Redis write failed'));
         }
       }
     }, 30_000).unref();

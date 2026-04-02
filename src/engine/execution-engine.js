@@ -279,6 +279,16 @@ export class ExecutionEngine {
         partialExitDone: true,
         signalReversalEnabled: this._config?.SIGNAL_REVERSAL_ENABLED ?? true,
         hydratedFromDB: true,
+
+        // ── PnL Trail fields (CRITICAL: must match initPosition defaults) ──
+        // Without these, fallback computes 0.5% of position value as floor,
+        // which can be ~₹100 and prevent trail from EVER activating.
+        trailMode: this._config?.TRAIL_MODE ?? 'PNL_TRAIL',
+        pnlTrailPct: this._config?.PNL_TRAIL_PCT ?? 25,
+        pnlTrailFloor: this._config?.PNL_TRAIL_FLOOR ?? 0,
+        peakUnrealizedPnl: 0,
+        pnlTrailStop: -Infinity,
+        pnlTrailActivated: false,
       });
 
       // Fix BUG-11: restoreDeployment only restores _currentDeployment, does NOT
